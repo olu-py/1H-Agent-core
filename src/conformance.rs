@@ -11,7 +11,7 @@
 //! until it handles the new event.
 //!
 //! The scenarios are also exported as JSON fixtures under
-//! `crates/protium-core/conformance/` (drift-checked by test, mirroring the
+//! `conformance/` (drift-checked by test, mirroring the
 //! ts-rs bindings export pattern) so a WebUI repository can run the same
 //! corpus without a Rust toolchain.
 //!
@@ -842,7 +842,7 @@ mod tests {
         }
         assert!(
             drifted.is_empty(),
-            "conformance fixtures drifted; commit the regenerated crates/protium-core/conformance/: {drifted:?}"
+            "conformance fixtures drifted; commit the regenerated conformance/: {drifted:?}"
         );
     }
 
