@@ -1,0 +1,118 @@
+[provider]
+preset = "open_ai"
+kind = "responses"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5-mini"
+thinking_level = "auto"
+# Qwen 3.7 only: 1024, 4096, 8192, 16384, or 32768.
+# thinking_budget_tokens = 4096
+use_previous_response_id = false
+# auto | enabled | disabled; DeepSeek Responses API only
+native_web_search = "auto"
+# Optional override for gateways or new models absent from the built-in registry.
+# context_window_tokens = 128000
+# Hard cap on the model's output tokens. Also the output reservation subtracted
+# from the safe input budget. Responses uses max_output_tokens, OpenAI chat uses
+# max_completion_tokens, other chat providers use max_tokens. 0 = provider default.
+# max_output_tokens = 8192
+# HTTP-level retry with exponential backoff, applied only before any stream
+# event has been emitted. retry_max_attempts = 0 disables retries.
+retry_max_attempts = 3
+retry_initial_backoff_ms = 500
+retry_max_backoff_ms = 8000
+
+# Saved provider connections are managed by the Provider settings screen.
+# Each preset may appear once; API keys remain in the OS keyring and are never
+# written here. Older configs with only `[provider]` are migrated on save.
+# [[providers]]
+# preset = "deep_seek"
+# kind = "responses"
+# base_url = "https://api.deepseek.com"
+# model = "deepseek-v4-flash"
+# thinking_level = "high"
+# use_previous_response_id = false
+# native_web_search = "auto"
+
+[ui]
+context_meter = true
+
+# Available presets: open_ai, deep_seek, qwen, volcano, custom.
+# Qwen's current China endpoint contains your Bailian WorkspaceId:
+# https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+
+[runtime]
+command_timeout_seconds = 60
+max_tool_output_bytes = 1048576
+max_fetch_bytes = 10485760
+# Hard cap on background session runtimes; the active session is not counted.
+# Overflow evicts the least-recently-used idle runtime first, then stops the
+# oldest busy runtime if needed. Evicted sessions rebuild from storage.
+max_background_sessions = 8
+# Undo/redo file checkpointing. Files larger than checkpoint_max_file_bytes are
+# skipped (reported, not restored). checkpoints per session exceeding
+# checkpoint_max_session_bytes drop the oldest snapshots.
+checkpoint_max_file_bytes = 1048576
+checkpoint_max_session_bytes = 16777216
+
+[compaction]
+enabled = true
+auto_threshold = 0.80
+target_ratio = 0.55
+# preserve_recent_tokens = 8000
+max_summary_bytes = 65536
+
+# Cluster mode (AI 集群) child-agent concurrency and execution budgets.
+# Per-turn/session fan-out counts remain reserved; active children are bounded
+# by max_parallel_children.
+[cluster]
+max_parallel_children = 4
+# Active model/tool time per child. Queueing and approval waits are excluded.
+child_active_timeout_seconds = 300
+# max_children_per_turn = 8
+# max_children_per_session = 24
+child_max_output_bytes = 262144
+child_max_tool_output_bytes = 131072
+child_max_context_items = 48
+child_max_context_bytes = 524288
+
+[security]
+allow_private_networks = false
+
+[permissions.tools]
+# file_write = "ask"
+# file_delete = "deny"
+# terminal_exec = "ask"
+# web_fetch = "allow"
+# web_search = "allow"
+
+[browser]
+enabled = false
+command = ""
+args = []
+timeout_seconds = 30
+max_output_bytes = 2097152
+keep_alive_seconds = 30
+
+# Custom slash commands expand {args} and {workspace} only.
+# [[commands]]
+# name = "review"
+# description = "Review the current change"
+# template = "Review the current git diff and list risks. {args}"
+
+# Local stdio MCP subset (tools/list and tools/call).
+# [[mcp_servers]]
+# name = "local-tools"
+# command = "my-mcp-server"
+# args = []
+# enabled = false
+# timeout_seconds = 30
+# max_output_bytes = 1048576
+
+# Configured agent templates can be referenced from cluster mode via
+# `agent_spawn(agent = "reviewer", ...)`.
+# [[agents]]
+# name = "reviewer"
+# mode = "explore"
+# max_turns = 3 # optional hard limit; omit or set 0 for unlimited turns
+# allowed_tools = ["file_read", "file_search", "git"]
+# system_prompt = "Review code for correctness and security."

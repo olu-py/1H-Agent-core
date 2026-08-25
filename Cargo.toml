@@ -1,0 +1,57 @@
+[package]
+name = "protium-core"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.85"
+description = "UI-independent core library for 1H-Agent: session state machine, model/tool loop, storage, permissions, and the v2 UI protocol consumed by every frontend adapter"
+authors = ["olu"]
+license-file = "LICENSE"
+
+[[bin]]
+name = "protium-tsgen"
+path = "src/bin/tsgen.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+dirs = "6"
+fs2 = "0.4"
+futures-util = "0.3"
+globset = "0.4"
+html2text = "0.15"
+ignore = "0.4"
+keyring = { version = "3", default-features = false }
+libc = "0.2"
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time", "io-util", "net"] }
+toml = "0.9"
+tracing = "0.1"
+ts-rs = { version = "12", features = ["serde-json-impl"] }
+unicode-segmentation = "1"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
