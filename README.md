@@ -53,6 +53,18 @@ cargo update -p protium-core
 
 更新后的消费端必须提交自己的 `Cargo.lock` 和适配改动。普通 `cargo update` 还会更新其他依赖，因此 core 维护应使用上面的定向命令。
 
+### 本地联调（未发布 core）
+
+当 core 与消费端需要边改边测时，可将三个仓库放在同一父目录，并在消费端用命令行配置临时覆盖 Git 依赖：
+
+```bash
+cargo --config \
+  'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../protium-core"' \
+  test --lib conformance
+```
+
+该命令不修改受跟踪的 `Cargo.toml`，但 Cargo 可能临时改写消费端 `Cargo.lock`。本地 patch、path 状态和临时锁文件不得提交；正式交付仍须先 push core，再移除 patch、执行 `cargo update -p protium-core` 并用 `--locked` 完整复测。若消费端开始时已有锁文件改动，Agent 必须保留原差异，不能用联调流程覆盖用户工作。
+
 ## 跨仓库维护流程
 
 1. 在本仓库修改 core；协议变更同时更新 `conformance/` 和 `bindings/`。
@@ -60,7 +72,7 @@ cargo update -p protium-core
 3. 在 TUI 仓库执行 `cargo update -p protium-core`，完成适配、conformance 测试并独立提交。
 4. 在 WebUI 仓库执行 `cargo update -p protium-core` 和 `bash scripts/core-bindings.sh sync`，完成 Rust/TypeScript 适配并独立提交。
 
-不得直接修改 Cargo 缓存中的 Git checkout，也不得把 core 源码复制回消费端。需要并行开发时，应把三个仓库分别 clone 到互不嵌套的目录。
+不得直接修改 Cargo 缓存中的 Git checkout，也不得把 core 源码复制回消费端。需要并行开发时，应把三个仓库分别 clone 到互不嵌套的同级目录；path patch 只引用这个独立 clone。
 
 ## 构建与测试
 

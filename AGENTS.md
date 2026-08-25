@@ -22,7 +22,7 @@ excluded: TUI/WebUI/Desktop 源码、HTTP/SSE 服务器、内置浏览器、远�
 3. 核心状态机在 `src/service.rs`（`AppService`/`Engine`/`AppHandle`），单会话在 `src/session.rs`（`SessionRuntime`），模型/工具循环在 `src/agent.rs`（`AgentRunner`）；消费端契约在 `src/protocol.rs`/`src/bridge.rs`。
 4. 修改事件、配置或持久化类型时，覆盖所有构造点、match、序列化、恢复和测试。
 5. 先跑最小目标测试；跨模块行为才升级到完整 Clippy 和测试。
-6. 需要下游适配时先完成并 push core，再到各消费端定向更新；禁止修改 Cargo Git checkout。
+6. core/消费端联调先用命令行本地 path patch 指向独立 core clone；交付前必须移除 patch、先完成并 push core，再由消费端定向更新 Git 锁文件和 `--locked` 复测；禁止修改 Cargo checkout。
 
 ## 任务路由
 

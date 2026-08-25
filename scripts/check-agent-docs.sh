@@ -55,5 +55,9 @@ grep -Fq 'https://github.com/olu-py/1H-Agent' "$repo_root/README.md" \
     || fail "README.md does not link the TUI consumer"
 grep -Fq 'https://github.com/olu-py/1H-Agent-webUI' "$repo_root/README.md" \
     || fail "README.md does not link the WebUI consumer"
+grep -Fq 'patch."https://github.com/olu-py/1H-Agent-core.git"' "$repo_root/README.md" \
+    || fail "README.md does not document the local core path patch workflow"
+grep -Fq '本地 path patch' "$root_doc" \
+    || fail "AGENTS.md does not require the local core integration workflow"
 
 echo "agent docs check passed"
