@@ -32,6 +32,16 @@ cargo run --example minimal -- /path/to/a/workspace
 
 `bindings/` 内的 `.ts` 文件由 `#[ts(export)]` 生成的 `export_bindings_*` 测试在 `cargo test` 时再生成并验证（ts-rs 默认配置、`bigint`），以无漂移为准，供 Web 前端直接消费。`protium-tsgen` 二进制（`with_large_int("number")`）输出仅供参考。
 
+## 消费端更新
+
+TUI 和 WebUI 通过 Git 依赖使用本仓库的 `main` 分支：
+
+```toml
+protium-core = { git = "https://github.com/olu-py/1H-Agent-core.git", branch = "main" }
+```
+
+核心变更合并后，消费端执行 `cargo update -p protium-core` 获取新提交，再按适配器的测试和协议绑定流程更新。WebUI 将本仓库提交的 `bindings/` 同步到自己的 `web/ts/`；Cargo 不会自动运行 `protium-tsgen`。
+
 ## 构建与测试
 
 ```bash

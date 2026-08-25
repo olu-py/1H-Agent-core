@@ -6,6 +6,7 @@ rust-version = "1.85"
 description = "UI-independent core library for 1H-Agent: session state machine, model/tool loop, storage, permissions, and the v2 UI protocol consumed by every frontend adapter"
 authors = ["olu"]
 license-file = "LICENSE"
+repository = "https://github.com/olu-py/1H-Agent-core"
 
 [[bin]]
 name = "protium-tsgen"
