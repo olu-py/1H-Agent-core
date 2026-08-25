@@ -37,6 +37,6 @@
 
 - 文档改动跑 `bash scripts/check-agent-docs.sh` + `git diff --check`。
 - 新增协议事件：确认加法演进（旧 UI 可忽略）、贯通全部环节，并同步各消费端映射与展示；`Event` 新变体会先在 `conformance.rs` 的 `variant_name` 穷举 match 处编译失败，且语料覆盖测试要求为新变体补一个场景后各消费端重放测试同步变红，直至处理完毕。
-- 协议/DTO 变更后同步 `bindings/`：绑定由 `#[ts(export)]` 生成的 `export_bindings_*` 测试在 `cargo test` 时再生成并验证（ts-rs 默认配置、`bigint`），以无漂移为准；`protium-tsgen` 二进制用 `with_large_int("number")`，输出仅作参考且 CI 不校验。WebUI 契约随 v2 定义同步。
+- 协议/DTO 变更后同步并提交 `bindings/`：绑定由 `#[ts(export)]` 生成的 `export_bindings_*` 测试在 `cargo test` 时再生成并验证（ts-rs 默认配置、`bigint`），以无漂移为准；`protium-tsgen` 的 number 输出仅作参考。core push 后，WebUI 先定向更新 Git 依赖，再运行 `bash scripts/core-bindings.sh sync`。
 - 事件/协议变更端到端速查：`ModelEvent`（provider 归一化）→ `AgentEvent`（forward 闭包合并/阈值，如 `ToolCallStreaming` 1 KiB 合并）→ `protocol::Event`（`routed_to_event` 映射 + doc 顺序保证）→ `bridge::event_payload_bytes` → 核心 reducer（`session.rs` phase/status）→ 消费端展示（TUI 见消费端仓库 tui.md 专题）→ bindings（`cargo test` 导出测试）→ 测试（agent scripted / protocol serde / projection / facade 帧文本）。
 - 协议/桥接改动升级到 `cargo test --lib --all-features --locked` 与完整 Clippy。

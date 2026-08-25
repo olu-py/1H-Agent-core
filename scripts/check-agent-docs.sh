@@ -22,7 +22,7 @@ test ! -e "$legacy_doc" || fail "legacy singular agent document must not exist"
 grep -Fq '[AGENTS.md](AGENTS.md)' "$repo_root/README.md" || fail "README.md does not link AGENTS.md"
 test "$(line_count "$root_doc")" -le "$root_line_limit" || fail "AGENTS.md exceeds $root_line_limit lines"
 
-guides=(provider cluster runtime tools storage ui-contract)
+guides=(provider cluster runtime tools storage ui-contract release)
 sections=("## 适用范围" "## 入口" "## 不变量" "## 诊断" "## 验证")
 for guide in "${guides[@]}"; do
     relative="docs/guides/${guide}.md"
@@ -43,5 +43,17 @@ if grep -R -n -F "$legacy_name" \
     "$repo_root/scripts"; then
     fail "legacy singular agent document reference found"
 fi
+
+extracted_core_path='crates/protium''-core'
+if grep -R -n -F "$extracted_core_path" \
+    "$repo_root/README.md" "$root_doc" "$repo_root/docs" \
+    "$repo_root/scripts"; then
+    fail "extracted consumer-local core path reference found"
+fi
+
+grep -Fq 'https://github.com/olu-py/1H-Agent' "$repo_root/README.md" \
+    || fail "README.md does not link the TUI consumer"
+grep -Fq 'https://github.com/olu-py/1H-Agent-webUI' "$repo_root/README.md" \
+    || fail "README.md does not link the WebUI consumer"
 
 echo "agent docs check passed"

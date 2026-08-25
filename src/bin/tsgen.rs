@@ -2,7 +2,7 @@
 //!
 //! Writes one `.ts` file per exported type into the directory given by
 //! `TS_RS_EXPORT_DIR` (`Config::from_env`); point it at
-//! `crates/protium-core/bindings` to regenerate the committed files.
+//! this repository's `bindings` directory to regenerate the committed files.
 //! `export_all` recurses into every dependency annotated with `#[ts(export)]`,
 //! so the output is self-contained.
 //!

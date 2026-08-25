@@ -22,6 +22,7 @@ excluded: TUI/WebUI/Desktop 源码、HTTP/SSE 服务器、内置浏览器、远�
 3. 核心状态机在 `src/service.rs`（`AppService`/`Engine`/`AppHandle`），单会话在 `src/session.rs`（`SessionRuntime`），模型/工具循环在 `src/agent.rs`（`AgentRunner`）；消费端契约在 `src/protocol.rs`/`src/bridge.rs`。
 4. 修改事件、配置或持久化类型时，覆盖所有构造点、match、序列化、恢复和测试。
 5. 先跑最小目标测试；跨模块行为才升级到完整 Clippy 和测试。
+6. 需要下游适配时先完成并 push core，再到各消费端定向更新；禁止修改 Cargo Git checkout。
 
 ## 任务路由
 
@@ -34,6 +35,7 @@ excluded: TUI/WebUI/Desktop 源码、HTTP/SSE 服务器、内置浏览器、远�
 | 工具、路径、SSRF、外部进程 | `src/tools/`、`src/security.rs` | [Tools](docs/guides/tools.md) |
 | 会话、分支、迁移、持久化 | `src/storage.rs`、`src/session.rs` | [Storage](docs/guides/storage.md) |
 | 配置上限、容量归一化、新增配置键 | `src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | Provider 专题（容量预算）；同步 `defaults_are_bounded` 类测试 |
+| 版本、bindings/conformance 交付、消费端更新 | `Cargo.toml`、`Cargo.lock`、`bindings/`、`conformance/` | [Release](docs/guides/release.md) |
 
 指南与源码不一致时以源码为准，并在同一改动中更新该指南；一个事实只归属根文档或一个专题。
 
@@ -49,5 +51,6 @@ excluded: TUI/WebUI/Desktop 源码、HTTP/SSE 服务器、内置浏览器、远�
 | 迭代中 | `cargo test --lib --all-features --locked <filter>` |
 | 局部 Rust 完成 | `cargo fmt --all -- --check`、`cargo test --lib --all-features --locked` |
 | 工具/存储/安全/进程或跨模块 | `cargo clippy --all-targets --all-features --locked -- -D warnings`、`cargo test --all-features --locked` |
+| 发布给消费端 | 完整验证后先提交并 push core；再由 TUI/WebUI 各自更新锁文件与适配 |
 
 保持改动聚焦，复用现有 helper，不清理无法证明无用的文件。事件/协议/持久化类型改动必须覆盖所有构造点、match、序列化与恢复测试。本仓库自 1H-Agent 提取（消费端项目各自持有前端源码）；未运行的检查必须在最终回复说明。
