@@ -360,6 +360,24 @@ pub enum ProviderKind {
     Responses,
 }
 
+impl ProviderKind {
+    pub const ALL: [Self; 2] = [Self::Responses, Self::ChatCompletions];
+
+    /// Stable wire tag, identical to the serde form, used by the provider
+    /// settings DTOs and the set-provider endpoint.
+    pub fn wire_tag(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+        }
+    }
+
+    /// Inverse of [`Self::wire_tag`].
+    pub fn parse_wire_tag(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.wire_tag() == value)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RuntimeConfig {

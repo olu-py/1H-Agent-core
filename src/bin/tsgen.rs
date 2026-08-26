@@ -17,7 +17,7 @@ use protium_core::{
     model::{TodoStatus, TodoTask},
     protocol::{
         ApiError, ApiErrorKind, AppSnapshotV2, ApprovalDto, Envelope, Event, MessageDto,
-        MessagePage, SessionStateDto, TodoDto,
+        MessagePage, ProviderProfileDto, ProviderSettingsDto, SessionStateDto, TodoDto,
     },
     provider::ToolCall,
 };
@@ -47,6 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     export::<ApiError>(&cfg, "ApiError")?;
     export::<ApiErrorKind>(&cfg, "ApiErrorKind")?;
     export::<ToolCall>(&cfg, "ToolCall")?;
+    export::<ProviderProfileDto>(&cfg, "ProviderProfileDto")?;
+    export::<ProviderSettingsDto>(&cfg, "ProviderSettingsDto")?;
 
     println!("generated type bindings in {}", cfg.out_dir().display());
     Ok(())

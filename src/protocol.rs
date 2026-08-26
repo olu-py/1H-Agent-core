@@ -316,6 +316,32 @@ pub struct PartialDto {
     pub created_at: String,
 }
 
+/// A non-secret provider connection profile for settings screens. `preset` is
+/// the `ProviderPreset` key id (`"deepseek"`) - the same identifier the
+/// set-provider endpoint accepts - and `kind` is the `ProviderKind` wire tag
+/// (`"responses"` / `"chat_completions"`). API keys are never part of any DTO.
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export)]
+pub struct ProviderProfileDto {
+    pub preset: String,
+    pub kind: String,
+    pub model: String,
+    pub base_url: String,
+}
+
+/// Provider settings for `GET /api/v2/config/provider`: the active profile,
+/// the saved per-preset profiles, and which presets currently have a usable
+/// API key (cache-only lookup: startup unlock, environment preload, and keys
+/// stored during this run). Absence from `connected` means "no key resolved
+/// yet", not a definitive "never configured".
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export)]
+pub struct ProviderSettingsDto {
+    pub active: ProviderProfileDto,
+    pub saved: Vec<ProviderProfileDto>,
+    pub connected: Vec<String>,
+}
+
 /// Per-session context capacity, computed by the core.
 ///
 /// The core is the single authority for context capacity; the TUI must not

@@ -119,6 +119,22 @@ enum CoreCommand {
         provider: crate::config::ProviderConfig,
         reply: oneshot::Sender<Result<(), ApiError>>,
     },
+    /// Applies the settings-screen edit: merges `model` / optional `base_url`
+    /// / optional protocol onto the current or saved profile of `preset`
+    /// (falling back to the preset template when nothing is saved), then
+    /// commits it through the `SetProviderConfig` path.
+    SetProviderProfile {
+        preset: crate::config::ProviderPreset,
+        model: String,
+        base_url: Option<String>,
+        kind: Option<crate::config::ProviderKind>,
+        reply: oneshot::Sender<Result<(), ApiError>>,
+    },
+    /// Reads the provider settings view (active + saved profiles, connected
+    /// presets). Never includes API keys.
+    GetProviderSettings {
+        reply: oneshot::Sender<Result<crate::protocol::ProviderSettingsDto, ApiError>>,
+    },
     /// Removes a saved provider profile, switching the active provider when it
     /// was the one removed.
     RemoveProvider {
@@ -613,6 +629,44 @@ impl AppHandle {
             .map_err(|_| ApiError::internal("command dropped"))?
     }
 
+    /// Applies a settings-screen provider edit: `model` plus optional
+    /// `base_url` and protocol onto the current or saved profile of `preset`
+    /// (a fresh preset template when nothing is saved). The caller stores any
+    /// new API key in the OS keyring (e.g. `secrets::store_api_key_cached`)
+    /// *before* calling this so the rebuilt runner picks it up.
+    pub async fn set_provider_profile(
+        &self,
+        preset: crate::config::ProviderPreset,
+        model: &str,
+        base_url: Option<&str>,
+        kind: Option<crate::config::ProviderKind>,
+    ) -> Result<(), ApiError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CoreCommand::SetProviderProfile {
+            preset,
+            model: model.to_owned(),
+            base_url: base_url.map(str::to_owned),
+            kind,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| ApiError::internal("command dropped"))?
+    }
+
+    /// Reads the provider settings view: the active profile, the saved
+    /// per-preset profiles, and the presets with a currently resolvable API
+    /// key. Never includes the keys themselves.
+    pub async fn provider_settings(
+        &self,
+    ) -> Result<crate::protocol::ProviderSettingsDto, ApiError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CoreCommand::GetProviderSettings { reply: tx })
+            .await?;
+        rx.await
+            .map_err(|_| ApiError::internal("command dropped"))?
+    }
+
     /// Removes a saved provider profile, switching the active provider when it
     /// was the one removed. The API key stays in the OS keyring.
     pub async fn remove_provider(
@@ -777,6 +831,20 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
         }
         CoreCommand::SetProviderConfig { provider, reply } => {
             let result = set_provider_config(engine, provider);
+            let _ = reply.send(result);
+        }
+        CoreCommand::SetProviderProfile {
+            preset,
+            model,
+            base_url,
+            kind,
+            reply,
+        } => {
+            let result = set_provider_profile(engine, preset, &model, base_url, kind);
+            let _ = reply.send(result);
+        }
+        CoreCommand::GetProviderSettings { reply } => {
+            let result = Ok(provider_settings(engine));
             let _ = reply.send(result);
         }
         CoreCommand::RemoveProvider { preset, reply } => {
@@ -1388,13 +1456,32 @@ fn set_provider(engine: &mut Engine, preset: &str, model: &str) -> Result<(), Ap
 
 /// Applies a full non-secret provider profile: switches the preset, protocol,
 /// base_url, model and thinking settings, upserts the saved profile, rebuilds
-/// the runner and persists the config. API keys are never handled here.
+/// the runner and persists the config. API keys are never handled here (the
+/// caller stores them in the OS keyring before calling).
 fn set_provider_config(
     engine: &mut Engine,
-    provider: crate::config::ProviderConfig,
+    mut provider: crate::config::ProviderConfig,
 ) -> Result<(), ApiError> {
     let preset = provider.preset;
     let model = provider.model.clone();
+    provider
+        .validate()
+        .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+    provider.normalize_thinking();
+    // Refresh the active secret whenever it does not match the incoming
+    // preset - a preset switch, or the first key arriving for the current
+    // preset - so the rebuilt runner never pairs one preset's key with
+    // another preset's base URL, and a newly stored key takes effect without
+    // a restart. `api_key_cached` resolves environment variables first and
+    // reads the keyring at most once per process and preset.
+    if engine.app.config.provider.preset != preset
+        || !matches!(&engine.app.active_secret, Some((active, _)) if *active == preset)
+    {
+        engine.app.active_secret = crate::secrets::api_key_cached(preset)
+            .ok()
+            .map(|key| (preset, key));
+    }
+    let has_key = engine.app.active_secret.is_some();
     engine.app.config.provider = provider.clone();
     engine.app.config.upsert_provider(provider);
     engine.app.current.context_limit_tokens =
@@ -1408,15 +1495,93 @@ fn set_provider_config(
         .map_err(|error| api_error(error.into()))?;
     app::rebuild_runner(&mut engine.app).map_err(api_error)?;
     let status = match engine.app.config.save() {
-        Ok(()) => format!("就绪 | {} | {}", preset.label(), model),
-        Err(error) => format!(
-            "配置已应用，但保存失败：{}",
-            crate::secrets::redact(&error.to_string())
-        ),
+        Ok(()) if has_key => format!("就绪 | {} | {}", preset.label(), model),
+        Ok(()) => "需要配置提供商".into(),
+        Err(error) => {
+            let suffix = crate::secrets::redact(&error.to_string());
+            if has_key {
+                format!("配置已应用，但保存失败：{suffix}")
+            } else {
+                format!("配置已应用（缺 API Key），但保存失败：{suffix}")
+            }
+        }
     };
     engine.app.current.status = status;
     push_context_updated(engine, &engine.app.current.session_id);
     Ok(())
+}
+
+/// Applies a settings-screen provider edit: merges the model and the optional
+/// base URL / protocol onto the base profile for `preset` - the current
+/// profile when it is already active (keeping thinking, retry and context
+/// customizations), otherwise the saved profile or a fresh preset template -
+/// then commits it via [`set_provider_config`].
+fn set_provider_profile(
+    engine: &mut Engine,
+    preset: crate::config::ProviderPreset,
+    model: &str,
+    base_url: Option<String>,
+    kind: Option<crate::config::ProviderKind>,
+) -> Result<(), ApiError> {
+    let mut profile = if engine.app.config.provider.preset == preset {
+        engine.app.config.provider.clone()
+    } else {
+        engine
+            .app
+            .config
+            .provider_for(preset)
+            .unwrap_or_else(|| preset.defaults())
+    };
+    profile.preset = preset;
+    profile.model = model.trim().to_owned();
+    if let Some(base_url) = base_url
+        && !base_url.trim().is_empty()
+    {
+        profile.base_url = base_url.trim().to_owned();
+    }
+    if let Some(kind) = kind {
+        profile.kind = kind;
+    }
+    set_provider_config(engine, profile)
+}
+
+/// Builds the provider settings view. `connected` uses cache-only key lookups
+/// (startup unlock, environment preload, keys stored this run) so answering a
+/// settings read never touches the OS keyring.
+fn provider_settings(engine: &Engine) -> crate::protocol::ProviderSettingsDto {
+    let app = &engine.app;
+    let mut presets: Vec<crate::config::ProviderPreset> =
+        app.config.providers.iter().map(|p| p.preset).collect();
+    if !presets.contains(&app.config.provider.preset) {
+        presets.push(app.config.provider.preset);
+    }
+    let connected = presets
+        .iter()
+        .filter(|preset| crate::secrets::api_key_cached_only(**preset).is_ok())
+        .map(|preset| preset.key_id().to_owned())
+        .collect::<Vec<_>>();
+    crate::protocol::ProviderSettingsDto {
+        active: provider_profile_dto(&app.config.provider),
+        saved: app
+            .config
+            .providers
+            .iter()
+            .map(provider_profile_dto)
+            .collect(),
+        connected,
+    }
+}
+
+/// Maps a [`crate::config::ProviderConfig`] onto its non-secret wire form.
+fn provider_profile_dto(
+    provider: &crate::config::ProviderConfig,
+) -> crate::protocol::ProviderProfileDto {
+    crate::protocol::ProviderProfileDto {
+        preset: provider.preset.key_id().to_owned(),
+        kind: provider.kind.wire_tag().to_owned(),
+        model: provider.model.clone(),
+        base_url: provider.base_url.clone(),
+    }
 }
 
 /// Removes a saved provider profile, switching the active provider (and its
@@ -1531,6 +1696,114 @@ mod tests {
         assert!(!snapshot.provider.is_empty());
         assert_eq!(snapshot.mode, "build");
         assert!(snapshot.approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_settings_reports_active_and_saved_profiles() {
+        let (_temp, handle) = test_handle().await;
+        let settings = handle.provider_settings().await.unwrap();
+        // Default config: OpenAI active from the template, nothing saved yet.
+        assert_eq!(settings.active.preset, "openai");
+        assert_eq!(settings.active.base_url, "https://api.openai.com/v1");
+        assert_eq!(settings.active.kind, "responses");
+        assert!(settings.saved.is_empty());
+        // test_handle seeds the active preset's key, so it resolves as connected.
+        assert!(settings.connected.contains(&"openai".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn set_provider_profile_switches_to_an_unsaved_preset_from_template() {
+        let (_temp, handle) = test_handle().await;
+        crate::secrets::test_seed_key(crate::config::ProviderPreset::DeepSeek, "deepseek-test-key");
+        handle
+            .set_provider_profile(
+                crate::config::ProviderPreset::DeepSeek,
+                "deepseek-v4-flash",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let settings = handle.provider_settings().await.unwrap();
+        // No saved DeepSeek profile existed, so the preset template provides
+        // the base URL and protocol; the switch itself upserts the profile.
+        assert_eq!(settings.active.preset, "deepseek");
+        assert_eq!(settings.active.model, "deepseek-v4-flash");
+        assert_eq!(settings.active.base_url, "https://api.deepseek.com");
+        assert_eq!(settings.active.kind, "responses");
+        assert!(
+            settings
+                .saved
+                .iter()
+                .any(|profile| profile.preset == "deepseek")
+        );
+        // The secret refresh on a preset switch resolves the seeded key.
+        assert!(settings.connected.contains(&"deepseek".to_owned()));
+        assert_eq!(handle.snapshot().await.unwrap().provider, "DeepSeek");
+    }
+
+    #[tokio::test]
+    async fn set_provider_profile_applies_overrides_and_keeps_the_active_base() {
+        let (_temp, handle) = test_handle().await;
+        handle
+            .set_provider_profile(
+                crate::config::ProviderPreset::OpenAi,
+                "gpt-5",
+                Some("https://proxy.example.com/v1"),
+                Some(crate::config::ProviderKind::ChatCompletions),
+            )
+            .await
+            .unwrap();
+        let settings = handle.provider_settings().await.unwrap();
+        assert_eq!(settings.active.preset, "openai");
+        assert_eq!(settings.active.model, "gpt-5");
+        assert_eq!(settings.active.base_url, "https://proxy.example.com/v1");
+        assert_eq!(settings.active.kind, "chat_completions");
+    }
+
+    #[tokio::test]
+    async fn set_provider_profile_without_a_key_marks_missing_provider() {
+        let (_temp, handle) = test_handle().await;
+        // The process-wide key cache is shared across parallel tests (see the
+        // comment in `test_handle`), so "no key for Volcano" cannot be
+        // guaranteed: another test may have seeded one. Assert the missing-key
+        // behavior only when Volcano was unresolvable when the test started.
+        let volcano_unconnected =
+            crate::secrets::api_key_cached_only(crate::config::ProviderPreset::Volcano).is_err();
+        handle
+            .set_provider_profile(
+                crate::config::ProviderPreset::Volcano,
+                "doubao-seed-2-1-pro-260628",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let settings = handle.provider_settings().await.unwrap();
+        assert_eq!(settings.active.preset, "volcano");
+        assert_eq!(settings.active.model, "doubao-seed-2-1-pro-260628");
+        if volcano_unconnected {
+            assert!(!settings.connected.contains(&"volcano".to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn set_provider_profile_rejects_an_invalid_base_url() {
+        let (_temp, handle) = test_handle().await;
+        let error = handle
+            .set_provider_profile(
+                crate::config::ProviderPreset::OpenAi,
+                "gpt-5-mini",
+                Some("not a url"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ApiErrorKind::BadRequest);
+        assert!(error.message.contains("Base URL"), "{}", error.message);
+        // A rejected profile leaves the active provider untouched.
+        let settings = handle.provider_settings().await.unwrap();
+        assert_eq!(settings.active.base_url, "https://api.openai.com/v1");
     }
 
     #[tokio::test]
