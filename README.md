@@ -22,7 +22,7 @@
 | 取消 | `AppHandle::cancel(session_id, request_seq)`（序号不匹配则静默忽略，防陈旧取消） |
 | 会话切换 | `AppHandle::activate_session` |
 | 审批 | `AppHandle::approve(approval_id, accept, allow_session)`；会话放行仅驻留内存 |
-| Provider 切换 | `AppHandle::set_provider(preset, model)` |
+| Provider 切换 | `AppHandle::set_provider_profile(preset, model, base_url, kind)`；设置视图 `AppHandle::provider_settings()` -> `protocol::ProviderSettingsDto`（非密钥字段；API Key 只经 `secrets::store_api_key_cached`） |
 | 事件流 | `AppHandle::subscribe_from(cursor)` 原子订阅（replay + live）；或 `replay_after` + `subscribe` |
 
 启动序列（所有消费端必须遵守）：先 `snapshot()`，再 `subscribe_from(snapshot.event_cursor)` 原子订阅并按 cursor 去重；`ResyncRequired`（游标逐出）或消费滞后时重取快照 + 消息页并重新订阅。协议只做加法演进：新变体/字段必须被旧消费端忽略，未知事件静默忽略。

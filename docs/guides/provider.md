@@ -8,7 +8,7 @@ Provider 配置、密钥、请求协议、reasoning、`response_id`、上下文�
 
 - 配置：`ProviderConfig`、`ProviderPreset`、`provider_for`、`upsert_provider`、`remove_provider`（`src/config.rs`）。
 - 密钥：`api_key_cached*`、`store_api_key_cached`（core `secrets` facade），仅存在性/解锁入口暴露给消费端。
-- 切换：消费端只经 `AppHandle::set_provider`/`set_provider_config`/`remove_provider` 提交，不直接改配置；首页选择 `HomeSelection`/`apply_home_selection` 是 TUI 侧入口。
+- 切换/编辑：消费端只经 `AppHandle::set_provider_profile`（模型 + 可选 base_url/kind，档案合并语义）/`set_provider`/`set_provider_config`/`remove_provider` 提交，不直接改配置；设置视图 `AppHandle::provider_settings()`（active/saved/connected，密钥永不入 DTO，connected 为缓存级解析）；首页选择 `HomeSelection`/`apply_home_selection` 是 TUI 侧入口。
 - 请求/恢复：`replay_safe_items`、请求游标、`src/provider/openai.rs`、`storage.rs` 的 Provider 状态。
 
 ## 不变量
