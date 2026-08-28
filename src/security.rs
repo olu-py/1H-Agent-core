@@ -98,7 +98,7 @@ impl Workspace {
 pub fn classify_tool(name: &str, arguments: &Value) -> PolicyDecision {
     match name {
         "file_list" | "file_stat" | "file_read" | "file_search" | "file_glob" | "repo_map"
-        | "web_search" | "web_fetch" | "git_diff" | "todo_read" | "todo_write" => {
+        | "web_search" | "web_fetch" | "market_quote" | "git_diff" | "todo_read" | "todo_write" => {
             PolicyDecision::Allow
         }
         "file_write" | "file_edit" | "file_mkdir" | "file_copy" | "file_move" | "file_delete" => {

@@ -1,6 +1,7 @@
 mod external;
 mod filesystem;
 mod git;
+mod market;
 mod process;
 mod web;
 
@@ -316,6 +317,13 @@ impl ToolRegistry {
                 }),
             ),
             definition(
+                "market_quote",
+                "Fetch real-time A-share market quotes as a plain-text table. Symbols use the sh/sz prefix plus 6 digits (e.g. sh000001, sz399001, sz399006, sh600519, sz000001); omitting symbols returns the three major indices (SSE Composite, SZSE Component, ChiNext)",
+                json!({
+                    "type":"object","properties":{"symbols":{"type":"array","items":{"type":"string"},"maxItems":20}},"additionalProperties":false
+                }),
+            ),
+            definition(
                 "terminal_exec",
                 "Run a program with an argument vector in the workspace",
                 json!({
@@ -459,6 +467,14 @@ impl ToolRegistry {
                     self.runtime.max_tool_output_bytes,
                     self.allow_private_networks,
                     self.runtime.search_backend,
+                )
+                .await
+            }
+            "market_quote" => {
+                market::quote(
+                    &call.arguments,
+                    self.runtime.max_tool_output_bytes,
+                    self.allow_private_networks,
                 )
                 .await
             }
