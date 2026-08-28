@@ -11,6 +11,7 @@ use tokio::net::lookup_host;
 use url::Url;
 
 use super::ToolError;
+use crate::config::SearchBackend;
 
 const MAX_REDIRECTS: usize = 5;
 
@@ -156,6 +157,7 @@ pub async fn search(
     value: &Value,
     max_bytes: usize,
     allow_private: bool,
+    backend: SearchBackend,
 ) -> Result<String, ToolError> {
     let args: SearchArgs = serde_json::from_value(value.clone())?;
     let query = args.query.trim();
@@ -164,7 +166,11 @@ pub async fn search(
     }
     let max_results = args.max_results.clamp(1, 10);
     let output_limit = max_bytes.min(64 * 1024);
-    let mut url = Url::parse("https://html.duckduckgo.com/html/").map_err(execution_error)?;
+    let (endpoint, label) = match backend {
+        SearchBackend::DuckDuckGo => ("https://html.duckduckgo.com/html/", "DuckDuckGo HTML"),
+        SearchBackend::Bing => ("https://www.bing.com/search", "Bing"),
+    };
+    let mut url = Url::parse(endpoint).map_err(execution_error)?;
     url.query_pairs_mut().append_pair("q", query);
     let fetched = fetch(
         &json!({"url": url.as_str(), "method": "GET", "max_bytes": output_limit}),
@@ -177,11 +183,18 @@ pub async fn search(
         &fetched,
         max_results,
         output_limit,
+        label,
     ))
 }
 
-fn limit_search_output(query: &str, fetched: &str, max_results: usize, max_bytes: usize) -> String {
-    let mut output = format!("Search query: {query}\nSearch provider: DuckDuckGo HTML\n\n");
+fn limit_search_output(
+    query: &str,
+    fetched: &str,
+    max_results: usize,
+    max_bytes: usize,
+    provider: &str,
+) -> String {
+    let mut output = format!("Search query: {query}\nSearch provider: {provider}\n\n");
     let mut results = 0usize;
     for block in fetched.split("\n\n") {
         let is_result =
@@ -334,10 +347,33 @@ mod tests {
     #[test]
     fn search_output_is_bounded_by_result_count() {
         let fetched = "URL: https://example.test\n\n[first](https://one.test)\n\n[second](https://two.test)\n\n[third](https://three.test)";
-        let output = limit_search_output("rust", fetched, 2, 4096);
+        let output = limit_search_output("rust", fetched, 2, 4096, "DuckDuckGo HTML");
         assert!(output.contains("one.test"));
         assert!(output.contains("two.test"));
         assert!(!output.contains("three.test"));
+        assert!(output.contains("Search provider: DuckDuckGo HTML"));
+    }
+
+    #[test]
+    fn bing_results_parse_into_bounded_blocks() {
+        let html = r#"<ol id="b_results">
+<li class="b_algo"><h2><a target="_blank" href="https://www.rust-lang.org/">The Rust Programming Language</a></h2><div class="b_caption"><p class="b_lineclamp2">A language empowering everyone to build reliable and efficient software.</p></div></li>
+<li class="b_algo"><h2><a target="_blank" href="https://doc.rust-lang.org/">Rust Documentation</a></h2><div class="b_caption"><p class="b_lineclamp2">Official documentation for the Rust programming language.</p></div></li>
+</ol>"#;
+        let text = html2text::from_read(html.as_bytes(), 100).expect("html2text");
+        let output = limit_search_output("rust", &text, 2, 4096, "Bing");
+        assert!(output.contains("Search provider: Bing"));
+        assert!(output.contains("www.rust-lang.org"));
+        assert!(output.contains("doc.rust-lang.org"));
+        assert!(!output.contains("b_algo"));
+    }
+
+    #[test]
+    fn bing_search_builds_bing_endpoint() {
+        let mut url = Url::parse("https://www.bing.com/search").unwrap();
+        url.query_pairs_mut().append_pair("q", "rust tokio");
+        assert!(url.as_str().contains("www.bing.com/search"));
+        assert!(url.as_str().contains("q=rust+tokio"));
     }
 
     #[test]
@@ -352,6 +388,7 @@ mod tests {
             &json!({"query": "Rust Tokio", "max_results": 3}),
             64 * 1024,
             false,
+            SearchBackend::DuckDuckGo,
         )
         .await
         .expect("public search should succeed");

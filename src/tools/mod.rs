@@ -458,6 +458,7 @@ impl ToolRegistry {
                     &call.arguments,
                     self.runtime.max_tool_output_bytes,
                     self.allow_private_networks,
+                    self.runtime.search_backend,
                 )
                 .await
             }

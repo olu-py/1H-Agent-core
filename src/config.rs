@@ -378,12 +378,25 @@ impl ProviderKind {
     }
 }
 
+/// Web search backend used by the `web_search` tool. DuckDuckGo is the
+/// default (best-effort public endpoint); Bing is offered for networks where
+/// DuckDuckGo is unreliable or unreachable.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackend {
+    #[default]
+    DuckDuckGo,
+    Bing,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RuntimeConfig {
     pub command_timeout_seconds: u64,
     pub max_tool_output_bytes: usize,
     pub max_fetch_bytes: usize,
+    /// Web search backend for the `web_search` tool.
+    pub search_backend: SearchBackend,
     /// Hard cap on runtimes parked in the background (the active session is
     /// not counted). Overflow prefers the least-recently-parked idle runtime,
     /// then shuts down the oldest busy runtime if necessary.
@@ -560,6 +573,7 @@ impl Default for RuntimeConfig {
             command_timeout_seconds: 60,
             max_tool_output_bytes: 1024 * 1024,
             max_fetch_bytes: 10 * 1024 * 1024,
+            search_backend: SearchBackend::default(),
             max_background_sessions: 8,
             checkpoint_max_file_bytes: 1024 * 1024,
             checkpoint_max_session_bytes: 16 * 1024 * 1024,
@@ -1372,6 +1386,19 @@ mod tests {
             config.runtime.checkpoint_max_session_bytes,
             16 * 1024 * 1024
         );
+        assert_eq!(config.runtime.search_backend, SearchBackend::DuckDuckGo);
+    }
+
+    #[test]
+    fn search_backend_is_parsed_from_toml() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "[runtime]\nsearch_backend = \"bing\"\n").unwrap();
+        let config = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(config.runtime.search_backend, SearchBackend::Bing);
+
+        fs::write(&path, "[runtime]\nsearch_backend = \"bogus\"\n").unwrap();
+        assert!(Config::load(Some(&path), temp.path()).is_err());
     }
 
     #[test]

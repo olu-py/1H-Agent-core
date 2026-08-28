@@ -23,7 +23,7 @@ pub fn system_prompt(preset: ProviderPreset, mode: AgentMode) -> String {
     let provider_rules = if preset == ProviderPreset::DeepSeek {
         "PROVIDER NOTES\n- Preserve this stable prefix and the declared tool schemas so Responses and Chat requests remain cache-friendly.\n- For current or external information, use the available web_search first. DeepSeek Responses may provide server-side search; otherwise use 1H-Agent's bounded web_search tool. Use web_fetch only for a URL already supplied by the user or selected from a verified search result.\n- Treat reasoning summaries as private provider metadata. Never ask for, reconstruct, or expose hidden chain-of-thought."
     } else {
-        "PROVIDER NOTES\n- Preserve this stable prefix and the declared tool schemas.\n- Treat provider reasoning summaries as private metadata. Never ask for, reconstruct, or expose hidden chain-of-thought."
+        "PROVIDER NOTES\n- Preserve this stable prefix and the declared tool schemas.\n- For current or external information, use the available web_search first, then web_fetch for a URL already supplied by the user or selected from a verified search result.\n- Treat provider reasoning summaries as private metadata. Never ask for, reconstruct, or expose hidden chain-of-thought."
     };
 
     let cluster_rules = if mode == AgentMode::Cluster {
@@ -163,6 +163,25 @@ mod tests {
         assert!(deepseek.contains("stable prefix"));
         assert!(deepseek.contains("server-side search"));
         assert!(!other.contains("DeepSeek Responses"));
+    }
+
+    #[test]
+    fn non_deepseek_providers_also_get_web_tool_guidance() {
+        for preset in [
+            ProviderPreset::Qwen,
+            ProviderPreset::Custom,
+            ProviderPreset::OpenAi,
+        ] {
+            let prompt = system_prompt(preset, AgentMode::Build);
+            assert!(
+                prompt.contains("web_search first"),
+                "{preset:?} should instruct web_search first"
+            );
+            assert!(
+                prompt.contains("web_fetch for a URL already supplied by the user"),
+                "{preset:?} should instruct web_fetch usage"
+            );
+        }
     }
 
     #[test]
