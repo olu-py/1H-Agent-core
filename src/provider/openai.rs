@@ -187,6 +187,7 @@ impl OpenAiClient {
         }
 
         let mut decoder = SseDecoder::default();
+        let mut responses_state = ResponsesStreamState::default();
         let mut stream = response.bytes_stream();
         let mut saw_done = false;
         while let Some(chunk) = stream.next().await {
@@ -200,9 +201,11 @@ impl OpenAiClient {
                     .map_err(|error| (true, ProviderError::Protocol(error.to_string())))?;
                 let parsed = match request.kind {
                     ProviderKind::ChatCompletions => parse_chat_event(&value),
-                    ProviderKind::Responses => {
-                        parse_responses_event_for_mode(&value, request.thinking_mode)
-                    }
+                    ProviderKind::Responses => parse_responses_event_for_mode(
+                        &value,
+                        request.thinking_mode,
+                        &mut responses_state,
+                    ),
                 }
                 .map_err(|error| (true, error))?;
                 for model_event in parsed {
@@ -624,12 +627,26 @@ pub(crate) fn parse_chat_event(value: &Value) -> Result<Vec<ModelEvent>, Provide
 
 #[cfg(test)]
 pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, ProviderError> {
-    parse_responses_event_for_mode(value, ThinkingMode::OpenAiResponsesSummary)
+    parse_responses_event_for_mode(
+        value,
+        ThinkingMode::OpenAiResponsesSummary,
+        &mut ResponsesStreamState::default(),
+    )
+}
+
+/// Per-stream Responses parsing state. One instance lives for a single model
+/// stream attempt so the completed reasoning item's summary replay can be
+/// suppressed when the same text already streamed as deltas (incremental
+/// semantics: the done payload never re-appends what deltas delivered).
+#[derive(Default)]
+pub(crate) struct ResponsesStreamState {
+    reasoning_deltas_seen: bool,
 }
 
 pub(crate) fn parse_responses_event_for_mode(
     value: &Value,
     thinking_mode: ThinkingMode,
+    state: &mut ResponsesStreamState,
 ) -> Result<Vec<ModelEvent>, ProviderError> {
     let event_type = value
         .get("type")
@@ -653,13 +670,17 @@ pub(crate) fn parse_responses_event_for_mode(
             }
         }
         "response.reasoning_summary_text.delta"
-            if matches!(thinking_mode, ThinkingMode::OpenAiResponsesSummary) =>
+            if matches!(
+                thinking_mode,
+                ThinkingMode::OpenAiResponsesSummary | ThinkingMode::CompatibleAuto
+            ) =>
         {
             if let Some(delta) = value
                 .get("delta")
                 .and_then(Value::as_str)
                 .filter(|delta| safe_reasoning_text(delta))
             {
+                state.reasoning_deltas_seen = true;
                 events.push(ModelEvent::ReasoningDelta(delta.to_owned()));
             }
         }
@@ -668,7 +689,9 @@ pub(crate) fn parse_responses_event_for_mode(
         | "response.reasoning.delta"
             if matches!(
                 thinking_mode,
-                ThinkingMode::DeepSeekResponses | ThinkingMode::QwenResponses
+                ThinkingMode::DeepSeekResponses
+                    | ThinkingMode::QwenResponses
+                    | ThinkingMode::CompatibleAuto
             ) =>
         {
             if let Some(delta) = value
@@ -676,6 +699,7 @@ pub(crate) fn parse_responses_event_for_mode(
                 .and_then(Value::as_str)
                 .filter(|delta| safe_reasoning_text(delta))
             {
+                state.reasoning_deltas_seen = true;
                 events.push(ModelEvent::ReasoningDelta(delta.to_owned()));
             }
         }
@@ -684,7 +708,9 @@ pub(crate) fn parse_responses_event_for_mode(
         "response.reasoning_text.done"
             if matches!(
                 thinking_mode,
-                ThinkingMode::DeepSeekResponses | ThinkingMode::QwenResponses
+                ThinkingMode::DeepSeekResponses
+                    | ThinkingMode::QwenResponses
+                    | ThinkingMode::CompatibleAuto
             ) => {}
         "response.output_item.added" => {
             let item = value.get("item").unwrap_or(&Value::Null);
@@ -741,7 +767,13 @@ pub(crate) fn parse_responses_event_for_mode(
                     }));
                 }
                 Some("reasoning") => {
-                    append_reasoning_summary(item, &mut events);
+                    // The completed item's summary repeats what the reasoning
+                    // deltas already delivered; only emit it as a fallback
+                    // when no delta was seen for this stream (endpoints that
+                    // publish the reasoning only once, at item completion).
+                    if !state.reasoning_deltas_seen {
+                        append_reasoning_summary(item, &mut events);
+                    }
                     events.push(ModelEvent::ProviderItem(item.clone()));
                 }
                 Some("web_search_call") => {
@@ -1182,6 +1214,7 @@ mod tests {
                 "delta":"检查项目结构"
             }),
             ThinkingMode::DeepSeekResponses,
+            &mut ResponsesStreamState::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1197,6 +1230,7 @@ mod tests {
                 "text":"检查项目结构"
             }),
             ThinkingMode::DeepSeekResponses,
+            &mut ResponsesStreamState::default(),
         )
         .unwrap();
         assert!(done.is_empty());
@@ -1212,6 +1246,7 @@ mod tests {
                 "output_index":0
             }),
             ThinkingMode::QwenResponses,
+            &mut ResponsesStreamState::default(),
         )
         .unwrap();
         assert_eq!(delta, vec![ModelEvent::ReasoningDelta("正在检查".into())]);
@@ -1224,9 +1259,111 @@ mod tests {
                 "output_index":0
             }),
             ThinkingMode::QwenResponses,
+            &mut ResponsesStreamState::default(),
         )
         .unwrap();
         assert!(done.is_empty());
+    }
+
+    #[test]
+    fn compatible_responses_streams_every_known_reasoning_delta_shape() {
+        let mut state = ResponsesStreamState::default();
+        for event_type in [
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+            "response.reasoning_content.delta",
+            "response.reasoning.delta",
+        ] {
+            let events = parse_responses_event_for_mode(
+                &json!({"type": event_type, "delta":"正在思考"}),
+                ThinkingMode::CompatibleAuto,
+                &mut state,
+            )
+            .unwrap();
+            assert_eq!(events, vec![ModelEvent::ReasoningDelta("正在思考".into())]);
+        }
+
+        // The completed reasoning item repeats the streamed text in its
+        // summary; with deltas already seen it must not be re-emitted.
+        let done = parse_responses_event_for_mode(
+            &json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "id":"rs_1",
+                    "type":"reasoning",
+                    "summary":[{"type":"summary_text","text":"正在思考"}]
+                }
+            }),
+            ThinkingMode::CompatibleAuto,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(matches!(&done[0], ModelEvent::ProviderItem(item) if item["id"] == "rs_1"));
+
+        // The done-only replay stays suppressed for this stream as well.
+        let done_replay = parse_responses_event_for_mode(
+            &json!({"type":"response.reasoning_text.done", "text":"正在思考"}),
+            ThinkingMode::CompatibleAuto,
+            &mut state,
+        )
+        .unwrap();
+        assert!(done_replay.is_empty());
+    }
+
+    #[test]
+    fn compatible_responses_falls_back_to_completed_summary_without_deltas() {
+        // Endpoints that publish reasoning only once (at item completion)
+        // still surface it through the summary fallback.
+        let events = parse_responses_event_for_mode(
+            &json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "id":"rs_1",
+                    "type":"reasoning",
+                    "summary":[{"type":"summary_text","text":"完整思考"}]
+                }
+            }),
+            ThinkingMode::CompatibleAuto,
+            &mut ResponsesStreamState::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            events.first(),
+            Some(&ModelEvent::ReasoningDelta("完整思考".into()))
+        );
+        assert!(matches!(&events[1], ModelEvent::ProviderItem(item) if item["id"] == "rs_1"));
+    }
+
+    #[test]
+    fn openai_summary_replay_is_suppressed_after_summary_deltas() {
+        let mut state = ResponsesStreamState::default();
+        let delta = parse_responses_event_for_mode(
+            &json!({"type":"response.reasoning_summary_text.delta", "delta":"part"}),
+            ThinkingMode::OpenAiResponsesSummary,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(delta, vec![ModelEvent::ReasoningDelta("part".into())]);
+
+        let done = parse_responses_event_for_mode(
+            &json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "id":"rs_1",
+                    "type":"reasoning",
+                    "summary":[{"type":"summary_text","text":"part"}]
+                }
+            }),
+            ThinkingMode::OpenAiResponsesSummary,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(matches!(&done[0], ModelEvent::ProviderItem(_)));
     }
 
     fn assert_chat_reasoning(model: &str, field: &str) {

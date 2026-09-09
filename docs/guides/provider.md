@@ -23,7 +23,7 @@ Provider 配置、密钥、请求协议、reasoning、`response_id`、上下文�
 - 压缩检查点和 `/uncompact` 都清理 `previous_response_id`；压缩摘要不得与旧服务端状态混用。
 - 服务端状态失效后先清 ID，再用 `replay_safe_items` 重放；不得发送孤立 output 或无结果 call。
 - DeepSeek Responses 不用 previous ID；原生搜索与同名本地 tool 互斥。
-- Reasoning 事件按增量语义处理：空 content 不结束思考，done 的完整文本不重复追加；Qwen 3.7/3.8 字段按各协议隔离。
+- Reasoning 事件按增量语义处理：空 content 不结束思考，done 的完整文本不重复追加；完成项 `summary` 仅在该流未收到任何思考增量时兜底（流级状态判定）。Qwen 3.7/3.8 字段按各协议隔离；custom 端点两种协议统一 `CompatibleAuto`，兼容全部已知思考增量事件形态（`reasoning_summary_text`/`reasoning_text`/`reasoning_content`/`reasoning` 的 `.delta`）。
 - 诊断输出始终脱敏；HTTP 层指数退避重试仅在"未发出任何事件"的失败上生效（连接/发送阶段错误与 408/429/500/502/503/504）；流中断不重试，由 agent 层空输出重放兜底；`Retry-After` 优先并被 clamp 到 `retry_max_backoff_ms`。重试上限与退避参数来自 `ProviderConfig`（0 关闭）并 clamp。
 
 ## 诊断

@@ -2321,6 +2321,11 @@ fn thinking_mode_for(config: &ProviderConfig) -> ThinkingMode {
             ThinkingMode::VolcanoChat
         }
         (ProviderPreset::Custom, ProviderKind::ChatCompletions) => ThinkingMode::CompatibleAuto,
+        // A custom Responses endpoint (OpenAI-compatible gateways, Volcano Ark
+        // coding, ...) streams reasoning with any of the known delta shapes;
+        // `Disabled` here would silently drop every incremental reasoning
+        // event and leave only the completed item's summary replay.
+        (ProviderPreset::Custom, ProviderKind::Responses) => ThinkingMode::CompatibleAuto,
         _ => ThinkingMode::Disabled,
     }
 }
@@ -2410,6 +2415,12 @@ mod tests {
 
         config = ProviderPreset::Custom.defaults();
         assert_eq!(thinking_mode_for(&config), ThinkingMode::CompatibleAuto);
+        // A custom Responses endpoint must keep compatible reasoning parsing
+        // too; `Disabled` here dropped every incremental reasoning event and
+        // left only the completed item's summary replay.
+        config.kind = ProviderKind::Responses;
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::CompatibleAuto);
+        config.kind = ProviderKind::ChatCompletions;
         config.thinking = ThinkingCapability::Qwen;
         assert_eq!(thinking_mode_for(&config), ThinkingMode::QwenChat);
         config.kind = ProviderKind::Responses;
