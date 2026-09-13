@@ -23,6 +23,7 @@
         "used_tokens": 3000,
         "output_reserve_tokens": 8192,
         "safe_input_tokens": 116808,
+        "window_source": "config",
         "estimated": false
       }
     },

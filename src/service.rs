@@ -135,6 +135,16 @@ enum CoreCommand {
     GetProviderSettings {
         reply: oneshot::Sender<Result<crate::protocol::ProviderSettingsDto, ApiError>>,
     },
+    /// Lists the provider's models from the `GET {base_url}/models` cache.
+    /// `refresh = true` refetches first (provider endpoint, then models.dev)
+    /// when metadata fetching is enabled.
+    GetProviderModels {
+        refresh: bool,
+        reply: oneshot::Sender<Result<crate::protocol::ProviderModelsDto, ApiError>>,
+    },
+    /// A background metadata fetch finished; the engine re-stamps the active
+    /// provider and pushes a fresh context budget. No reply.
+    ModelMetadataRefreshed,
     /// Removes a saved provider profile, switching the active provider when it
     /// was the one removed.
     RemoveProvider {
@@ -163,6 +173,9 @@ struct Engine {
     bridge: Arc<crate::bridge::EventBridge>,
     pending: HashMap<String, PendingRecord>,
     approval_timeout: Duration,
+    /// Engine-bound clone of the command channel, used by background tasks
+    /// (model metadata fetches) to re-enter the state machine.
+    command_tx: mpsc::Sender<CoreCommand>,
 }
 
 impl Engine {
@@ -228,7 +241,7 @@ impl Engine {
         // moved into the app state machine.
         let context_dirty = matches!(
             &event,
-            AgentEvent::Usage(_)
+            AgentEvent::Usage { .. }
                 | AgentEvent::Completed { .. }
                 | AgentEvent::CompactionCompleted { .. }
                 | AgentEvent::CompactionFailed(_)
@@ -434,6 +447,7 @@ impl AppService {
             bridge: bridge.clone(),
             pending: HashMap::new(),
             approval_timeout: config.approval_timeout,
+            command_tx: command_tx.clone(),
         };
         let engine_task = tokio::spawn(run_engine(engine, command_rx));
         let event_capacity = bridge.max_events();
@@ -654,6 +668,20 @@ impl AppHandle {
             .map_err(|_| ApiError::internal("command dropped"))?
     }
 
+    /// Lists the provider's models for pickers. `refresh = true` refetches
+    /// the provider's `GET /models` and models.dev before answering (when
+    /// metadata fetching is enabled); `false` answers from cache instantly.
+    pub async fn provider_models(
+        &self,
+        refresh: bool,
+    ) -> Result<crate::protocol::ProviderModelsDto, ApiError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CoreCommand::GetProviderModels { refresh, reply: tx })
+            .await?;
+        rx.await
+            .map_err(|_| ApiError::internal("command dropped"))?
+    }
+
     /// Reads the provider settings view: the active profile, the saved
     /// per-preset profiles, and the presets with a currently resolvable API
     /// key. Never includes the keys themselves.
@@ -847,6 +875,13 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             let result = Ok(provider_settings(engine));
             let _ = reply.send(result);
         }
+        CoreCommand::GetProviderModels { refresh, reply } => {
+            let result = provider_models(engine, refresh).await;
+            let _ = reply.send(result);
+        }
+        CoreCommand::ModelMetadataRefreshed => {
+            model_metadata_refreshed(engine);
+        }
         CoreCommand::RemoveProvider { preset, reply } => {
             let result = remove_provider(engine, preset);
             let _ = reply.send(result);
@@ -929,24 +964,30 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
 
 /// Computes the context budget for a session: window, current usage, output
 /// reservation and the resulting safe input budget. The core is the single
-/// authority for context capacity.
+/// authority for context capacity. `window_source` reports which metadata
+/// tier the window came from (config / provider / community / registry /
+/// unknown); `estimated` is true whenever it is not an explicit config
+/// value, because discovered tiers can change as fetches land.
 fn context_budget(engine: &Engine, session_id: &str) -> Option<ContextBudgetDto> {
     let app = &engine.app;
     let runtime = app.runtime(session_id)?;
     let provider = &app.config.provider;
+    let resolved = crate::model_meta::resolve(provider);
     let window = runtime.context_limit_tokens;
     let used = runtime
         .context_used_tokens
         .max(crate::session::estimate_context_tokens(
             &runtime.conversation,
         ));
-    let reserve = u64::from(provider.max_output_tokens.unwrap_or(0));
+    let reserve = u64::from(resolved.max_output_tokens.unwrap_or(0));
+    let window_source = resolved.window_source_tag().to_owned();
     Some(ContextBudgetDto {
         context_window_tokens: window,
         used_tokens: used,
         output_reserve_tokens: reserve,
         safe_input_tokens: window.map(|w| w.saturating_sub(reserve).saturating_sub(used)),
-        estimated: provider.context_window_tokens.is_none(),
+        window_source,
+        estimated: resolved.window_source != crate::model_meta::MetaSource::Config,
     })
 }
 
@@ -1143,7 +1184,7 @@ pub(crate) fn routed_to_event(event: &AgentEvent) -> Option<Event> {
             call: call.clone(),
             result: result.clone(),
         },
-        AgentEvent::Usage(usage) => Event::Usage {
+        AgentEvent::Usage { usage, .. } => Event::Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             total_tokens: usage.total_tokens,
@@ -1249,6 +1290,12 @@ fn submit_input(
     let request_seq = app.current.request_seq;
     app.input.set(text.to_owned());
     app::submit_input(app).map_err(api_error)?;
+    // Lazy one-shot metadata fetch: the first submit with an unknown window
+    // triggers exactly one background refresh per session (explicit config
+    // and fresh cache rows short-circuit it inside the spawner).
+    if !app.current.metadata_fetch_attempted && app.current.context_limit_tokens.is_none() {
+        spawn_model_metadata_refresh(engine);
+    }
     // Submitting a message changes the used-token estimate; refresh the
     // safe-input budget for the target session.
     push_context_updated(engine, &session_id);
@@ -1450,6 +1497,8 @@ fn set_provider(engine: &mut Engine, preset: &str, model: &str) -> Result<(), Ap
     if !model.is_empty() && model != engine.app.config.provider.model {
         app::apply_model_choice(&mut engine.app, model.to_owned()).map_err(api_error)?;
     }
+    // Model switches and preset switches are both metadata fetch triggers.
+    spawn_model_metadata_refresh(engine);
     push_context_updated(engine, &engine.app.current.session_id);
     Ok(())
 }
@@ -1483,6 +1532,10 @@ fn set_provider_config(
     }
     let has_key = engine.app.active_secret.is_some();
     engine.app.config.provider = provider.clone();
+    // The incoming profile never carries runtime metadata (the field does not
+    // serialize); re-stamp from the cache before resolving the window so a
+    // previous run's fetch still applies to the new base URL/model.
+    app::stamp_discovered_meta(&mut engine.app.config, &engine.app.storage);
     engine.app.config.upsert_provider(provider);
     engine.app.current.context_limit_tokens =
         engine.app.config.provider.resolved_context_window_tokens();
@@ -1507,6 +1560,9 @@ fn set_provider_config(
         }
     };
     engine.app.current.status = status;
+    // Event-driven metadata refresh: a provider switch is a fetch trigger.
+    // Best effort, fully async — the reply never waits on the network.
+    spawn_model_metadata_refresh(engine);
     push_context_updated(engine, &engine.app.current.session_id);
     Ok(())
 }
@@ -1582,6 +1638,196 @@ fn provider_profile_dto(
         model: provider.model.clone(),
         base_url: provider.base_url.clone(),
     }
+}
+
+/// Lists the provider's models for pickers. `refresh = false` answers from
+/// the cached `provider-list|{base_url}` row (instant, offline-safe);
+/// `true` performs a bounded inline fetch first (explicit user action, so
+/// waiting up to the metadata timeout is acceptable) when
+/// `[model_metadata] fetch` is enabled and a key is cached. The DTO carries
+/// metadata only — never the API key.
+async fn provider_models(
+    engine: &mut Engine,
+    refresh: bool,
+) -> Result<crate::protocol::ProviderModelsDto, ApiError> {
+    if refresh {
+        run_model_metadata_refresh(engine).await;
+    }
+    let base_url = engine.app.config.provider.base_url.clone();
+    let row = engine
+        .app
+        .storage
+        .model_metadata(&crate::model_meta::provider_list_key(&base_url))
+        .ok()
+        .flatten();
+    let models = row
+        .as_ref()
+        .and_then(|row| row.payload.as_deref())
+        .and_then(|payload| {
+            serde_json::from_str::<Vec<crate::provider::ProviderModelInfo>>(payload).ok()
+        })
+        .unwrap_or_default();
+    Ok(crate::protocol::ProviderModelsDto {
+        models: models
+            .into_iter()
+            .map(|model| crate::protocol::ProviderModelDto {
+                id: model.id,
+                context_window_tokens: model.context_window_tokens,
+                max_output_tokens: model.max_output_tokens,
+            })
+            .collect(),
+        fetched_at: row.map(|row| row.fetched_at),
+    })
+}
+
+/// Performs the metadata fetches for one provider endpoint — `GET
+/// {base_url}/models` (cached as the model list plus per-model rows) and
+/// models.dev (community rows) — and persists them. Every failure is
+/// swallowed: metadata is best effort and the snapshot/registry tiers
+/// remain the fallback. Returns whether any rows were written.
+async fn fetch_and_cache_metadata(
+    client: &crate::provider::OpenAiClient,
+    base_url: &str,
+    timeout_ms: u64,
+    storage: &Storage,
+) -> bool {
+    let mut written = false;
+    if let Ok(models) = client.list_models(timeout_ms).await {
+        for model in &models {
+            if model.context_window_tokens.is_some() || model.max_output_tokens.is_some() {
+                let _ = storage.save_model_metadata(
+                    &crate::model_meta::provider_meta_key(base_url, &model.id),
+                    "provider",
+                    model.context_window_tokens,
+                    model.max_output_tokens,
+                    None,
+                );
+            }
+        }
+        if let Ok(payload) = serde_json::to_string(&models) {
+            let _ = storage.save_model_metadata(
+                &crate::model_meta::provider_list_key(base_url),
+                "provider",
+                None,
+                None,
+                Some(&payload),
+            );
+        }
+        written = true;
+    }
+    if let Ok(table) = crate::model_meta::fetch_community_models(timeout_ms).await {
+        let rows = table
+            .into_iter()
+            .map(|(model, meta)| {
+                (
+                    crate::model_meta::community_meta_key(&model),
+                    meta.context_window_tokens,
+                    meta.max_output_tokens,
+                )
+            })
+            .collect::<Vec<_>>();
+        if storage
+            .save_model_metadata_batch("community", &rows)
+            .is_ok()
+        {
+            written = written || !rows.is_empty();
+        }
+    }
+    written
+}
+
+/// Whether a cached row is newer than the configured TTL.
+fn metadata_row_is_fresh(engine: &Engine, key: &str) -> bool {
+    // `ttl_hours` is clamped to 1..=168 at load, so the cast cannot overflow.
+    let ttl_secs = engine.app.config.model_metadata.ttl_hours as i64 * 3600;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    engine
+        .app
+        .storage
+        .model_metadata(key)
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.fetched_at.saturating_add(ttl_secs) >= now)
+}
+
+/// Spawns the background metadata fetch for the active provider (provider
+/// switch / model switch triggers). Skipped silently when fetching is
+/// disabled, no API key is cached, or a fresh cached row already covers the
+/// active model (TTL gates the *attempt* only — cached values stay usable).
+/// The reply path never waits on this task.
+fn spawn_model_metadata_refresh(engine: &Engine) {
+    if !engine.app.config.model_metadata.fetch {
+        return;
+    }
+    let Some((_, api_key)) = engine.app.active_secret.as_ref() else {
+        return;
+    };
+    let base_url = engine.app.config.provider.base_url.clone();
+    let model = engine.app.config.provider.model.clone();
+    if metadata_row_is_fresh(
+        engine,
+        &crate::model_meta::provider_meta_key(&base_url, &model),
+    ) || metadata_row_is_fresh(engine, &crate::model_meta::community_meta_key(&model))
+    {
+        return;
+    }
+    let Ok(client) = crate::provider::OpenAiClient::new(base_url.clone(), api_key.clone()) else {
+        return;
+    };
+    let timeout_ms = engine.app.config.model_metadata.timeout_ms;
+    let storage = engine.app.storage.clone();
+    let command_tx = engine.command_tx.clone();
+    tokio::spawn(async move {
+        fetch_and_cache_metadata(&client, &base_url, timeout_ms, &storage).await;
+        let _ = command_tx.try_send(CoreCommand::ModelMetadataRefreshed);
+    });
+}
+
+/// Explicit refresh (settings screen): fetches inline — bounded by the
+/// metadata timeout — then re-stamps the active provider. Disabled or
+/// keyless setups fall through to the cache read.
+async fn run_model_metadata_refresh(engine: &mut Engine) {
+    if !engine.app.config.model_metadata.fetch {
+        return;
+    }
+    let Some((_, api_key)) = engine.app.active_secret.clone() else {
+        return;
+    };
+    let base_url = engine.app.config.provider.base_url.clone();
+    let Ok(client) = crate::provider::OpenAiClient::new(base_url.clone(), api_key) else {
+        return;
+    };
+    let timeout_ms = engine.app.config.model_metadata.timeout_ms;
+    let storage = engine.app.storage.clone();
+    fetch_and_cache_metadata(&client, &base_url, timeout_ms, &storage).await;
+    model_metadata_refreshed(engine);
+}
+
+/// A metadata fetch (background or inline) finished: re-stamp the active
+/// provider from the cache, propagate the stamp into live runners so
+/// in-flight compaction sees the fresh window, refresh the context budget,
+/// and mark the one-shot lazy attempt as done.
+fn model_metadata_refreshed(engine: &mut Engine) {
+    let base_url = engine.app.config.provider.base_url.clone();
+    let model = engine.app.config.provider.model.clone();
+    let discovered = app::stamp_discovered_meta(&mut engine.app.config, &engine.app.storage);
+    // `discovered` is `#[serde(skip)]`, so saved profiles stay clean; only
+    // the in-memory runner copies are patched in place.
+    for runtime in engine.app.background.values_mut() {
+        if let Some(runner) = runtime.runner.as_mut() {
+            runner.set_discovered_meta(&base_url, &model, discovered);
+        }
+    }
+    if let Some(runner) = engine.app.current.runner.as_mut() {
+        runner.set_discovered_meta(&base_url, &model, discovered);
+    }
+    engine.app.current.context_limit_tokens =
+        engine.app.config.provider.resolved_context_window_tokens();
+    engine.app.current.metadata_fetch_attempted = true;
+    push_context_updated(engine, &engine.app.current.session_id);
 }
 
 /// Removes a saved provider profile, switching the active provider (and its

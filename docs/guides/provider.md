@@ -7,6 +7,7 @@ Provider 配置、密钥、请求协议、reasoning、`response_id`、上下文�
 ## 入口
 
 - 配置：`ProviderConfig`、`ProviderPreset`、`provider_for`、`upsert_provider`、`remove_provider`（`src/config.rs`）。
+- 元数据链：`src/model_meta.rs`（四层解析、models.dev 快照与解析、`GET /models` 解析、防投毒边界）、`OpenAiClient::list_models`（单次尝试、per-request 超时、1 MiB 体积上限）、`storage.rs` 的 `model_metadata` 缓存表、`AppHandle::provider_models(refresh)`。
 - 密钥：`api_key_cached*`、`store_api_key_cached`（core `secrets` facade），仅存在性/解锁入口暴露给消费端。
 - 切换/编辑：消费端只经 `AppHandle::set_provider_profile`（模型 + 可选 base_url/kind，档案合并语义）/`set_provider`/`set_provider_config`/`remove_provider` 提交，不直接改配置；设置视图 `AppHandle::provider_settings()`（active/saved/connected，密钥永不入 DTO，connected 为缓存级解析）；首页选择 `HomeSelection`/`apply_home_selection` 是 TUI 侧入口。
 - 请求/恢复：`replay_safe_items`、请求游标、`src/provider/openai.rs`、`storage.rs` 的 Provider 状态。
@@ -19,7 +20,7 @@ Provider 配置、密钥、请求协议、reasoning、`response_id`、上下文�
 - 消费端不读取 API Key 进模型上下文、不直接构造 Provider 请求、不解析私有 JSON/SSE；Provider 事件先规范化为公共 `ModelEvent`，再经 protocol 映射给消费端。
 - 首页只复制按 preset 去重的非密钥档案；仅 `StartNew` 将所选 Provider/模型/mode 应用到配置与新会话并按需解锁，`Resume` 仍恢复目标会话状态。
 - 切换 Provider/模型必须重建 runner 并清理旧 `response_id`。增量游标从最新用户消息开始且保留其后 `@` 上下文。
-- 容量预算（core 唯一权威）：`context_window_tokens` 显式优先，否则查 Provider 感知注册表；未知模型返回 `None`（不设默认窗口），必须显式配置。`max_output_tokens` 既是每请求输出硬上限（Responses 用 `max_output_tokens`、OpenAI chat 用 `max_completion_tokens`、其他 chat 用 `max_tokens`）也是输出预留。`safe_input_capacity = 窗口 − 输出预留 − 系统开销(4096)`；超窗先全轮压缩，失败再 hinted 硬裁并插入本地化提示，绝不静默预裁。
+- 容量预算（core 唯一权威）：窗口按元数据链解析——显式 `context_window_tokens` > 运行时发现（`GET {base_url}/models`，models.dev 社区库）> 内置 Provider 感知注册表；未知模型返回 `None`（不设默认窗口）。发现值只在 `[4096, 10_000_000]`（窗口）/`[1024, 131072]`（输出）界内接受，越界拒绝不 clamp；`ProviderConfig.discovered` 为运行时戳（`#[serde(skip)]`，不序列化），由 `stamp_discovered_meta` 从缓存重建并同步 live runner。发现型 `max_output_tokens` 只用于预算预留与展示，绝不注入请求体。拉取全部事件驱动（切换 Provider/模型、未知窗口的首次 submit、设置显式刷新），无轮询、冷启动零网络；`[model_metadata] fetch = false` 全程离线，TTL（1..=168h）只门控刷新尝试，缓存值在替换前一直可用；models.dev 请求不带密钥与用户数据。`max_output_tokens` 既是每请求输出硬上限（Responses 用 `max_output_tokens`、OpenAI chat 用 `max_completion_tokens`、其他 chat 用 `max_tokens`）也是输出预留。`safe_input_capacity = 窗口 − 输出预留 − 系统开销(4096)`；超窗先全轮压缩，失败再 hinted 硬裁并插入本地化提示，绝不静默预裁。token 估算（字节/4）按会话校准因子（真实用量/估算，clamp 0.5..=2.0，仅全量重放轮采样）缩放。
 - 压缩检查点和 `/uncompact` 都清理 `previous_response_id`；压缩摘要不得与旧服务端状态混用。
 - 服务端状态失效后先清 ID，再用 `replay_safe_items` 重放；不得发送孤立 output 或无结果 call。
 - DeepSeek Responses 不用 previous ID；原生搜索与同名本地 tool 互斥。
@@ -38,8 +39,8 @@ Provider 配置、密钥、请求协议、reasoning、`response_id`、上下文�
 
 ## 验证
 
-- 迭代过滤器：`config::tests`、`settings::tests`、`secrets::tests`、`provider::openai::tests`、`provider::tests`（重试决策）。
+- 迭代过滤器：`config::tests`、`settings::tests`、`secrets::tests`、`provider::openai::tests`、`provider::tests`（重试决策）、`model_meta::tests`（解析链、字段形态、边界拒绝）。
 - Agent 状态过滤器：`incremental_cursor_keeps_latest_user_message_and_following_context`、`stateless_replay_keeps_only_complete_ordered_tool_pairs`、`provider_retry_event_reaches_the_ui_channel`。
 - 完成阶段按根文档运行一次 lib 测试；涉及存储恢复时升级到完整测试。
-- 重试测试用 `OpenAiClient::scripted_with_failures`/`scripted_steps`（`Fail`/`Events`/`EventsThenFail`）模拟"发出事件后再失败"的流中断，验证不重试防 delta 重放；集成测用 1ms 退避避免 flaky。
+- 重试测试用 `OpenAiClient::scripted_with_failures`/`scripted_steps`（`Fail`/`Events`/`EventsThenFail`/`Models`）模拟"发出事件后再失败"的流中断与元数据结果，验证不重试防 delta 重放；集成测用 1ms 退避避免 flaky。
 - 新增 `ModelEvent` 变体需一次接通：`StreamCollector::on_event` 的 `other => Some(other)` 自动透传 → agent 主/子 forward 闭包显式分支（`Send`/`SendMany`（一事件展开为有序序列，如 `ReasoningCompleted`+`TextDelta`）/`SendIgnore`）→ 确认 `should_coalesce_stream_redraw` 是否需合并低频事件；跨层接线链见 UI Contract 专题。

@@ -155,6 +155,19 @@ impl Storage {
                 existed INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
+            -- Model metadata cache: provider `/models` and models.dev rows.
+            -- `key` is 'provider-list|{base_url}' (payload = the full id
+            -- list), 'provider|{base_url}|{model}', or 'community|{model}'.
+            -- TTL is judged by the reader; cached values stay usable until a
+            -- newer fetch replaces them.
+            CREATE TABLE IF NOT EXISTS model_metadata (
+                key TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                context_window_tokens INTEGER,
+                max_output_tokens INTEGER,
+                payload TEXT,
+                fetched_at INTEGER NOT NULL
+            );
             -- Cursor pagination reads messages newest-first along the head
             -- chain; the session_id+hidden+id index keeps that query index-only.
             CREATE INDEX IF NOT EXISTS idx_messages_session_hidden_id
@@ -171,6 +184,8 @@ impl Storage {
             VALUES (5, CURRENT_TIMESTAMP);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (6, CURRENT_TIMESTAMP);
+            INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+            VALUES (7, CURRENT_TIMESTAMP);
             ",
         )?;
         // These checks keep databases created by the first release compatible
@@ -1215,9 +1230,114 @@ impl Storage {
         Ok(())
     }
 
+    /// Upserts one model-metadata cache row (`fetched_at` = now). `payload`
+    /// carries the serialized model-id list for `provider-list|…` keys.
+    pub fn save_model_metadata(
+        &self,
+        key: &str,
+        source: &str,
+        context_window_tokens: Option<u64>,
+        max_output_tokens: Option<u32>,
+        payload: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.lock()?.execute(
+            "INSERT INTO model_metadata(key, source, context_window_tokens, max_output_tokens, payload, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(key) DO UPDATE SET
+                source = excluded.source,
+                context_window_tokens = excluded.context_window_tokens,
+                max_output_tokens = excluded.max_output_tokens,
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at",
+            params![
+                key,
+                source,
+                context_window_tokens,
+                max_output_tokens,
+                payload,
+                Utc::now().timestamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Upserts many per-model metadata rows in one transaction (used for a
+    /// models.dev refresh). Rows with no metadata at all are skipped.
+    pub fn save_model_metadata_batch(
+        &self,
+        source: &str,
+        rows: &[(String, Option<u64>, Option<u32>)],
+    ) -> Result<usize, StorageError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let now = Utc::now().timestamp();
+        let mut written = 0usize;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO model_metadata(key, source, context_window_tokens, max_output_tokens, payload, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5)
+                 ON CONFLICT(key) DO UPDATE SET
+                    source = excluded.source,
+                    context_window_tokens = excluded.context_window_tokens,
+                    max_output_tokens = excluded.max_output_tokens,
+                    payload = excluded.payload,
+                    fetched_at = excluded.fetched_at",
+            )?;
+            for (key, context_window_tokens, max_output_tokens) in rows {
+                if context_window_tokens.is_none() && max_output_tokens.is_none() {
+                    continue;
+                }
+                statement.execute(params![
+                    key,
+                    source,
+                    context_window_tokens,
+                    max_output_tokens,
+                    now
+                ])?;
+                written += 1;
+            }
+        }
+        transaction.commit()?;
+        Ok(written)
+    }
+
+    /// Reads one cache row. Errors are meant to be treated as a miss by
+    /// callers (the metadata chain falls through to the snapshot/registry).
+    pub fn model_metadata(&self, key: &str) -> Result<Option<ModelMetadataRow>, StorageError> {
+        self.lock()?
+            .query_row(
+                "SELECT source, context_window_tokens, max_output_tokens, payload, fetched_at
+                 FROM model_metadata WHERE key = ?1",
+                [key],
+                |row| {
+                    Ok(ModelMetadataRow {
+                        source: row.get(0)?,
+                        context_window_tokens: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                        max_output_tokens: row
+                            .get::<_, Option<i64>>(2)?
+                            .and_then(|v| u32::try_from(v).ok()),
+                        payload: row.get(3)?,
+                        fetched_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         self.connection.lock().map_err(|_| StorageError::Poisoned)
     }
+}
+
+/// One cached model-metadata row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelMetadataRow {
+    pub source: String,
+    pub context_window_tokens: Option<u64>,
+    pub max_output_tokens: Option<u32>,
+    pub payload: Option<String>,
+    pub fetched_at: i64,
 }
 
 fn append_message_on_turn(
@@ -1445,6 +1565,71 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session);
         assert_eq!(sessions[0].title, "hello");
+    }
+
+    #[test]
+    fn model_metadata_rows_roundtrip_and_batch_skips_empty_entries() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .save_model_metadata(
+                "provider|https://gw/v1|big-model",
+                "provider",
+                Some(200_000),
+                Some(32_768),
+                None,
+            )
+            .unwrap();
+        let row = storage
+            .model_metadata("provider|https://gw/v1|big-model")
+            .unwrap()
+            .expect("row present");
+        assert_eq!(row.source, "provider");
+        assert_eq!(row.context_window_tokens, Some(200_000));
+        assert_eq!(row.max_output_tokens, Some(32_768));
+        assert!(row.fetched_at > 0);
+
+        // A list row carries the payload and no per-model limits.
+        storage
+            .save_model_metadata(
+                "provider-list|https://gw/v1",
+                "provider",
+                None,
+                None,
+                Some(r#"[{"id":"big-model"}]"#),
+            )
+            .unwrap();
+        let list = storage
+            .model_metadata("provider-list|https://gw/v1")
+            .unwrap()
+            .expect("list row present");
+        assert_eq!(list.payload.as_deref(), Some(r#"[{"id":"big-model"}]"#));
+        assert!(list.context_window_tokens.is_none());
+
+        // Batch upserts skip empty entries and overwrite existing rows.
+        let written = storage
+            .save_model_metadata_batch(
+                "community",
+                &[
+                    ("community|big-model".to_owned(), Some(256_000), Some(8_192)),
+                    ("community|empty".to_owned(), None, None),
+                ],
+            )
+            .unwrap();
+        assert_eq!(written, 1);
+        let community = storage
+            .model_metadata("community|big-model")
+            .unwrap()
+            .expect("community row present");
+        assert_eq!(community.context_window_tokens, Some(256_000));
+        assert!(storage.model_metadata("community|empty").unwrap().is_none());
+
+        // Missing keys are a plain miss, not an error.
+        assert!(
+            storage
+                .model_metadata("provider|https://gw/v1|other-model")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

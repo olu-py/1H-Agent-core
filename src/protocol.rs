@@ -342,6 +342,29 @@ pub struct ProviderSettingsDto {
     pub connected: Vec<String>,
 }
 
+/// One model entry of the provider's `GET /models` list. Metadata fields are
+/// `null` when the endpoint does not report them (plain OpenAI-compatible
+/// servers list ids only; OpenRouter and LM Studio expose window/output
+/// limits).
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export)]
+pub struct ProviderModelDto {
+    pub id: String,
+    pub context_window_tokens: Option<u64>,
+    pub max_output_tokens: Option<u32>,
+}
+
+/// The provider's model list for settings screens, served from the
+/// `model_metadata` cache after an explicit or triggered refresh.
+/// `fetched_at` is the Unix seconds of the last successful provider fetch
+/// (`None` when only static lists are available).
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export)]
+pub struct ProviderModelsDto {
+    pub models: Vec<ProviderModelDto>,
+    pub fetched_at: Option<i64>,
+}
+
 /// Per-session context capacity, computed by the core.
 ///
 /// The core is the single authority for context capacity; the TUI must not
@@ -362,8 +385,13 @@ pub struct ContextBudgetDto {
     /// Safe available input budget = window − reserve − used. `None` when the
     /// window is unknown.
     pub safe_input_tokens: Option<u64>,
-    /// True when the window came from the built-in model registry (an
-    /// estimate); false when it is an explicit user configuration.
+    /// Which metadata tier the window came from: `config` (explicit TOML),
+    /// `provider` (`GET /models` discovery), `community` (models.dev),
+    /// `registry` (built-in static tables), or `unknown` (no window).
+    pub window_source: String,
+    /// True when the window is not an explicit user configuration (i.e.
+    /// anything other than `config`); discovered tiers can change as
+    /// fetches land.
     pub estimated: bool,
 }
 
@@ -536,6 +564,7 @@ mod tests {
                     used_tokens: 1000,
                     output_reserve_tokens: 8192,
                     safe_input_tokens: Some(118_808),
+                    window_source: "registry".to_owned(),
                     estimated: true,
                 },
             },

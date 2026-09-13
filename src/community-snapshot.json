@@ -1,0 +1,6 @@
+{
+  "snapshot_date": null,
+  "source": "https://api.models.dev",
+  "note": "Offline community fallback for the model metadata chain. Regenerate with scripts/fetch-models-dev.sh at release time; runtime refreshes land in the model_metadata SQLite cache instead of this file. An empty models map is valid: the built-in registry remains the last fallback.",
+  "models": {}
+}

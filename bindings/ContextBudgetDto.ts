@@ -29,7 +29,14 @@ output_reserve_tokens: bigint,
  */
 safe_input_tokens: bigint | null, 
 /**
- * True when the window came from the built-in model registry (an
- * estimate); false when it is an explicit user configuration.
+ * Which metadata tier the window came from: `config` (explicit TOML),
+ * `provider` (`GET /models` discovery), `community` (models.dev),
+ * `registry` (built-in static tables), or `unknown` (no window).
+ */
+window_source: string, 
+/**
+ * True when the window is not an explicit user configuration (i.e.
+ * anything other than `config`); discovered tiers can change as
+ * fetches land.
  */
 estimated: boolean, };

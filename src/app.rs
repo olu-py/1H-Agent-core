@@ -64,7 +64,7 @@ pub(crate) struct RoutedEvent {
 /// the WebUI server, which only replaces the `router_rx` consumer.
 pub(crate) async fn build_app(
     workspace_path: PathBuf,
-    config: Config,
+    mut config: Config,
     storage: Storage,
     session_id: String,
 ) -> Result<App> {
@@ -114,6 +114,10 @@ pub(crate) async fn build_app(
         .and_then(|value| AgentMode::parse(&value))
         .unwrap_or_default();
     registry.set_mode(initial_mode);
+    // Rebuild the runtime-discovered metadata for the active provider from
+    // the cache before any runtime exists — startup never touches the
+    // network, but a previous run's fetch still seeds the window.
+    stamp_discovered_meta(&mut config, &storage);
     let mut runtime = build_runtime(
         &storage,
         &config,
@@ -145,6 +149,48 @@ pub(crate) async fn build_app(
     })
 }
 
+/// Rebuilds `config.provider.discovered` from the `model_metadata` cache:
+/// the provider `/models` row for the active base URL + model first, then
+/// the models.dev community row. Pure storage reads — never network. Returns
+/// the stamped value so callers can propagate it into live runners.
+pub(crate) fn stamp_discovered_meta(
+    config: &mut Config,
+    storage: &Storage,
+) -> Option<crate::model_meta::DiscoveredMeta> {
+    let base_url = config.provider.base_url.clone();
+    let model = config.provider.model.clone();
+    let mut discovered = storage
+        .model_metadata(&crate::model_meta::provider_meta_key(&base_url, &model))
+        .ok()
+        .flatten()
+        .filter(|row| row.context_window_tokens.is_some() || row.max_output_tokens.is_some())
+        .map(|row| crate::model_meta::DiscoveredMeta {
+            source: crate::model_meta::MetaSource::ProviderApi,
+            meta: crate::model_meta::ModelMeta {
+                context_window_tokens: row.context_window_tokens,
+                max_output_tokens: row.max_output_tokens,
+            },
+            fetched_at: row.fetched_at,
+        });
+    if discovered.is_none() {
+        discovered = storage
+            .model_metadata(&crate::model_meta::community_meta_key(&model))
+            .ok()
+            .flatten()
+            .filter(|row| row.context_window_tokens.is_some() || row.max_output_tokens.is_some())
+            .map(|row| crate::model_meta::DiscoveredMeta {
+                source: crate::model_meta::MetaSource::Community,
+                meta: crate::model_meta::ModelMeta {
+                    context_window_tokens: row.context_window_tokens,
+                    max_output_tokens: row.max_output_tokens,
+                },
+                fetched_at: row.fetched_at,
+            });
+    }
+    config.provider.discovered = discovered;
+    discovered
+}
+
 pub(crate) fn apply_provider_choice(app: &mut App, preset: ProviderPreset) -> Result<()> {
     if preset == app.config.provider.preset {
         return Ok(());
@@ -167,6 +213,7 @@ pub(crate) fn apply_provider_choice(app: &mut App, preset: ProviderPreset) -> Re
     app.storage.clear_response_id(&app.current.session_id)?;
     app.config.provider = provider;
     app.active_secret = Some((preset, api_key));
+    stamp_discovered_meta(&mut app.config, &app.storage);
     app.current.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
     rebuild_runner(app)?;
     app.current.status = match app.config.save() {
@@ -189,6 +236,7 @@ pub(crate) fn apply_model_choice(app: &mut App, model: String) -> Result<()> {
     }
     app.config.provider.model = model;
     app.config.provider.normalize_thinking();
+    stamp_discovered_meta(&mut app.config, &app.storage);
     app.config.upsert_provider(app.config.provider.clone());
     app.current.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
     app.storage.clear_response_id(&app.current.session_id)?;
@@ -311,8 +359,10 @@ pub(crate) fn submit_input(app: &mut App) -> Result<()> {
     // No fixed item/byte trim here: context capacity is the model window minus
     // the output reservation and system overhead, and overflow is handled by
     // full-turn compaction (falling back to a hinted hard-limit trim). The
-    // estimated usage below feeds the authoritative context budget.
-    app.current.context_used_tokens = estimate_context_tokens(&app.current.conversation);
+    // calibrated usage below feeds the authoritative context budget.
+    app.current.context_used_tokens = (estimate_context_tokens(&app.current.conversation) as f64
+        * app.current.token_calibration)
+        .ceil() as u64;
     app.current.busy = true;
     app.current.agent_phase = AgentPhase::Thinking;
     app.current.model_phase = ModelPhase::Idle;
@@ -774,7 +824,8 @@ pub(crate) fn rebuild_runner(app: &mut App) -> Result<()> {
         .with_approval_lock(app.approval_lock.clone())
         .with_configured_agents(app.config.agents.clone())
         .with_child_role(child_role)
-        .with_child_provider_resolver(child_provider_resolver),
+        .with_child_provider_resolver(child_provider_resolver)
+        .with_token_calibration(app.current.token_calibration),
     );
     Ok(())
 }
@@ -1070,6 +1121,8 @@ fn build_runtime(
         usage: Usage::default(),
         context_used_tokens: estimate_context_tokens(&conversation),
         context_limit_tokens: provider_config.resolved_context_window_tokens(),
+        token_calibration: 1.0,
+        metadata_fetch_attempted: false,
         pending_approval: None,
         mode,
         child_role,
@@ -1853,6 +1906,8 @@ mod tests {
             usage: Usage::default(),
             context_used_tokens: 1,
             context_limit_tokens: None,
+            token_calibration: 1.0,
+            metadata_fetch_attempted: false,
             pending_approval: None,
             mode: AgentMode::default(),
             child_role: None,

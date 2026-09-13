@@ -23,6 +23,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub runtime: RuntimeConfig,
     pub compaction: CompactionConfig,
+    pub model_metadata: ModelMetadataConfig,
     pub security: SecurityConfig,
     pub permissions: PermissionConfig,
     pub browser: BrowserConfig,
@@ -92,6 +93,40 @@ pub struct ProviderConfig {
     pub retry_max_attempts: u32,
     pub retry_initial_backoff_ms: u64,
     pub retry_max_backoff_ms: u64,
+    /// Runtime-discovered metadata (provider `/models` or models.dev),
+    /// stamped by the engine from the `model_metadata` cache. Never
+    /// serialized: it is rebuilt after every restart or provider switch, and
+    /// an explicit `context_window_tokens` / `max_output_tokens` always wins
+    /// over it (see `model_meta::resolve`).
+    #[serde(skip)]
+    pub discovered: Option<crate::model_meta::DiscoveredMeta>,
+}
+
+/// Runtime model metadata discovery: `GET {base_url}/models` and the
+/// models.dev community database. All fetching is event-driven (provider
+/// switch, first submit with an unknown window, manual refresh); there is no
+/// polling and the process never touches the network at startup.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ModelMetadataConfig {
+    /// Master switch for runtime metadata fetches. `false` keeps the process
+    /// fully offline: only the explicit config, the committed models.dev
+    /// snapshot, and the built-in registry are consulted.
+    pub fetch: bool,
+    /// How long a cached fetch stays fresh before a trigger refreshes it.
+    pub ttl_hours: u64,
+    /// Per-request timeout for metadata fetches.
+    pub timeout_ms: u64,
+}
+
+impl Default for ModelMetadataConfig {
+    fn default() -> Self {
+        Self {
+            fetch: true,
+            ttl_hours: 24,
+            timeout_ms: 5000,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -533,6 +568,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
             compaction: CompactionConfig::default(),
+            model_metadata: ModelMetadataConfig::default(),
             security: SecurityConfig::default(),
             permissions: PermissionConfig::default(),
             browser: BrowserConfig::default(),
@@ -563,6 +599,7 @@ impl Default for ProviderConfig {
             retry_max_attempts: 3,
             retry_initial_backoff_ms: 500,
             retry_max_backoff_ms: 8000,
+            discovered: None,
         }
     }
 }
@@ -639,6 +676,8 @@ impl Config {
                 Some(limit.clamp(64, 64_000))
             };
         }
+        config.model_metadata.ttl_hours = config.model_metadata.ttl_hours.clamp(1, 168);
+        config.model_metadata.timeout_ms = config.model_metadata.timeout_ms.clamp(1000, 15_000);
         if config.browser.timeout_seconds == 0 || config.browser.timeout_seconds > 3600 {
             anyhow::bail!("browser timeout must be between 1 and 3600 seconds");
         }
@@ -786,14 +825,14 @@ impl ProviderConfig {
             self.thinking_budget_tokens = None;
         }
     }
-    /// The model's context window: an explicit `context_window_tokens` always
-    /// wins; otherwise the provider-aware registry is consulted. Returns `None`
-    /// for models the registry does not know, so no request is sent against an
-    /// uncertain default window — an unknown model must set
-    /// `context_window_tokens` explicitly.
+    /// The model's context window, resolved through the metadata chain
+    /// (`model_meta::resolve`): explicit `context_window_tokens` >
+    /// runtime-discovered metadata (provider `/models`, models.dev) > the
+    /// built-in registry. Returns `None` for models nothing knows, so no
+    /// request is sent against an uncertain default window — an unknown model
+    /// must set `context_window_tokens` explicitly.
     pub fn resolved_context_window_tokens(&self) -> Option<u64> {
-        self.context_window_tokens
-            .or_else(|| known_context_window(self.preset, &self.model))
+        crate::model_meta::resolve(self).context_window_tokens
     }
 
     pub fn validate(&mut self) -> Result<()> {
@@ -895,6 +934,7 @@ impl ProviderPreset {
             retry_max_attempts: 3,
             retry_initial_backoff_ms: 500,
             retry_max_backoff_ms: 8000,
+            discovered: None,
         };
         config.normalize_thinking();
         config
@@ -970,40 +1010,51 @@ const VOLCANO_SELECTABLE_MODELS: &[&str] =
 struct ModelRule {
     model: &'static str,
     context_window_tokens: u64,
+    /// Documented output cap when publicly known; `None` leaves the reserve
+    /// to explicit config or discovered metadata.
+    max_output_tokens: Option<u32>,
 }
 
 const OPENAI_EXACT_MODELS: &[ModelRule] = &[
     ModelRule {
         model: "o1-mini",
         context_window_tokens: 128_000,
+        max_output_tokens: Some(65_536),
     },
     ModelRule {
         model: "o1-preview",
         context_window_tokens: 128_000,
+        max_output_tokens: Some(65_536),
     },
     ModelRule {
         model: "o1",
         context_window_tokens: 200_000,
+        max_output_tokens: Some(100_000),
     },
     ModelRule {
         model: "o3",
         context_window_tokens: 200_000,
+        max_output_tokens: Some(100_000),
     },
     ModelRule {
         model: "o4-mini",
         context_window_tokens: 200_000,
+        max_output_tokens: Some(100_000),
     },
     ModelRule {
         model: "gpt-5.6-sol",
         context_window_tokens: 1_050_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "gpt-5.6-terra",
         context_window_tokens: 1_050_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "gpt-5.6-luna",
         context_window_tokens: 1_050_000,
+        max_output_tokens: None,
     },
 ];
 
@@ -1011,46 +1062,57 @@ const OPENAI_PREFIX_MODELS: &[ModelRule] = &[
     ModelRule {
         model: "o1-mini",
         context_window_tokens: 128_000,
+        max_output_tokens: Some(65_536),
     },
     ModelRule {
         model: "o1-preview",
         context_window_tokens: 128_000,
+        max_output_tokens: Some(65_536),
     },
     ModelRule {
         model: "o1",
         context_window_tokens: 200_000,
+        max_output_tokens: Some(100_000),
     },
     ModelRule {
         model: "o3",
         context_window_tokens: 200_000,
+        max_output_tokens: Some(100_000),
     },
     ModelRule {
         model: "o4-mini",
         context_window_tokens: 200_000,
+        max_output_tokens: Some(100_000),
     },
     ModelRule {
         model: "gpt-5.6-sol",
         context_window_tokens: 1_050_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "gpt-5.6-terra",
         context_window_tokens: 1_050_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "gpt-5.6-luna",
         context_window_tokens: 1_050_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "gpt-4.1",
         context_window_tokens: 1_047_576,
+        max_output_tokens: Some(32_768),
     },
     ModelRule {
         model: "gpt-4o",
         context_window_tokens: 128_000,
+        max_output_tokens: Some(16_384),
     },
     ModelRule {
         model: "gpt-5",
         context_window_tokens: 400_000,
+        max_output_tokens: Some(128_000),
     },
 ];
 
@@ -1058,18 +1120,22 @@ const DEEPSEEK_EXACT_MODELS: &[ModelRule] = &[
     ModelRule {
         model: "deepseek-chat",
         context_window_tokens: 128_000,
+        max_output_tokens: Some(8_192),
     },
     ModelRule {
         model: "deepseek-reasoner",
         context_window_tokens: 128_000,
+        max_output_tokens: Some(32_768),
     },
     ModelRule {
         model: "deepseek-v4-pro",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "deepseek-v4-flash",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
 ];
 
@@ -1077,18 +1143,22 @@ const DEEPSEEK_PREFIX_MODELS: &[ModelRule] = &[
     ModelRule {
         model: "deepseek-r1",
         context_window_tokens: 128_000,
+        max_output_tokens: Some(32_768),
     },
     ModelRule {
         model: "deepseek-v3",
         context_window_tokens: 128_000,
+        max_output_tokens: Some(8_192),
     },
     ModelRule {
         model: "deepseek-v4-pro",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "deepseek-v4-flash",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
 ];
 
@@ -1096,34 +1166,42 @@ const QWEN_EXACT_MODELS: &[ModelRule] = &[
     ModelRule {
         model: "qwen-max",
         context_window_tokens: 32_768,
+        max_output_tokens: Some(8_192),
     },
     ModelRule {
         model: "qwen-plus",
         context_window_tokens: 131_072,
+        max_output_tokens: Some(8_192),
     },
     ModelRule {
         model: "qwen-turbo",
         context_window_tokens: 1_000_000,
+        max_output_tokens: Some(8_192),
     },
     ModelRule {
         model: "qwen-long",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "qwen3.8-max",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "qwen3.7-max",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "qwen3.7-plus",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "qwen3.7-flash",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
 ];
 
@@ -1131,42 +1209,52 @@ const QWEN_PREFIX_MODELS: &[ModelRule] = &[
     ModelRule {
         model: "qwen-max",
         context_window_tokens: 32_768,
+        max_output_tokens: Some(8_192),
     },
     ModelRule {
         model: "qwen-plus",
         context_window_tokens: 131_072,
+        max_output_tokens: Some(8_192),
     },
     ModelRule {
         model: "qwen-turbo",
         context_window_tokens: 1_000_000,
+        max_output_tokens: Some(8_192),
     },
     ModelRule {
         model: "qwen-long",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "qwen3.8-max",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "qwen3.7-max",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "qwen3.7-plus",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "qwen3.7-flash",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "qwen2.5",
         context_window_tokens: 131_072,
+        max_output_tokens: Some(8_192),
     },
     ModelRule {
         model: "qwen3",
         context_window_tokens: 131_072,
+        max_output_tokens: Some(32_768),
     },
 ];
 
@@ -1174,158 +1262,199 @@ const VOLCANO_PREFIX_MODELS: &[ModelRule] = &[
     ModelRule {
         model: "doubao-seed",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "deepseek-v4-flash",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "glm-5.2",
         context_window_tokens: 1_000_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "deepseek-v4-pro",
         context_window_tokens: 200_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "glm-4.7",
         context_window_tokens: 200_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "minimax-m2.7",
         context_window_tokens: 200_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "minimax-m2.5",
         context_window_tokens: 200_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-seed-2.0-pro",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-seed-2.0-code",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-seed-2.0-lite",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "kimi-k2.6",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "kimi-k2.5",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-5-pro-32k",
         context_window_tokens: 32_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-5-lite-32k",
         context_window_tokens: 32_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-5-pro-128k",
         context_window_tokens: 128_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-5-lite-128k",
         context_window_tokens: 128_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-5-pro-256k",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-5-lite-256k",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-6-pro-32k",
         context_window_tokens: 32_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-6-lite-32k",
         context_window_tokens: 32_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-6-pro-128k",
         context_window_tokens: 128_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-6-lite-128k",
         context_window_tokens: 128_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-6-pro-256k",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-1-6-lite-256k",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-pro-32k",
         context_window_tokens: 32_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-lite-32k",
         context_window_tokens: 32_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-pro-128k",
         context_window_tokens: 128_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-lite-128k",
         context_window_tokens: 128_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-pro-256k",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
     ModelRule {
         model: "doubao-lite-256k",
         context_window_tokens: 256_000,
+        max_output_tokens: None,
     },
 ];
 
-fn known_context_window(preset: ProviderPreset, model: &str) -> Option<u64> {
+/// Built-in registry window lookup (the L4 tier of `model_meta::resolve`).
+pub(crate) fn known_context_window(preset: ProviderPreset, model: &str) -> Option<u64> {
+    known_model_rule(preset, model).map(|rule| rule.context_window_tokens)
+}
+
+/// Built-in registry output-cap lookup (L4 of `model_meta::resolve`).
+pub(crate) fn known_max_output(preset: ProviderPreset, model: &str) -> Option<u32> {
+    known_model_rule(preset, model).and_then(|rule| rule.max_output_tokens)
+}
+
+fn known_model_rule(preset: ProviderPreset, model: &str) -> Option<ModelRule> {
     let model = model.trim().to_ascii_lowercase();
     match preset {
         ProviderPreset::OpenAi => {
-            lookup_model_window(&model, OPENAI_EXACT_MODELS, OPENAI_PREFIX_MODELS)
+            lookup_model_rule(&model, OPENAI_EXACT_MODELS, OPENAI_PREFIX_MODELS)
         }
         ProviderPreset::DeepSeek => {
-            lookup_model_window(&model, DEEPSEEK_EXACT_MODELS, DEEPSEEK_PREFIX_MODELS)
+            lookup_model_rule(&model, DEEPSEEK_EXACT_MODELS, DEEPSEEK_PREFIX_MODELS)
         }
-        ProviderPreset::Qwen => lookup_model_window(&model, QWEN_EXACT_MODELS, QWEN_PREFIX_MODELS),
-        ProviderPreset::Volcano => lookup_model_window(&model, &[], VOLCANO_PREFIX_MODELS),
+        ProviderPreset::Qwen => lookup_model_rule(&model, QWEN_EXACT_MODELS, QWEN_PREFIX_MODELS),
+        ProviderPreset::Volcano => lookup_model_rule(&model, &[], VOLCANO_PREFIX_MODELS),
         ProviderPreset::Custom => {
-            lookup_model_window(&model, OPENAI_EXACT_MODELS, OPENAI_PREFIX_MODELS)
+            lookup_model_rule(&model, OPENAI_EXACT_MODELS, OPENAI_PREFIX_MODELS)
                 .or_else(|| {
-                    lookup_model_window(&model, DEEPSEEK_EXACT_MODELS, DEEPSEEK_PREFIX_MODELS)
+                    lookup_model_rule(&model, DEEPSEEK_EXACT_MODELS, DEEPSEEK_PREFIX_MODELS)
                 })
-                .or_else(|| lookup_model_window(&model, QWEN_EXACT_MODELS, QWEN_PREFIX_MODELS))
-                .or_else(|| lookup_model_window(&model, &[], VOLCANO_PREFIX_MODELS))
+                .or_else(|| lookup_model_rule(&model, QWEN_EXACT_MODELS, QWEN_PREFIX_MODELS))
+                .or_else(|| lookup_model_rule(&model, &[], VOLCANO_PREFIX_MODELS))
         }
     }
+    .copied()
 }
 
-fn lookup_model_window(model: &str, exact: &[ModelRule], prefixes: &[ModelRule]) -> Option<u64> {
-    exact
-        .iter()
-        .find(|rule| model == rule.model)
-        .or_else(|| {
-            prefixes
-                .iter()
-                .filter(|rule| model_family_matches(model, rule.model))
-                .max_by_key(|rule| rule.model.len())
-        })
-        .map(|rule| rule.context_window_tokens)
+fn lookup_model_rule<'a>(
+    model: &str,
+    exact: &'a [ModelRule],
+    prefixes: &'a [ModelRule],
+) -> Option<&'a ModelRule> {
+    exact.iter().find(|rule| model == rule.model).or_else(|| {
+        prefixes
+            .iter()
+            .filter(|rule| model_family_matches(model, rule.model))
+            .max_by_key(|rule| rule.model.len())
+    })
 }
 
 fn model_family_matches(model: &str, family: &str) -> bool {
@@ -1387,6 +1516,55 @@ mod tests {
             16 * 1024 * 1024
         );
         assert_eq!(config.runtime.search_backend, SearchBackend::DuckDuckGo);
+        assert!(config.model_metadata.fetch);
+        assert_eq!(config.model_metadata.ttl_hours, 24);
+        assert_eq!(config.model_metadata.timeout_ms, 5000);
+    }
+
+    #[test]
+    fn model_metadata_settings_are_clamped() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[model_metadata]\nfetch = false\nttl_hours = 0\ntimeout_ms = 1\n",
+        )
+        .unwrap();
+        let low = Config::load(Some(&path), temp.path()).unwrap();
+        assert!(!low.model_metadata.fetch);
+        assert_eq!(low.model_metadata.ttl_hours, 1);
+        assert_eq!(low.model_metadata.timeout_ms, 1000);
+
+        fs::write(
+            &path,
+            "[model_metadata]\nttl_hours = 9999\ntimeout_ms = 999999\n",
+        )
+        .unwrap();
+        let high = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(high.model_metadata.ttl_hours, 168);
+        assert_eq!(high.model_metadata.timeout_ms, 15_000);
+    }
+
+    #[test]
+    fn registry_reports_documented_output_caps() {
+        assert_eq!(
+            known_max_output(ProviderPreset::OpenAi, "gpt-4o"),
+            Some(16_384)
+        );
+        assert_eq!(
+            known_max_output(ProviderPreset::OpenAi, "gpt-4.1-mini"),
+            Some(32_768)
+        );
+        assert_eq!(
+            known_max_output(ProviderPreset::DeepSeek, "deepseek-chat"),
+            Some(8_192)
+        );
+        // Unknown models and models without a documented cap stay `None`.
+        assert_eq!(known_max_output(ProviderPreset::Custom, "mystery"), None);
+        assert_eq!(
+            known_max_output(ProviderPreset::Volcano, "doubao-seed-2-0-pro"),
+            None
+        );
     }
 
     #[test]

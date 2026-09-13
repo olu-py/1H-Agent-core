@@ -61,6 +61,19 @@ target_ratio = 0.55
 # preserve_recent_tokens = 8000
 max_summary_bytes = 65536
 
+# Runtime model metadata discovery: GET {base_url}/models and the models.dev
+# community database fill the context window for models the built-in registry
+# does not know. Fetching is event-driven (provider/model switch, first submit
+# with an unknown window, explicit settings refresh) - never polling, and the
+# process never touches the network at startup. Explicit
+# provider.context_window_tokens always wins; discovered values outside sane
+# bounds are rejected, not clamped. Set fetch = false for a fully offline
+# process (the registry and the committed models.dev snapshot still answer).
+[model_metadata]
+fetch = true
+ttl_hours = 24 # 1..=168; gates refresh attempts only, cached values stay usable
+timeout_ms = 5000 # 1000..=15000, per request
+
 # Cluster mode (AI 集群) child-agent concurrency and execution budgets.
 # Per-turn/session fan-out counts remain reserved; active children are bounded
 # by max_parallel_children.

@@ -119,6 +119,17 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
+/// One entry of `GET {base_url}/models`. The id is always present (it feeds
+/// the model picker); the metadata fields are `None` when the endpoint does
+/// not report them (plain OpenAI-compatible servers list ids only, while
+/// OpenRouter and LM Studio also expose window/output limits).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderModelInfo {
+    pub id: String,
+    pub context_window_tokens: Option<u64>,
+    pub max_output_tokens: Option<u32>,
+}
+
 #[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("request failed: {0}")]

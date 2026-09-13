@@ -113,6 +113,7 @@ fn budget(used_tokens: u64) -> ContextBudgetDto {
         used_tokens,
         output_reserve_tokens: 8_192,
         safe_input_tokens: Some(128_000 - 8_192 - used_tokens),
+        window_source: "config".to_owned(),
         estimated: false,
     }
 }

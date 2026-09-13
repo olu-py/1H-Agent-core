@@ -9,8 +9,8 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 use super::{
-    ConversationItem, ModelEvent, ModelRequest, ProviderError, Role, ThinkingMode, ToolCall,
-    ToolDefinition, Usage, retry_delay,
+    ConversationItem, ModelEvent, ModelRequest, ProviderError, ProviderModelInfo, Role,
+    ThinkingMode, ToolCall, ToolDefinition, Usage, retry_delay,
 };
 use crate::config::{ProviderKind, ThinkingLevel, ThinkingProfileKind};
 
@@ -35,6 +35,8 @@ enum ScriptedStep {
     /// Emit events then fail; used to prove mid-stream failures are never
     /// retried even when the error itself is retryable.
     EventsThenFail(Vec<ModelEvent>, ProviderError),
+    /// Result of a `list_models` call (model list or error).
+    Models(Result<Vec<ProviderModelInfo>, ProviderError>),
 }
 
 impl OpenAiClient {
@@ -135,6 +137,63 @@ impl OpenAiClient {
                 }
             }
         }
+    }
+
+    /// Fetches `GET {base_url}/models` once: the model-id list for pickers
+    /// plus whatever metadata the endpoint reports (OpenRouter
+    /// `context_length`/`top_provider.max_completion_tokens`, LM Studio
+    /// `max_context_length`; plain OpenAI-compatible servers list ids only).
+    /// Single attempt with a tight per-request timeout and a bounded body —
+    /// metadata is never worth blocking the agent loop for, and failures are
+    /// simply reported to be retried by the next trigger.
+    pub async fn list_models(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<Vec<ProviderModelInfo>, ProviderError> {
+        #[cfg(test)]
+        if let Some(steps) = &self.scripted_steps {
+            let step = steps.lock().await.pop_front().ok_or_else(|| {
+                ProviderError::Protocol("scripted provider exhausted".to_owned())
+            })?;
+            return match step {
+                ScriptedStep::Models(result) => result,
+                _ => Err(ProviderError::Protocol(
+                    "scripted step mismatch: expected Models".to_owned(),
+                )),
+            };
+        }
+        let response = self
+            .client
+            .get(format!("{}/models", self.base_url))
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .timeout(Duration::from_millis(timeout_ms.max(1)))
+            .send()
+            .await
+            .map_err(ProviderError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after_ms = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after);
+            let bytes = response.bytes().await.map_err(ProviderError::Http)?;
+            let message =
+                String::from_utf8_lossy(&bytes[..bytes.len().min(16 * 1024)]).into_owned();
+            return Err(ProviderError::Status {
+                status: status.as_u16(),
+                message,
+                retry_after_ms,
+            });
+        }
+        let body =
+            crate::model_meta::read_capped(response, crate::model_meta::PROVIDER_MODELS_BODY_CAP)
+                .await
+                .map_err(ProviderError::Protocol)?;
+        let value: Value = serde_json::from_slice(&body).map_err(|error| {
+            ProviderError::Protocol(format!("invalid models response: {error}"))
+        })?;
+        Ok(crate::model_meta::parse_provider_models(&value))
     }
 
     /// Sends one request and streams its events. Returns `true` in the error
@@ -271,6 +330,10 @@ impl OpenAiClient {
                 }
                 Err((true, error))
             }
+            ScriptedStep::Models(_) => Err((
+                false,
+                ProviderError::Protocol("scripted step mismatch: expected stream".to_owned()),
+            )),
         }
     }
 }
@@ -1050,6 +1113,47 @@ mod tests {
         let mut client = OpenAiClient::new("http://127.0.0.1".into(), "test".into())?;
         client.scripted_steps = Some(std::sync::Arc::new(Mutex::new(steps.into())));
         Ok(client)
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_scripted_metadata() {
+        let client = scripted_steps(vec![ScriptedStep::Models(Ok(vec![
+            ProviderModelInfo {
+                id: "gateway-model".to_owned(),
+                context_window_tokens: Some(256_000),
+                max_output_tokens: Some(8_192),
+            },
+            ProviderModelInfo {
+                id: "plain-model".to_owned(),
+                context_window_tokens: None,
+                max_output_tokens: None,
+            },
+        ]))])
+        .unwrap();
+        let models = client.list_models(5_000).await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].context_window_tokens, Some(256_000));
+        assert_eq!(models[1].id, "plain-model");
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_scripted_failure_without_retry() {
+        let client = scripted_steps(vec![ScriptedStep::Models(Err(ProviderError::Status {
+            status: 401,
+            message: "unauthorized".to_owned(),
+            retry_after_ms: None,
+        }))])
+        .unwrap();
+        let error = client.list_models(5_000).await.unwrap_err();
+        assert!(matches!(error, ProviderError::Status { status: 401, .. }));
+        // The single step was consumed; a second call fails without retrying.
+        assert!(client.list_models(5_000).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_models_rejects_stream_steps() {
+        let client = scripted_steps(vec![ScriptedStep::Events(vec![ModelEvent::Done])]).unwrap();
+        assert!(client.list_models(5_000).await.is_err());
     }
 
     #[test]

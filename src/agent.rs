@@ -543,7 +543,14 @@ pub enum AgentEvent {
         call: ToolCall,
         result: String,
     },
-    Usage(Usage),
+    /// Real usage reported by the provider for one request round.
+    /// `input_estimate` is the runner's local estimate of that request's
+    /// input (0 when the round was incremental and therefore not
+    /// comparable); consumers use the pair to calibrate future estimates.
+    Usage {
+        usage: Usage,
+        input_estimate: u64,
+    },
     Completed {
         items: Vec<ConversationItem>,
     },
@@ -620,6 +627,11 @@ pub struct AgentRunner {
     configured_agents: Arc<Vec<AgentConfig>>,
     child_provider_resolver: Option<Arc<ChildProviderResolver>>,
     compaction: CompactionConfig,
+    /// Session token-estimate calibration (real usage / local estimate,
+    /// clamped 0.5..=2.0), snapshotted when the runner was built. Scales the
+    /// heuristic estimate so the compaction threshold tracks the provider's
+    /// real tokenizer (byte/4 underestimates CJK-heavy context).
+    token_calibration: f64,
 }
 
 #[derive(Default)]
@@ -841,6 +853,7 @@ impl AgentRunner {
             configured_agents: Arc::new(Vec::new()),
             child_provider_resolver: None,
             compaction: CompactionConfig::default(),
+            token_calibration: 1.0,
         }
     }
 
@@ -876,6 +889,30 @@ impl AgentRunner {
         self.compaction = config;
         self.compaction.normalize();
         self
+    }
+
+    pub fn with_token_calibration(mut self, calibration: f64) -> Self {
+        self.token_calibration = calibration.clamp(0.5, 2.0);
+        self
+    }
+
+    /// Applies a runtime-discovered metadata stamp (provider `/models` or
+    /// models.dev) so in-flight compaction decisions see the fresh window.
+    /// No-op unless this runner targets the same base URL and model.
+    pub(crate) fn set_discovered_meta(
+        &mut self,
+        base_url: &str,
+        model: &str,
+        discovered: Option<crate::model_meta::DiscoveredMeta>,
+    ) {
+        if self.provider_config.base_url == base_url && self.provider_config.model == model {
+            self.provider_config.discovered = discovered;
+        }
+    }
+
+    /// Local estimate scaled by the session calibration factor.
+    fn calibrated_estimate(&self, tokens: u64) -> u64 {
+        (tokens as f64 * self.token_calibration).ceil() as u64
     }
 
     fn tools_for_request(&self) -> Vec<ToolDefinition> {
@@ -971,7 +1008,7 @@ impl AgentRunner {
         let Some(window) = self.provider_config.resolved_context_window_tokens() else {
             return;
         };
-        let estimated = crate::session::estimate_context_tokens(items);
+        let estimated = self.calibrated_estimate(crate::session::estimate_context_tokens(items));
         if (estimated as f64) < (window as f64 * f64::from(self.compaction.auto_threshold)) {
             return;
         }
@@ -1011,7 +1048,9 @@ impl AgentRunner {
             // suffix slice on every iteration would count each earlier item
             // again and again, over-estimating and trimming more history than
             // the budget intends.
-            let size = crate::session::estimate_context_tokens(&items[cut - 1..cut]);
+            let size = self.calibrated_estimate(crate::session::estimate_context_tokens(
+                &items[cut - 1..cut],
+            ));
             if recent.saturating_add(size) > recent_budget {
                 break;
             }
@@ -1225,6 +1264,15 @@ impl AgentRunner {
                 .kind,
                 max_output_tokens: self.provider_config.max_output_tokens,
             };
+            // Full-replay rounds (no previous_response_id) carry the entire
+            // conversation, so their real usage anchors the token-estimate
+            // calibration. Incremental rounds resume server-side state and
+            // are not comparable — report 0 and skip recalibration.
+            let input_estimate = if previous_response_id.is_none() {
+                crate::session::estimate_context_tokens(&request.items)
+            } else {
+                0
+            };
             ui_events
                 .send(AgentEvent::ModelStreaming)
                 .await
@@ -1331,7 +1379,10 @@ impl AgentRunner {
                             Ok(Forwarded::Send(AgentEvent::TextDelta(delta)))
                         }
                     }
-                    ModelEvent::Usage(usage) => Ok(Forwarded::SendIgnore(AgentEvent::Usage(usage))),
+                    ModelEvent::Usage(usage) => Ok(Forwarded::SendIgnore(AgentEvent::Usage {
+                        usage,
+                        input_estimate,
+                    })),
                     ModelEvent::ResponseId(id) => {
                         if self.provider_config.use_previous_response_id {
                             previous_response_id = Some(id.clone());

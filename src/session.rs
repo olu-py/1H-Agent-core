@@ -100,6 +100,13 @@ pub struct SessionRuntime {
     pub usage: Usage,
     pub context_used_tokens: u64,
     pub context_limit_tokens: Option<u64>,
+    /// Token-estimate calibration for this session (real provider usage /
+    /// local estimate, clamped 0.5..=2.0). Scales the byte/4 heuristic for
+    /// CJK-heavy context so the meter and compaction threshold stay honest.
+    pub token_calibration: f64,
+    /// Whether the one-shot lazy metadata fetch already ran for this session
+    /// (at most one attempt per session when the window is unknown).
+    pub metadata_fetch_attempted: bool,
     pub pending_approval: Option<PendingApproval>,
     pub mode: AgentMode,
     pub child_role: Option<String>,
@@ -384,10 +391,23 @@ impl SessionRuntime {
                 }
                 self.status = "正在将工具结果交给模型……".into();
             }
-            AgentEvent::Usage(usage) => {
-                self.context_used_tokens = usage
-                    .input_tokens
-                    .max(estimate_context_tokens(&self.conversation));
+            AgentEvent::Usage {
+                usage,
+                input_estimate,
+            } => {
+                // Keep the meter anchored on real usage; the calibrated local
+                // estimate only floors it between provider reports.
+                let calibrated = (estimate_context_tokens(&self.conversation) as f64
+                    * self.token_calibration)
+                    .ceil() as u64;
+                self.context_used_tokens = usage.input_tokens.max(calibrated);
+                // A full-replay round's real input vs. our estimate of the
+                // same request calibrates future estimates (clamped so a
+                // single odd round cannot swing the budget far).
+                if input_estimate > 0 {
+                    self.token_calibration =
+                        (usage.input_tokens as f64 / input_estimate as f64).clamp(0.5, 2.0);
+                }
                 self.usage = usage;
             }
             AgentEvent::Completed { items } => {
@@ -650,12 +670,15 @@ pub(crate) fn trim_conversation(items: &mut Vec<ConversationItem>) {
 /// capacity so requests never exceed the window on top of system overhead.
 pub(crate) const SYSTEM_OVERHEAD_TOKENS: u64 = 4096;
 
-/// The safe input token capacity for a provider: model window minus the output
-/// reservation (configured `max_output_tokens`) minus system overhead. `None`
-/// when the model window is unknown — the caller must not assume a capacity.
+/// The safe input token capacity for a provider: resolved window (explicit
+/// config > discovered metadata > registry) minus the effective output
+/// reservation (explicit `max_output_tokens`, else a discovered/registry
+/// default) minus system overhead. `None` when the model window is unknown —
+/// the caller must not assume a capacity.
 pub fn safe_input_capacity(provider: &crate::config::ProviderConfig) -> Option<u64> {
-    let window = provider.resolved_context_window_tokens()?;
-    let reserve = u64::from(provider.max_output_tokens.unwrap_or(0));
+    let resolved = crate::model_meta::resolve(provider);
+    let window = resolved.context_window_tokens?;
+    let reserve = u64::from(resolved.max_output_tokens.unwrap_or(0));
     Some(
         window
             .saturating_sub(reserve)
