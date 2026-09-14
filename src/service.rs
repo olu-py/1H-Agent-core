@@ -1692,15 +1692,36 @@ async fn provider_models(
             serde_json::from_str::<Vec<crate::provider::ProviderModelInfo>>(payload).ok()
         })
         .unwrap_or_default();
-    Ok(crate::protocol::ProviderModelsDto {
-        models: models
-            .into_iter()
-            .map(|model| crate::protocol::ProviderModelDto {
+    // Community fallback: entries the provider endpoint does not describe pick
+    // up their models.dev row (the same exact-key semantics the active
+    // model's L3 lookup uses), so pickers and fetch buttons see one merged
+    // view instead of a list that hides known community windows.
+    let models = models
+        .into_iter()
+        .map(|mut model| {
+            if model.context_window_tokens.is_none() || model.max_output_tokens.is_none() {
+                if let Ok(Some(community)) = engine
+                    .app
+                    .storage
+                    .model_metadata(&crate::model_meta::community_meta_key(&model.id))
+                {
+                    if model.context_window_tokens.is_none() {
+                        model.context_window_tokens = community.context_window_tokens;
+                    }
+                    if model.max_output_tokens.is_none() {
+                        model.max_output_tokens = community.max_output_tokens;
+                    }
+                }
+            }
+            crate::protocol::ProviderModelDto {
                 id: model.id,
                 context_window_tokens: model.context_window_tokens,
                 max_output_tokens: model.max_output_tokens,
-            })
-            .collect(),
+            }
+        })
+        .collect();
+    Ok(crate::protocol::ProviderModelsDto {
+        models,
         fetched_at: row.map(|row| row.fetched_at),
     })
 }
@@ -1980,6 +2001,57 @@ mod tests {
         assert!(settings.saved.is_empty());
         // test_handle seeds the active preset's key, so it resolves as connected.
         assert!(settings.connected.contains(&"openai".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn provider_models_merges_community_metadata_for_unreported_models() {
+        let (temp, handle) = test_handle().await;
+        // Seed the cache the way a refresh would: a provider list payload
+        // where one model reports its window and one does not, plus a
+        // models.dev community row for the unreported model.
+        let storage = crate::storage::Storage::open(&temp.path().join("data/agent.db")).unwrap();
+        let payload = serde_json::to_string(&vec![
+            crate::provider::ProviderModelInfo {
+                id: "gateway-x".to_owned(),
+                context_window_tokens: None,
+                max_output_tokens: None,
+            },
+            crate::provider::ProviderModelInfo {
+                id: "gpt-4o".to_owned(),
+                context_window_tokens: Some(128_000),
+                max_output_tokens: Some(16_384),
+            },
+        ])
+        .unwrap();
+        storage
+            .save_model_metadata(
+                &crate::model_meta::provider_list_key("https://api.openai.com/v1"),
+                "provider",
+                None,
+                None,
+                Some(&payload),
+            )
+            .unwrap();
+        storage
+            .save_model_metadata(
+                &crate::model_meta::community_meta_key("gateway-x"),
+                "community",
+                Some(200_000),
+                Some(8_192),
+                None,
+            )
+            .unwrap();
+        drop(storage);
+
+        let dto = handle.provider_models(false).await.unwrap();
+        let gateway = dto.models.iter().find(|m| m.id == "gateway-x").unwrap();
+        // The community row fills only what the provider left unreported.
+        assert_eq!(gateway.context_window_tokens, Some(200_000));
+        assert_eq!(gateway.max_output_tokens, Some(8_192));
+        // Provider-reported values are not overwritten by the merge.
+        let gpt = dto.models.iter().find(|m| m.id == "gpt-4o").unwrap();
+        assert_eq!(gpt.context_window_tokens, Some(128_000));
+        assert_eq!(gpt.max_output_tokens, Some(16_384));
     }
 
     #[tokio::test]
