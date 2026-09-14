@@ -128,6 +128,9 @@ enum CoreCommand {
         model: String,
         base_url: Option<String>,
         kind: Option<crate::config::ProviderKind>,
+        /// Optional explicit window override (clamped 4096..=10_000_000);
+        /// `None` keeps the merged profile's value.
+        context_window_tokens: Option<u64>,
         reply: oneshot::Sender<Result<(), ApiError>>,
     },
     /// Reads the provider settings view (active + saved profiles, connected
@@ -645,15 +648,19 @@ impl AppHandle {
 
     /// Applies a settings-screen provider edit: `model` plus optional
     /// `base_url` and protocol onto the current or saved profile of `preset`
-    /// (a fresh preset template when nothing is saved). The caller stores any
-    /// new API key in the OS keyring (e.g. `secrets::store_api_key_cached`)
-    /// *before* calling this so the rebuilt runner picks it up.
+    /// (a fresh preset template when nothing is saved). `context_window_tokens`
+    /// optionally overrides the merged profile's explicit window (clamped to
+    /// the same bounds as `Config::load`); `None` keeps the merged value.
+    /// The caller stores any new API key in the OS keyring (e.g.
+    /// `secrets::store_api_key_cached`) *before* calling this so the rebuilt
+    /// runner picks it up.
     pub async fn set_provider_profile(
         &self,
         preset: crate::config::ProviderPreset,
         model: &str,
         base_url: Option<&str>,
         kind: Option<crate::config::ProviderKind>,
+        context_window_tokens: Option<u64>,
     ) -> Result<(), ApiError> {
         let (tx, rx) = oneshot::channel();
         self.send(CoreCommand::SetProviderProfile {
@@ -661,6 +668,7 @@ impl AppHandle {
             model: model.to_owned(),
             base_url: base_url.map(str::to_owned),
             kind,
+            context_window_tokens,
             reply: tx,
         })
         .await?;
@@ -866,9 +874,17 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             model,
             base_url,
             kind,
+            context_window_tokens,
             reply,
         } => {
-            let result = set_provider_profile(engine, preset, &model, base_url, kind);
+            let result = set_provider_profile(
+                engine,
+                preset,
+                &model,
+                base_url,
+                kind,
+                context_window_tokens,
+            );
             let _ = reply.send(result);
         }
         CoreCommand::GetProviderSettings { reply } => {
@@ -1568,16 +1584,19 @@ fn set_provider_config(
 }
 
 /// Applies a settings-screen provider edit: merges the model and the optional
-/// base URL / protocol onto the base profile for `preset` - the current
-/// profile when it is already active (keeping thinking, retry and context
-/// customizations), otherwise the saved profile or a fresh preset template -
-/// then commits it via [`set_provider_config`].
+/// base URL / protocol / explicit context window onto the base profile for
+/// `preset` - the current profile when it is already active (keeping
+/// thinking, retry and context customizations), otherwise the saved profile
+/// or a fresh preset template - then commits it via [`set_provider_config`].
+/// A provided window is clamped to the same bounds `Config::load` enforces,
+/// so the settings screen can never install an out-of-bounds window.
 fn set_provider_profile(
     engine: &mut Engine,
     preset: crate::config::ProviderPreset,
     model: &str,
     base_url: Option<String>,
     kind: Option<crate::config::ProviderKind>,
+    context_window_tokens: Option<u64>,
 ) -> Result<(), ApiError> {
     let mut profile = if engine.app.config.provider.preset == preset {
         engine.app.config.provider.clone()
@@ -1597,6 +1616,12 @@ fn set_provider_profile(
     }
     if let Some(kind) = kind {
         profile.kind = kind;
+    }
+    if let Some(window) = context_window_tokens {
+        profile.context_window_tokens = Some(window.clamp(
+            crate::model_meta::MIN_CONTEXT_WINDOW_TOKENS,
+            crate::model_meta::MAX_CONTEXT_WINDOW_TOKENS,
+        ));
     }
     set_provider_config(engine, profile)
 }
@@ -1967,6 +1992,7 @@ mod tests {
                 "deepseek-v4-flash",
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1997,6 +2023,7 @@ mod tests {
                 "gpt-5",
                 Some("https://proxy.example.com/v1"),
                 Some(crate::config::ProviderKind::ChatCompletions),
+                None,
             )
             .await
             .unwrap();
@@ -2005,6 +2032,56 @@ mod tests {
         assert_eq!(settings.active.model, "gpt-5");
         assert_eq!(settings.active.base_url, "https://proxy.example.com/v1");
         assert_eq!(settings.active.kind, "chat_completions");
+    }
+
+    #[tokio::test]
+    async fn set_provider_profile_overrides_the_explicit_window_with_clamping() {
+        let (_temp, handle) = test_handle().await;
+        // A session must exist for the snapshot to carry a context budget.
+        handle.submit(None, "hello").await.unwrap();
+        handle
+            .set_provider_profile(
+                crate::config::ProviderPreset::OpenAi,
+                "gateway-unknown-model",
+                None,
+                None,
+                // Out-of-bounds windows are clamped to the Config::load bounds,
+                // never installed verbatim.
+                Some(3),
+            )
+            .await
+            .unwrap();
+        let snapshot = handle.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot
+                .context
+                .as_ref()
+                .and_then(|c| c.context_window_tokens),
+            Some(4096)
+        );
+        assert_eq!(
+            snapshot.context.as_ref().map(|c| c.window_source.as_str()),
+            Some("config")
+        );
+        // Omitting the window keeps the merged profile's explicit value.
+        handle
+            .set_provider_profile(
+                crate::config::ProviderPreset::OpenAi,
+                "gateway-unknown-model",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let snapshot = handle.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot
+                .context
+                .as_ref()
+                .and_then(|c| c.context_window_tokens),
+            Some(4096)
+        );
     }
 
     #[tokio::test]
@@ -2020,6 +2097,7 @@ mod tests {
             .set_provider_profile(
                 crate::config::ProviderPreset::Volcano,
                 "doubao-seed-2-1-pro-260628",
+                None,
                 None,
                 None,
             )
@@ -2041,6 +2119,7 @@ mod tests {
                 crate::config::ProviderPreset::OpenAi,
                 "gpt-5-mini",
                 Some("not a url"),
+                None,
                 None,
             )
             .await

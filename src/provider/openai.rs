@@ -152,9 +152,10 @@ impl OpenAiClient {
     ) -> Result<Vec<ProviderModelInfo>, ProviderError> {
         #[cfg(test)]
         if let Some(steps) = &self.scripted_steps {
-            let step = steps.lock().await.pop_front().ok_or_else(|| {
-                ProviderError::Protocol("scripted provider exhausted".to_owned())
-            })?;
+            let step =
+                steps.lock().await.pop_front().ok_or_else(|| {
+                    ProviderError::Protocol("scripted provider exhausted".to_owned())
+                })?;
             return match step {
                 ScriptedStep::Models(result) => result,
                 _ => Err(ProviderError::Protocol(
