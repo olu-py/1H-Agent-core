@@ -104,6 +104,11 @@ pub struct SessionRuntime {
     /// local estimate, clamped 0.5..=2.0). Scales the byte/4 heuristic for
     /// CJK-heavy context so the meter and compaction threshold stay honest.
     pub token_calibration: f64,
+    /// Last successful full-replay request's usage anchor. Real usage covers
+    /// the conversation prefix the anchor observed; items appended after it
+    /// are estimated incrementally. `None` (or a stale anchor whose index no
+    /// longer fits) falls back to the calibrated whole-conversation estimate.
+    pub usage_anchor: Option<UsageAnchor>,
     /// Whether the one-shot lazy metadata fetch already ran for this session
     /// (at most one attempt per session when the window is unknown).
     pub metadata_fetch_attempted: bool,
@@ -192,6 +197,15 @@ impl SessionRuntime {
                 self.model_phase = ModelPhase::Streaming;
             }
             AgentEvent::CompactionCompleted { hidden } => {
+                // Compaction rewrote the stored conversation prefix (history
+                // replaced by a summary), so the anchor's item index no
+                // longer addresses the same list; drop it until the next
+                // full-replay round re-anchors. The conversation itself is
+                // replaced at `Completed`, which re-meters immediately, so
+                // the meter never keeps a stale pre-compaction value.
+                self.usage_anchor = None;
+                self.context_used_tokens =
+                    estimate_used_tokens(None, &self.conversation, self.token_calibration);
                 self.status = format!("上下文已压缩，隐藏 {hidden} 条历史消息");
             }
             AgentEvent::CompactionFailed(error) => {
@@ -395,12 +409,26 @@ impl SessionRuntime {
                 usage,
                 input_estimate,
             } => {
-                // Keep the meter anchored on real usage; the calibrated local
-                // estimate only floors it between provider reports.
-                let calibrated = (estimate_context_tokens(&self.conversation) as f64
-                    * self.token_calibration)
-                    .ceil() as u64;
-                self.context_used_tokens = usage.input_tokens.max(calibrated);
+                // A full-replay round's usage re-anchors the meter: `real_input`
+                // covers the whole request (system prompt + replayed items) and
+                // items appended after `at_len` are estimated incrementally. The
+                // conservative gate keeps the max of the provider number and our
+                // own estimate of the same request, so an under-reporting
+                // provider (prompt-cache discounts, missing fields) never
+                // shrinks the meter. Incremental rounds (`input_estimate == 0`)
+                // only cover the new suffix and cannot re-anchor; a still-valid
+                // anchor keeps covering the prefix.
+                if input_estimate > 0 {
+                    self.usage_anchor = Some(UsageAnchor {
+                        real_input: usage.input_tokens.max(input_estimate),
+                        at_len: self.conversation.len(),
+                    });
+                }
+                self.context_used_tokens = estimate_used_tokens(
+                    self.usage_anchor.as_ref(),
+                    &self.conversation,
+                    self.token_calibration,
+                );
                 // A full-replay round's real input vs. our estimate of the
                 // same request calibrates future estimates (clamped so a
                 // single odd round cannot swing the budget far).
@@ -425,6 +453,15 @@ impl SessionRuntime {
                 if compacted {
                     self.entries = display_entries(&self.conversation);
                 }
+                // Re-meter over the replaced conversation: a valid anchor
+                // keeps the real-usage prefix and estimates the newly
+                // appended suffix; after a compaction (anchor cleared) the
+                // calibrated estimate of the rewritten history applies.
+                self.context_used_tokens = estimate_used_tokens(
+                    self.usage_anchor.as_ref(),
+                    &self.conversation,
+                    self.token_calibration,
+                );
                 self.busy = false;
                 self.active_task = None;
                 self.agent_phase = AgentPhase::Idle;
@@ -771,6 +808,48 @@ pub(crate) fn estimate_context_tokens(items: &[ConversationItem]) -> u64 {
     (bytes.saturating_add(3) / 4).max(1)
 }
 
+/// The last successful full-replay request's usage anchor. Real provider
+/// usage covers everything up to `at_len` conversation items; items appended
+/// afterwards are estimated heuristically on top of that fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageAnchor {
+    /// Real input tokens of the anchoring request (system prompt + full
+    /// replay), taken as `max(usage.input_tokens, input_estimate)` so an
+    /// under-reporting provider (prompt-cache discounts, missing fields)
+    /// falls back to our own estimate of the same request and never shrinks
+    /// the meter.
+    pub real_input: u64,
+    /// Conversation length when the usage arrived; items appended after this
+    /// index are the increment the anchor does not cover.
+    pub at_len: usize,
+}
+
+/// The session context meter. With a valid anchor (`at_len <= items.len()`)
+/// the anchored prefix uses real usage and only the appended suffix is
+/// estimated, scaled by the session calibration factor (bytes/4
+/// systematically underestimates CJK; the factor applies to the increment
+/// only, so its error no longer accumulates with session length). Without a
+/// valid anchor — none set yet, or the conversation was rewritten so the
+/// index no longer fits — this is the previous behaviour: the calibrated
+/// estimate of the whole conversation.
+pub fn estimate_used_tokens(
+    anchor: Option<&UsageAnchor>,
+    items: &[ConversationItem],
+    calibration: f64,
+) -> u64 {
+    if let Some(anchor) = anchor
+        && anchor.at_len <= items.len()
+    {
+        let suffix = &items[anchor.at_len..];
+        if suffix.is_empty() {
+            return anchor.real_input;
+        }
+        let suffix_tokens = (estimate_context_tokens(suffix) as f64 * calibration).ceil() as u64;
+        return anchor.real_input.saturating_add(suffix_tokens);
+    }
+    (estimate_context_tokens(items) as f64 * calibration).ceil() as u64
+}
+
 fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
     entries
         .iter()
@@ -957,5 +1036,221 @@ mod tests {
         }];
         assert_eq!(trim_conversation_to_budget(&mut items, 1_000_000), 0);
         assert_eq!(items.len(), 1);
+    }
+
+    /// Builds a detached runtime for event-handling tests. The storage keeps
+    /// the temp dir alive for the duration of the test via the returned guard.
+    fn anchor_test_runtime() -> (tempfile::TempDir, EventCtx<'static>, SessionRuntime) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = Box::leak(Box::new(
+            Storage::open(&temp.path().join("session.db")).unwrap(),
+        ));
+        let session_id = storage.create_session(temp.path()).unwrap();
+        let (agent_tx, _rx) = mpsc::channel(8);
+        let runtime = SessionRuntime {
+            session_id,
+            status: String::new(),
+            entries: Vec::new(),
+            todos: Vec::new(),
+            busy: false,
+            agent_phase: AgentPhase::Idle,
+            model_phase: ModelPhase::Idle,
+            thinking_last_line: String::new(),
+            thinking_active: false,
+            thinking_buffer: String::new(),
+            thinking_buffer_truncated: false,
+            thinking_buffer_epoch: 0,
+            thinking_result: ThinkingResult::Completed,
+            usage: Usage::default(),
+            context_used_tokens: 0,
+            context_limit_tokens: None,
+            token_calibration: 1.0,
+            usage_anchor: None,
+            metadata_fetch_attempted: false,
+            pending_approval: None,
+            mode: AgentMode::default(),
+            child_role: None,
+            conversation: Vec::new(),
+            runner: None,
+            agent_tx,
+            active_task: None,
+            request_seq: 0,
+            parked_at: Instant::now(),
+        };
+        // The ctx only borrows the leaked storage; the workspace path is the
+        // temp dir, which outlives the test scope through `temp`.
+        let workspace = Box::leak(temp.path().to_path_buf().into_boxed_path());
+        let ctx = EventCtx {
+            storage: &*storage,
+            workspace,
+        };
+        (temp, ctx, runtime)
+    }
+
+    #[test]
+    fn estimate_used_tokens_valid_anchor_adds_calibrated_suffix() {
+        let items = (0..4)
+            .map(|i| ConversationItem::Message {
+                role: Role::User,
+                content: format!("message {i} {}", "x".repeat(800)),
+            })
+            .collect::<Vec<_>>();
+        // Each item is ~810 bytes (~202 tokens); the anchor covers the first
+        // two, the suffix estimate rounds to 405.
+        let anchor = UsageAnchor {
+            real_input: 1_000,
+            at_len: 2,
+        };
+        let used = estimate_used_tokens(Some(&anchor), &items, 1.0);
+        assert_eq!(used, 1_000 + 405);
+        // The calibration factor applies to the increment only.
+        let used = estimate_used_tokens(Some(&anchor), &items, 2.0);
+        assert_eq!(used, 1_000 + 810);
+        // Nothing appended: the anchor value is used verbatim.
+        assert_eq!(estimate_used_tokens(Some(&anchor), &items[..2], 2.0), 1_000);
+    }
+
+    #[test]
+    fn estimate_used_tokens_falls_back_without_a_valid_anchor() {
+        let items = vec![ConversationItem::Message {
+            role: Role::User,
+            content: "12345678".into(),
+        }];
+        // No anchor: the calibrated whole-conversation estimate.
+        assert_eq!(estimate_used_tokens(None, &items, 1.0), 2);
+        assert_eq!(estimate_used_tokens(None, &items, 2.0), 4);
+        // A stale anchor (conversation shorter than the recorded index) is
+        // treated as absent.
+        let stale = UsageAnchor {
+            real_input: 1_000,
+            at_len: 5,
+        };
+        assert_eq!(estimate_used_tokens(Some(&stale), &items, 1.0), 2);
+    }
+
+    #[test]
+    fn full_replay_usage_sets_the_anchor_and_underreport_falls_back_to_estimate() {
+        let (_temp, ctx, mut runtime) = anchor_test_runtime();
+        runtime.conversation = (0..2)
+            .map(|i| ConversationItem::Message {
+                role: Role::User,
+                content: format!("message {i}"),
+            })
+            .collect();
+
+        // Provider reports more than the local estimate: the real number wins.
+        runtime.handle_event(
+            &ctx,
+            AgentEvent::Usage {
+                usage: Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    total_tokens: 110,
+                },
+                input_estimate: 90,
+            },
+        );
+        let anchor = runtime.usage_anchor.clone().unwrap();
+        assert_eq!(anchor.real_input, 100);
+        assert_eq!(anchor.at_len, 2);
+        assert_eq!(runtime.context_used_tokens, 100);
+        assert_eq!(
+            runtime.token_calibration,
+            (100.0_f64 / 90.0).clamp(0.5, 2.0)
+        );
+
+        // Provider under-reports (prompt-cache discount): the anchor falls
+        // back to our own estimate of the same request.
+        runtime.handle_event(
+            &ctx,
+            AgentEvent::Usage {
+                usage: Usage {
+                    input_tokens: 50,
+                    output_tokens: 10,
+                    total_tokens: 60,
+                },
+                input_estimate: 120,
+            },
+        );
+        let anchor = runtime.usage_anchor.clone().unwrap();
+        assert_eq!(anchor.real_input, 120);
+        assert_eq!(anchor.at_len, 2);
+        assert_eq!(runtime.context_used_tokens, 120);
+    }
+
+    #[test]
+    fn incremental_usage_does_not_reanchor_and_counts_as_suffix() {
+        let (_temp, ctx, mut runtime) = anchor_test_runtime();
+        runtime.conversation = vec![ConversationItem::Message {
+            role: Role::User,
+            content: "root".into(),
+        }];
+        runtime.handle_event(
+            &ctx,
+            AgentEvent::Usage {
+                usage: Usage {
+                    input_tokens: 500,
+                    output_tokens: 0,
+                    total_tokens: 500,
+                },
+                input_estimate: 400,
+            },
+        );
+        let calibration = runtime.token_calibration;
+
+        // An incremental round appends items and reports usage for the new
+        // input only (`input_estimate == 0`): the anchor must stay put.
+        runtime.conversation.push(ConversationItem::ToolOutput {
+            call_id: "call-1".into(),
+            output: "y".repeat(800),
+        });
+        runtime.handle_event(
+            &ctx,
+            AgentEvent::Usage {
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 0,
+                    total_tokens: 10,
+                },
+                input_estimate: 0,
+            },
+        );
+        let anchor = runtime.usage_anchor.clone().unwrap();
+        assert_eq!(anchor.real_input, 500);
+        assert_eq!(anchor.at_len, 1);
+        // Meter = anchored prefix + calibrated increment (800 bytes -> 200
+        // tokens, scaled by the 500/400 = 1.25 calibration the anchoring
+        // round produced).
+        assert_eq!(runtime.context_used_tokens, 500 + 250);
+        assert_eq!(runtime.token_calibration, calibration);
+    }
+
+    #[test]
+    fn compaction_completed_clears_the_anchor() {
+        let (_temp, ctx, mut runtime) = anchor_test_runtime();
+        runtime.conversation = vec![ConversationItem::Message {
+            role: Role::User,
+            content: "root".into(),
+        }];
+        runtime.handle_event(
+            &ctx,
+            AgentEvent::Usage {
+                usage: Usage {
+                    input_tokens: 500,
+                    output_tokens: 0,
+                    total_tokens: 500,
+                },
+                input_estimate: 400,
+            },
+        );
+        assert!(runtime.usage_anchor.is_some());
+
+        runtime.handle_event(&ctx, AgentEvent::CompactionCompleted { hidden: 3 });
+        assert!(runtime.usage_anchor.is_none());
+        // Without the anchor the meter falls back to the calibrated estimate.
+        let expected = (estimate_context_tokens(&runtime.conversation) as f64
+            * runtime.token_calibration)
+            .ceil() as u64;
+        assert_eq!(runtime.context_used_tokens, expected);
     }
 }

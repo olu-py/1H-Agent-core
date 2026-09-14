@@ -60,6 +60,10 @@ auto_threshold = 0.80
 target_ratio = 0.55
 # preserve_recent_tokens = 8000
 max_summary_bytes = 65536
+# Recovery attempts after a provider-confirmed context overflow: each attempt
+# compacts (or hard-trims) the conversation and retries only when the request
+# actually shrank; failures beyond the cap surface the original error. 0 disables.
+max_overflow_retries = 1
 
 # Runtime model metadata discovery: GET {base_url}/models and the models.dev
 # community database fill the context window for models the built-in registry

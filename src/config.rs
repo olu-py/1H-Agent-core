@@ -45,6 +45,11 @@ pub struct CompactionConfig {
     pub target_ratio: f32,
     pub preserve_recent_tokens: Option<u64>,
     pub max_summary_bytes: usize,
+    /// Recovery attempts after a provider-confirmed context overflow. Each
+    /// attempt compacts (or trims) the conversation and retries only when the
+    /// request actually shrank. 0 disables the recovery; failures beyond the
+    /// cap surface the original provider error.
+    pub max_overflow_retries: u32,
 }
 
 impl Default for CompactionConfig {
@@ -55,6 +60,7 @@ impl Default for CompactionConfig {
             target_ratio: 0.55,
             preserve_recent_tokens: None,
             max_summary_bytes: 65_536,
+            max_overflow_retries: 1,
         }
     }
 }
@@ -64,6 +70,7 @@ impl CompactionConfig {
         self.auto_threshold = self.auto_threshold.clamp(0.60, 0.90);
         self.target_ratio = self.target_ratio.clamp(0.30, 0.70);
         self.max_summary_bytes = self.max_summary_bytes.clamp(4 * 1024, 256 * 1024);
+        self.max_overflow_retries = self.max_overflow_retries.clamp(0, 3);
         if let Some(value) = self.preserve_recent_tokens.as_mut() {
             *value = (*value).clamp(4_000, 16_000);
         }
@@ -1507,6 +1514,7 @@ mod tests {
         assert_eq!(config.cluster.child_active_timeout_seconds, 300);
         assert!(config.compaction.enabled);
         assert_eq!(config.compaction.auto_threshold, 0.80);
+        assert_eq!(config.compaction.max_overflow_retries, 1);
         assert_eq!(config.provider.retry_max_attempts, 3);
         assert_eq!(config.provider.retry_initial_backoff_ms, 500);
         assert_eq!(config.provider.retry_max_backoff_ms, 8000);
@@ -1676,12 +1684,22 @@ mod tests {
             target_ratio: 0.1,
             preserve_recent_tokens: Some(100_000),
             max_summary_bytes: 1,
+            max_overflow_retries: 99,
         };
         config.normalize();
         assert_eq!(config.auto_threshold, 0.90);
         assert_eq!(config.target_ratio, 0.30);
         assert_eq!(config.preserve_recent_tokens, Some(16_000));
         assert_eq!(config.max_summary_bytes, 4 * 1024);
+        assert_eq!(config.max_overflow_retries, 3);
+
+        let mut config = CompactionConfig {
+            max_overflow_retries: 0,
+            ..CompactionConfig::default()
+        };
+        config.normalize();
+        // 0 legitimately disables the overflow recovery and stays 0.
+        assert_eq!(config.max_overflow_retries, 0);
     }
 
     #[test]

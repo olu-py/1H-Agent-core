@@ -21,12 +21,12 @@ use crate::{
     model::{TodoStatus, TodoTask},
     prompt,
     provider::{
-        ConversationItem, ModelEvent, ModelRequest, OpenAiClient, Role, ThinkingMode, ToolCall,
-        ToolDefinition, Usage,
+        ConversationItem, ModelEvent, ModelRequest, OpenAiClient, ProviderError, Role,
+        ThinkingMode, ToolCall, ToolDefinition, Usage, is_context_overflow,
     },
     secrets,
     security::PolicyDecision,
-    session::trim_conversation_bounded,
+    session::{UsageAnchor, trim_conversation_bounded},
     storage::Storage,
     tools::SharedToolRegistry,
 };
@@ -632,6 +632,12 @@ pub struct AgentRunner {
     /// heuristic estimate so the compaction threshold tracks the provider's
     /// real tokenizer (byte/4 underestimates CJK-heavy context).
     token_calibration: f64,
+    /// Session usage anchor snapshot (see `session::UsageAnchor`), stamped
+    /// when the runner is built/submitted. Lets `compact_if_needed` compare
+    /// the anchored meter against the compaction threshold instead of the
+    /// full calibrated estimate. Never re-read after an in-run compaction
+    /// rewrote the prefix — the recovery gate compares calibrated estimates.
+    usage_anchor: Option<UsageAnchor>,
 }
 
 #[derive(Default)]
@@ -775,8 +781,9 @@ enum StreamFailure {
     /// A caller-side event handler failed (fatal).
     Handler(String),
     /// The provider returned an error for this request (replayable when the
-    /// round produced no output).
-    Provider(String),
+    /// round produced no output). The structured error lets the agent layer
+    /// recognize context overflows for the compact→retry recovery.
+    Provider(ProviderError),
     /// The spawned provider task failed to join (fatal).
     Join(String),
     /// The stream ended without a Done marker (fatal).
@@ -824,7 +831,7 @@ async fn stream_once(
         .await
         .map_err(|error| StreamFailure::Join(error.to_string()))?;
     if let Err(error) = provider_result {
-        return Err(StreamFailure::Provider(error.to_string()));
+        return Err(StreamFailure::Provider(error));
     }
     if !collector.saw_done {
         return Err(StreamFailure::EndedWithoutCompletion);
@@ -854,6 +861,7 @@ impl AgentRunner {
             child_provider_resolver: None,
             compaction: CompactionConfig::default(),
             token_calibration: 1.0,
+            usage_anchor: None,
         }
     }
 
@@ -893,6 +901,14 @@ impl AgentRunner {
 
     pub fn with_token_calibration(mut self, calibration: f64) -> Self {
         self.token_calibration = calibration.clamp(0.5, 2.0);
+        self
+    }
+
+    /// Stamps the session's current usage anchor onto this runner snapshot.
+    /// `None` (or a stale anchor the meter guards against) falls back to the
+    /// calibrated whole-conversation estimate.
+    pub fn with_usage_anchor(mut self, anchor: Option<UsageAnchor>) -> Self {
+        self.usage_anchor = anchor;
         self
     }
 
@@ -1008,7 +1024,13 @@ impl AgentRunner {
         let Some(window) = self.provider_config.resolved_context_window_tokens() else {
             return;
         };
-        let estimated = self.calibrated_estimate(crate::session::estimate_context_tokens(items));
+        // The anchored meter (real usage prefix + calibrated increment) when
+        // a valid anchor was stamped; otherwise the calibrated estimate.
+        let estimated = crate::session::estimate_used_tokens(
+            self.usage_anchor.as_ref(),
+            items,
+            self.token_calibration,
+        );
         if (estimated as f64) < (window as f64 * f64::from(self.compaction.auto_threshold)) {
             return;
         }
@@ -1138,9 +1160,8 @@ impl AgentRunner {
         )
         .await
         .map_err(|failure| match failure {
-            StreamFailure::Provider(error)
-            | StreamFailure::Handler(error)
-            | StreamFailure::Join(error) => error,
+            StreamFailure::Handler(error) | StreamFailure::Join(error) => error,
+            StreamFailure::Provider(error) => error.to_string(),
             StreamFailure::EndedWithoutCompletion => {
                 "compaction stream ended without completion".into()
             }
@@ -1225,6 +1246,10 @@ impl AgentRunner {
             && self.provider_config.kind == ProviderKind::Responses
             && self.provider_config.native_web_search != NativeWebSearch::Disabled;
         let mut executed_tool_calls = HashSet::<String>::new();
+        // Recovery attempts for provider-confirmed context overflows within
+        // this run. Bounded by `compaction.max_overflow_retries` (0 disables
+        // the recovery entirely).
+        let mut overflow_retries: u32 = 0;
         loop {
             let request_items = if previous_response_id.is_some() {
                 items[request_cursor..].to_vec()
@@ -1434,6 +1459,66 @@ impl AgentRunner {
             {
                 Ok(()) => {}
                 Err(StreamFailure::Provider(error)) => {
+                    // Provider-confirmed context overflow: run the compact →
+                    // (trim) → retry recovery while attempts remain. A retry
+                    // is only granted when the request actually shrank, so a
+                    // failing compaction cannot loop; the original error stays
+                    // authoritative otherwise.
+                    if is_context_overflow(&error)
+                        && overflow_retries < self.compaction.max_overflow_retries
+                    {
+                        let before = self
+                            .calibrated_estimate(crate::session::estimate_context_tokens(items));
+                        if let Err(compact_error) =
+                            self.compact_context(items, None, ui_events).await
+                        {
+                            let _ = ui_events
+                                .send(AgentEvent::CompactionFailed(compact_error))
+                                .await;
+                            // Compaction failed: degrade to the hinted
+                            // hard-limit trim. It needs a resolved window to
+                            // compute a budget; without one there is no safe
+                            // trim and the progress gate below refuses the
+                            // retry.
+                            if let Some(budget) =
+                                crate::session::safe_input_capacity(&self.provider_config)
+                            {
+                                crate::session::trim_conversation_to_budget(items, budget);
+                            }
+                        }
+                        // The gate compares the same calibrated estimate on
+                        // both sides, so it stays exact even though a
+                        // compaction invalidated the usage anchor's item
+                        // index (the anchor is deliberately not consulted
+                        // here). Compaction (prefix → summary) and trim
+                        // (front removal) both strictly reduce it, and
+                        // Ok(0)/removed == 0 leave it unchanged.
+                        let after = self
+                            .calibrated_estimate(crate::session::estimate_context_tokens(items));
+                        if after < before {
+                            overflow_retries += 1;
+                            // The compacted history matches no server-side
+                            // state: the retry is a full replay.
+                            self.storage
+                                .clear_response_id(&self.session_id)
+                                .map_err(|error| error.to_string())?;
+                            previous_response_id = None;
+                            request_cursor = 0;
+                            let _ = ui_events
+                                .send(AgentEvent::ProviderRetry {
+                                    attempt: overflow_retries,
+                                    reason: "context overflow".to_owned(),
+                                    delay_ms: 0,
+                                })
+                                .await;
+                            continue;
+                        }
+                        // No measurable progress (nothing compactable, no
+                        // usable window): fail the round with the original
+                        // error instead of retrying the same request.
+                        self.save_partial(&collector.assistant_text);
+                        return Err(error.to_string());
+                    }
                     if previous_response_id.is_some()
                         && collector.assistant_text.is_empty()
                         && collector.partials.is_empty()
@@ -1451,7 +1536,7 @@ impl AgentRunner {
                     // Keep the half-generated answer so the user can review and
                     // resume it instead of losing the stream.
                     self.save_partial(&collector.assistant_text);
-                    return Err(error);
+                    return Err(error.to_string());
                 }
                 Err(StreamFailure::Handler(error)) | Err(StreamFailure::Join(error)) => {
                     self.save_partial(&collector.assistant_text);
@@ -2160,7 +2245,7 @@ impl AgentRunner {
                 Ok(()) => {}
                 Err(StreamFailure::Provider(error)) => {
                     status = ChildSessionStatus::Failed;
-                    failure = Some(error);
+                    failure = Some(error.to_string());
                     break;
                 }
                 Err(StreamFailure::Handler(error)) | Err(StreamFailure::Join(error)) => {
@@ -2695,6 +2780,211 @@ mod tests {
             "expected AgentEvent::ProviderRetry on the UI channel"
         );
         assert!(completed, "retry should recover and complete");
+    }
+
+    /// Builds a runner with a scripted provider for the overflow-recovery
+    /// tests: failures are served first (in request order), then responses.
+    fn overflow_test_runner(
+        temp: &TempDir,
+        responses: Vec<Vec<ModelEvent>>,
+        failures: Vec<ProviderError>,
+        context_window_tokens: Option<u64>,
+    ) -> AgentRunner {
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "long task")
+            .unwrap();
+        let mut provider_config = ProviderPreset::Custom.defaults();
+        provider_config.model = "fixture".into();
+        provider_config.context_window_tokens = context_window_tokens;
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        // Keep the compaction recent window small so the 30-message fixture
+        // has history worth summarizing.
+        let compaction = CompactionConfig {
+            preserve_recent_tokens: Some(4_000),
+            ..CompactionConfig::default()
+        };
+        AgentRunner::new(
+            OpenAiClient::scripted_with_failures(responses, failures).unwrap(),
+            provider_config,
+            tools,
+            storage,
+            session_id,
+        )
+        .with_compaction_config(compaction)
+    }
+
+    fn overflow_failure() -> ProviderError {
+        ProviderError::Status {
+            status: 400,
+            message: "This model's maximum context length is 65536 tokens. However, you requested 70000 tokens."
+                .into(),
+            retry_after_ms: None,
+        }
+    }
+
+    fn overflow_items(count: usize) -> Vec<ConversationItem> {
+        (0..count)
+            .map(|i| ConversationItem::Message {
+                role: Role::User,
+                content: format!("message {i} {}", "x".repeat(1000)),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compacts_and_retries_as_full_replay() {
+        let temp = TempDir::new().unwrap();
+        let runner = overflow_test_runner(
+            &temp,
+            vec![
+                // Consumed by the recovery compaction's summary request.
+                vec![
+                    ModelEvent::TextDelta("{\"goals\":\"summary\"}".into()),
+                    ModelEvent::Done,
+                ],
+                // Consumed by the retry (a full replay after compaction).
+                vec![ModelEvent::TextDelta("recovered".into()), ModelEvent::Done],
+            ],
+            vec![overflow_failure()],
+            Some(100_000),
+        );
+        let (events, mut receiver) = mpsc::channel(64);
+        let task = tokio::spawn(async move {
+            runner.run(overflow_items(30), events).await;
+        });
+
+        let mut saw_retry = false;
+        let mut saw_compacted = false;
+        let mut final_answer = None;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::ProviderRetry {
+                    attempt,
+                    reason,
+                    delay_ms,
+                } => {
+                    saw_retry = true;
+                    assert_eq!(attempt, 1);
+                    assert_eq!(reason, "context overflow");
+                    assert_eq!(delay_ms, 0);
+                }
+                AgentEvent::CompactionCompleted { .. } => saw_compacted = true,
+                AgentEvent::Completed { items } => {
+                    final_answer = items.iter().rev().find_map(|item| match item {
+                        ConversationItem::Message {
+                            role: Role::Assistant,
+                            content,
+                        } => Some(content.clone()),
+                        _ => None,
+                    });
+                    break;
+                }
+                AgentEvent::Failed(error) => panic!("unexpected failure: {error}"),
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert!(saw_retry, "the overflow must trigger a ProviderRetry event");
+        assert!(
+            saw_compacted,
+            "the recovery must compact the conversation first"
+        );
+        assert_eq!(final_answer.as_deref(), Some("recovered"));
+    }
+
+    #[tokio::test]
+    async fn context_overflow_without_progress_fails_with_the_original_error() {
+        let temp = TempDir::new().unwrap();
+        // No window: compaction is a no-op, the hinted trim has no budget,
+        // so there is no progress and the retry must be refused.
+        let runner = overflow_test_runner(&temp, Vec::new(), vec![overflow_failure()], None);
+        let (events, mut receiver) = mpsc::channel(64);
+        let task = tokio::spawn(async move {
+            runner.run(overflow_items(30), events).await;
+        });
+
+        let mut failure = None;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::Failed(error) => {
+                    failure = Some(error);
+                    break;
+                }
+                AgentEvent::ProviderRetry { .. } | AgentEvent::CompactionCompleted { .. } => {
+                    panic!("no retry may be attempted without measurable progress")
+                }
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        let failure = failure.expect("the run must fail");
+        assert!(
+            failure.contains("maximum context length"),
+            "the original provider error stays authoritative: {failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_overflow_retries_are_bounded_by_max_overflow_retries() {
+        let temp = TempDir::new().unwrap();
+        // Steps are consumed in request order: the first request overflows;
+        // the recovery's compaction request fails (500), so the recovery
+        // degrades to the hinted trim, which does shrink the oversized
+        // history; the retry overflows again and the default cap (1) forbids
+        // a second recovery — the original error is surfaced.
+        let server_error = ProviderError::Status {
+            status: 500,
+            message: "internal error".into(),
+            retry_after_ms: None,
+        };
+        let runner = overflow_test_runner(
+            &temp,
+            Vec::new(),
+            vec![overflow_failure(), server_error, overflow_failure()],
+            Some(100_000),
+        );
+        let (events, mut receiver) = mpsc::channel(64);
+        // ~100.8k estimated tokens: above the 95_904 safe input capacity, so
+        // the trim fallback has something to remove.
+        let task = tokio::spawn(async move {
+            runner.run(overflow_items(400), events).await;
+        });
+
+        let mut recoveries = 0usize;
+        let mut compaction_failed = false;
+        let mut failure = None;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::ProviderRetry { attempt: 1, .. } => recoveries += 1,
+                AgentEvent::ProviderRetry { attempt, .. } => {
+                    panic!("attempt {attempt} must never be attempted beyond the cap")
+                }
+                AgentEvent::CompactionFailed(_) => compaction_failed = true,
+                AgentEvent::CompactionCompleted { .. } => {}
+                AgentEvent::Failed(error) => {
+                    failure = Some(error);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert_eq!(recoveries, 1);
+        assert!(
+            compaction_failed,
+            "the recovery must report the failed compaction"
+        );
+        let failure = failure.expect("the run must fail after exhausting the cap");
+        assert!(
+            failure.contains("maximum context length"),
+            "the original provider error stays authoritative: {failure}"
+        );
     }
 
     #[tokio::test]

@@ -990,11 +990,12 @@ fn context_budget(engine: &Engine, session_id: &str) -> Option<ContextBudgetDto>
     let provider = &app.config.provider;
     let resolved = crate::model_meta::resolve(provider);
     let window = runtime.context_limit_tokens;
-    let used = runtime
-        .context_used_tokens
-        .max(crate::session::estimate_context_tokens(
-            &runtime.conversation,
-        ));
+    let used = crate::session::estimate_used_tokens(
+        runtime.usage_anchor.as_ref(),
+        &runtime.conversation,
+        runtime.token_calibration,
+    )
+    .max(runtime.context_used_tokens);
     let reserve = u64::from(resolved.max_output_tokens.unwrap_or(0));
     let window_source = resolved.window_source_tag().to_owned();
     Some(ContextBudgetDto {

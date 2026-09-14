@@ -185,6 +185,34 @@ fn exponential_backoff(attempt: u32, initial_ms: u64, max_ms: u64) -> u64 {
         .min(max_ms)
 }
 
+/// Conservative context-overflow recognition for the agent layer's
+/// compact→retry recovery: only well-known provider wording on a 4xx status
+/// in `400..=413` counts. A missed pattern costs one unrecovered turn (the
+/// error fails exactly as before); a false positive would compact a healthy
+/// conversation, so anything unrecognized is never treated as overflow.
+pub(crate) fn is_context_overflow(error: &ProviderError) -> bool {
+    let ProviderError::Status {
+        status, message, ..
+    } = error
+    else {
+        return false;
+    };
+    if !(400..=413).contains(status) {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    [
+        "context length",
+        "maximum context length",
+        "prompt is too long",
+        "input too large",
+        "too many tokens",
+        "context window",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +293,67 @@ mod tests {
             ),
             Some(Duration::from_millis(500))
         );
+    }
+
+    #[test]
+    fn is_context_overflow_matches_known_provider_wording() {
+        let overflow = |status: u16, message: &str| ProviderError::Status {
+            status,
+            message: message.into(),
+            retry_after_ms: None,
+        };
+        // OpenAI-style maximum-context message, case-insensitively.
+        assert!(is_context_overflow(&overflow(
+            400,
+            "This model's maximum context length is 65536 tokens. However, you requested 70000 tokens."
+        )));
+        assert!(is_context_overflow(&overflow(
+            400,
+            "this model's Maximum Context Length is 65536 tokens"
+        )));
+        // Anthropic-style prompt length.
+        assert!(is_context_overflow(&overflow(
+            400,
+            "prompt is too long: 210000 tokens > 200000 maximum"
+        )));
+        // Gateway payload limit.
+        assert!(is_context_overflow(&overflow(
+            413,
+            "request input too large"
+        )));
+        // Context-window wording on other 4xx statuses in range.
+        assert!(is_context_overflow(&overflow(
+            403,
+            "requested tokens exceed the model's context window"
+        )));
+        assert!(is_context_overflow(&overflow(
+            400,
+            "Please reduce the number of tokens; too many tokens provided"
+        )));
+    }
+
+    #[test]
+    fn is_context_overflow_rejects_everything_else() {
+        let status = |status_code: u16, message: &str| ProviderError::Status {
+            status: status_code,
+            message: message.into(),
+            retry_after_ms: None,
+        };
+        // 4xx in range without known overflow wording.
+        assert!(!is_context_overflow(&status(
+            400,
+            "invalid request: tool call id mismatch"
+        )));
+        // Known wording on a status outside 400..=413 (e.g. rate limiting).
+        assert!(!is_context_overflow(&status(
+            429,
+            "too many tokens per minute"
+        )));
+        assert!(!is_context_overflow(&status(500, "maximum context length")));
+        // Non-status failures never count.
+        assert!(!is_context_overflow(&ProviderError::Protocol(
+            "bad event".into()
+        )));
+        assert!(!is_context_overflow(&ProviderError::ReceiverClosed));
     }
 }

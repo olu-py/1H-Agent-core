@@ -19,7 +19,8 @@ use crate::{
     secrets,
     security::Workspace,
     session::{
-        EventCtx, SessionRuntime, display_entries, estimate_context_tokens, trim_conversation,
+        EventCtx, SessionRuntime, display_entries, estimate_context_tokens, estimate_used_tokens,
+        trim_conversation,
     },
     storage::{SessionSummary, Storage},
     tools::ToolRegistry,
@@ -359,16 +360,22 @@ pub(crate) fn submit_input(app: &mut App) -> Result<()> {
     // No fixed item/byte trim here: context capacity is the model window minus
     // the output reservation and system overhead, and overflow is handled by
     // full-turn compaction (falling back to a hinted hard-limit trim). The
-    // calibrated usage below feeds the authoritative context budget.
-    app.current.context_used_tokens = (estimate_context_tokens(&app.current.conversation) as f64
-        * app.current.token_calibration)
-        .ceil() as u64;
+    // anchored meter below feeds the authoritative context budget: real usage
+    // covers the prefix, the calibrated estimate covers the increment.
+    app.current.context_used_tokens = estimate_used_tokens(
+        app.current.usage_anchor.as_ref(),
+        &app.current.conversation,
+        app.current.token_calibration,
+    );
     app.current.busy = true;
     app.current.agent_phase = AgentPhase::Thinking;
     app.current.model_phase = ModelPhase::Idle;
     app.current.status = "准备请求中…… | Esc 取消".into();
     let items = app.current.conversation.clone();
     let events = app.current.agent_tx.clone();
+    // Stamp the session's current anchor onto this run's runner snapshot so
+    // in-run compaction thresholds compare the anchored estimate.
+    let runner = runner.with_usage_anchor(app.current.usage_anchor.clone());
     app.current.active_task = Some(tokio::spawn(async move {
         runner.run(items, events).await;
     }));
@@ -629,6 +636,9 @@ pub(crate) fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 .storage
                 .restore_latest_compaction(&app.current.session_id)?
             {
+                // Restoring rewrote the stored history; the anchor's item
+                // index no longer describes it reliably.
+                app.current.usage_anchor = None;
                 let session_id = app.current.session_id.clone();
                 activate_session(app, session_id)?;
                 app.current.status = "已恢复最近一次压缩".into();
@@ -799,6 +809,10 @@ pub(crate) fn export_session(app: &mut App, requested: Option<String>) -> Result
 }
 
 pub(crate) fn rebuild_runner(app: &mut App) -> Result<()> {
+    // A rebuilt runner serves a different provider/model contract (new
+    // tokenizer and routing), so the usage anchor recorded under the old one
+    // is no longer comparable: drop it with the response id.
+    app.current.usage_anchor = None;
     let Some((_, api_key)) = &app.active_secret else {
         app.current.runner = None;
         return Ok(());
@@ -823,9 +837,11 @@ pub(crate) fn rebuild_runner(app: &mut App) -> Result<()> {
         .with_cluster_config(app.config.cluster.clone())
         .with_approval_lock(app.approval_lock.clone())
         .with_configured_agents(app.config.agents.clone())
+        .with_compaction_config(app.config.compaction.clone())
         .with_child_role(child_role)
         .with_child_provider_resolver(child_provider_resolver)
-        .with_token_calibration(app.current.token_calibration),
+        .with_token_calibration(app.current.token_calibration)
+        .with_usage_anchor(app.current.usage_anchor.clone()),
     );
     Ok(())
 }
@@ -1122,6 +1138,7 @@ fn build_runtime(
         context_used_tokens: estimate_context_tokens(&conversation),
         context_limit_tokens: provider_config.resolved_context_window_tokens(),
         token_calibration: 1.0,
+        usage_anchor: None,
         metadata_fetch_attempted: false,
         pending_approval: None,
         mode,
@@ -1506,6 +1523,46 @@ mod tests {
         assert_eq!(app.current.status, "已重做上一轮");
         assert_eq!(app.current.conversation.len(), 2);
         assert_eq!(app.current.entries.len(), 2);
+    }
+
+    #[test]
+    fn rebuild_runner_clears_the_usage_anchor() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        // A provider/model switch rebuilds the runner under a new tokenizer
+        // and routing contract; the old anchor is no longer comparable.
+        app.current.usage_anchor = Some(crate::session::UsageAnchor {
+            real_input: 500,
+            at_len: 4,
+        });
+
+        rebuild_runner(&mut app).unwrap();
+
+        assert!(app.current.usage_anchor.is_none());
+    }
+
+    #[tokio::test]
+    async fn undo_and_redo_clear_the_usage_anchor() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let session_id = app.current.session_id.clone();
+        app.storage
+            .append_message(&session_id, Role::User, "hello")
+            .unwrap();
+        app.storage
+            .append_message(&session_id, Role::Assistant, "hi")
+            .unwrap();
+        app.current.usage_anchor = Some(crate::session::UsageAnchor {
+            real_input: 500,
+            at_len: 2,
+        });
+
+        execute_command(&mut app, Command::Undo).unwrap();
+        // reload_current_session builds a fresh runtime: no stale anchor.
+        assert!(app.current.usage_anchor.is_none());
+
+        execute_command(&mut app, Command::Redo).unwrap();
+        assert!(app.current.usage_anchor.is_none());
     }
 
     #[tokio::test]
@@ -1907,6 +1964,7 @@ mod tests {
             context_used_tokens: 1,
             context_limit_tokens: None,
             token_calibration: 1.0,
+            usage_anchor: None,
             metadata_fetch_attempted: false,
             pending_approval: None,
             mode: AgentMode::default(),
