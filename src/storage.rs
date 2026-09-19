@@ -47,6 +47,27 @@ pub struct StoredMessage {
     pub created_at: String,
 }
 
+/// A user-visible long-term memory row. `recallable` is derived from the
+/// current session/source graph; deleted or source-invalid rows remain
+/// inspectable for review but are not injected into future requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRecord {
+    pub id: i64,
+    pub kind: String,
+    pub title: String,
+    pub content: String,
+    pub topic: Option<String>,
+    pub status: String,
+    pub source_session_id: Option<String>,
+    pub source_turn_id: Option<String>,
+    pub source_message_id: Option<i64>,
+    pub evidence: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub confirmed_at: Option<String>,
+    pub recallable: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
@@ -57,6 +78,8 @@ pub enum StorageError {
     Poisoned,
     #[error("invalid todo task: {0}")]
     InvalidTodo(String),
+    #[error("memory limit: {0}")]
+    MemoryLimit(String),
 }
 
 impl Storage {
@@ -168,6 +191,30 @@ impl Storage {
                 payload TEXT,
                 fetched_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS memory_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                topic TEXT,
+                status TEXT NOT NULL DEFAULT 'candidate',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                confirmed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS memory_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id INTEGER NOT NULL REFERENCES memory_entries(id) ON DELETE CASCADE,
+                session_id TEXT,
+                turn_id TEXT,
+                message_id INTEGER,
+                evidence TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_entries_workspace_status
+                ON memory_entries(workspace, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_sources_memory
+                ON memory_sources(memory_id);
             -- Cursor pagination reads messages newest-first along the head
             -- chain; the session_id+hidden+id index keeps that query index-only.
             CREATE INDEX IF NOT EXISTS idx_messages_session_hidden_id
@@ -186,6 +233,8 @@ impl Storage {
             VALUES (6, CURRENT_TIMESTAMP);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (7, CURRENT_TIMESTAMP);
+            INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+            VALUES (8, CURRENT_TIMESTAMP);
             ",
         )?;
         // These checks keep databases created by the first release compatible
@@ -1058,6 +1107,295 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    pub fn list_memories(
+        &self,
+        workspace: &str,
+        query: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        let connection = self.lock()?;
+        let query = query.map(str::trim).filter(|value| !value.is_empty());
+        let pattern = query.map(|value| format!("%{}%", value.replace('%', "\\%")));
+        let status_clause = if include_deleted {
+            "1 = 1"
+        } else {
+            "e.status <> 'deleted'"
+        };
+        let mut statement = connection.prepare(&format!(
+            "SELECT e.id, e.kind, e.title, e.content, e.topic, e.status,
+                    e.created_at, e.updated_at, e.confirmed_at,
+                    ms.session_id, ms.turn_id, ms.message_id, ms.evidence,
+                    CASE WHEN e.status = 'active' AND NOT EXISTS (
+                        SELECT 1 FROM memory_sources invalid_ms
+                        LEFT JOIN sessions invalid_s ON invalid_s.id = invalid_ms.session_id
+                        LEFT JOIN messages invalid_m ON invalid_m.id = invalid_ms.message_id
+                        WHERE invalid_ms.memory_id = e.id
+                          AND (
+                              (invalid_ms.session_id IS NOT NULL AND
+                               (invalid_s.id IS NULL OR invalid_s.deleted_at IS NOT NULL
+                                OR invalid_s.workspace <> e.workspace))
+                              OR (invalid_ms.message_id IS NOT NULL AND
+                                  (invalid_m.id IS NULL OR invalid_m.hidden <> 0 OR invalid_m.partial <> 0))
+                              OR (invalid_ms.turn_id IS NOT NULL AND NOT EXISTS (
+                                  WITH RECURSIVE source_chain(id) AS (
+                                      SELECT head_turn_id FROM sessions
+                                      WHERE id = invalid_ms.session_id
+                                      UNION ALL
+                                      SELECT turns.parent_id FROM turns
+                                      JOIN source_chain ON turns.id = source_chain.id
+                                      WHERE turns.parent_id IS NOT NULL
+                                  )
+                                  SELECT 1 FROM source_chain
+                                  WHERE id = invalid_ms.turn_id
+                              ))
+                          )
+                    ) THEN 1 ELSE 0 END AS recallable
+             FROM memory_entries e
+             LEFT JOIN memory_sources ms ON ms.id = (
+                 SELECT source.id FROM memory_sources source
+                 WHERE source.memory_id = e.id ORDER BY source.id LIMIT 1
+             )
+             WHERE e.workspace = ?1 AND {status_clause}
+               AND (?2 IS NULL OR e.title LIKE ?2 ESCAPE '\\'
+                    OR e.content LIKE ?2 ESCAPE '\\'
+                    OR COALESCE(e.topic, '') LIKE ?2 ESCAPE '\\')
+             ORDER BY CASE e.status WHEN 'candidate' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,
+                      e.updated_at DESC, e.id DESC
+             LIMIT 512"
+        ))?;
+        statement
+            .query_map(params![workspace, pattern], memory_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_memory(
+        &self,
+        workspace: &str,
+        kind: &str,
+        title: &str,
+        content: &str,
+        topic: Option<&str>,
+        status: &str,
+        source_session_id: Option<&str>,
+        source_turn_id: Option<&str>,
+        source_message_id: Option<i64>,
+        evidence: Option<&str>,
+        max_entries: usize,
+        max_candidates: usize,
+        max_entry_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Result<MemoryRecord, StorageError> {
+        let title = title.trim();
+        let content = content.trim();
+        if title.is_empty() || content.is_empty() {
+            return Err(StorageError::MemoryLimit(
+                "memory title and content are required".into(),
+            ));
+        }
+        if title.len().saturating_add(content.len()) > max_entry_bytes {
+            return Err(StorageError::MemoryLimit(format!(
+                "memory entry exceeds {max_entry_bytes} bytes"
+            )));
+        }
+        let status = if status == "candidate" {
+            "candidate"
+        } else {
+            "active"
+        };
+        let connection = self.lock()?;
+        let (count, candidates, total_bytes): (i64, i64, i64) = connection.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'candidate' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(length(title) + length(content)), 0)
+             FROM memory_entries WHERE workspace = ?1 AND status <> 'deleted'",
+            [workspace],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if count as usize >= max_entries {
+            return Err(StorageError::MemoryLimit(
+                "memory capacity is full; review or delete existing entries".into(),
+            ));
+        }
+        if status == "candidate" && candidates as usize >= max_candidates {
+            return Err(StorageError::MemoryLimit(
+                "memory candidate queue is full; review candidates first".into(),
+            ));
+        }
+        if (total_bytes as usize).saturating_add(title.len() + content.len()) > max_total_bytes {
+            return Err(StorageError::MemoryLimit(
+                "memory storage capacity is full; review or delete existing entries".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let confirmed_at = (status == "active").then_some(now.as_str());
+        connection.execute(
+            "INSERT INTO memory_entries
+             (workspace, kind, title, content, topic, status, created_at, updated_at, confirmed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+            params![
+                workspace,
+                kind,
+                title,
+                content,
+                topic,
+                status,
+                now,
+                confirmed_at
+            ],
+        )?;
+        let id = connection.last_insert_rowid();
+        if source_session_id.is_some()
+            || source_turn_id.is_some()
+            || source_message_id.is_some()
+            || evidence.is_some()
+        {
+            connection.execute(
+                "INSERT INTO memory_sources(memory_id, session_id, turn_id, message_id, evidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    id,
+                    source_session_id,
+                    source_turn_id,
+                    source_message_id,
+                    evidence
+                ],
+            )?;
+        }
+        self.memory_by_id_locked(&connection, id)
+    }
+
+    pub fn confirm_memory(&self, workspace: &str, id: i64) -> Result<MemoryRecord, StorageError> {
+        let connection = self.lock()?;
+        let now = Utc::now().to_rfc3339();
+        let changed = connection.execute(
+            "UPDATE memory_entries SET status = 'active', updated_at = ?3, confirmed_at = ?3
+             WHERE id = ?1 AND workspace = ?2 AND status <> 'deleted'",
+            params![id, workspace, now],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::MemoryLimit("memory entry not found".into()));
+        }
+        self.memory_by_id_locked(&connection, id)
+    }
+
+    pub fn update_memory(
+        &self,
+        workspace: &str,
+        id: i64,
+        title: &str,
+        content: &str,
+        max_entry_bytes: usize,
+    ) -> Result<MemoryRecord, StorageError> {
+        let title = title.trim();
+        let content = content.trim();
+        if title.is_empty() || content.is_empty() {
+            return Err(StorageError::MemoryLimit(
+                "memory title and content are required".into(),
+            ));
+        }
+        if title.len().saturating_add(content.len()) > max_entry_bytes {
+            return Err(StorageError::MemoryLimit(format!(
+                "memory entry exceeds {max_entry_bytes} bytes"
+            )));
+        }
+        let connection = self.lock()?;
+        let changed = connection.execute(
+            "UPDATE memory_entries SET title = ?3, content = ?4, updated_at = ?5
+             WHERE id = ?1 AND workspace = ?2 AND status <> 'deleted'",
+            params![id, workspace, title, content, Utc::now().to_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::MemoryLimit("memory entry not found".into()));
+        }
+        self.memory_by_id_locked(&connection, id)
+    }
+
+    pub fn delete_memory(&self, workspace: &str, id: i64) -> Result<(), StorageError> {
+        let connection = self.lock()?;
+        let changed = connection.execute(
+            "UPDATE memory_entries SET status = 'deleted', updated_at = ?3
+             WHERE id = ?1 AND workspace = ?2 AND status <> 'deleted'",
+            params![id, workspace, Utc::now().to_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::MemoryLimit("memory entry not found".into()));
+        }
+        Ok(())
+    }
+
+    pub fn recall_memories(
+        &self,
+        workspace: &str,
+        query: Option<&str>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        let records = self.list_memories(workspace, query, false)?;
+        let mut used = 0usize;
+        Ok(records
+            .into_iter()
+            .filter(|record| record.recallable)
+            .take_while(|record| {
+                let bytes = record.title.len().saturating_add(record.content.len());
+                if used.saturating_add(bytes) > max_bytes {
+                    return false;
+                }
+                used = used.saturating_add(bytes);
+                true
+            })
+            .take(limit.max(1))
+            .collect())
+    }
+
+    fn memory_by_id_locked(
+        &self,
+        connection: &rusqlite::Connection,
+        id: i64,
+    ) -> Result<MemoryRecord, StorageError> {
+        connection
+            .query_row(
+                "SELECT e.id, e.kind, e.title, e.content, e.topic, e.status,
+                        e.created_at, e.updated_at, e.confirmed_at,
+                        ms.session_id, ms.turn_id, ms.message_id, ms.evidence,
+                        CASE WHEN e.status = 'active' AND NOT EXISTS (
+                            SELECT 1 FROM memory_sources invalid_ms
+                            LEFT JOIN sessions invalid_s ON invalid_s.id = invalid_ms.session_id
+                            LEFT JOIN messages invalid_m ON invalid_m.id = invalid_ms.message_id
+                            WHERE invalid_ms.memory_id = e.id
+                              AND (
+                                  (invalid_ms.session_id IS NOT NULL AND
+                                   (invalid_s.id IS NULL OR invalid_s.deleted_at IS NOT NULL
+                                    OR invalid_s.workspace <> e.workspace))
+                                  OR (invalid_ms.message_id IS NOT NULL AND
+                                      (invalid_m.id IS NULL OR invalid_m.hidden <> 0 OR invalid_m.partial <> 0))
+                                  OR (invalid_ms.turn_id IS NOT NULL AND NOT EXISTS (
+                                      WITH RECURSIVE source_chain(id) AS (
+                                          SELECT head_turn_id FROM sessions
+                                          WHERE id = invalid_ms.session_id
+                                          UNION ALL
+                                          SELECT turns.parent_id FROM turns
+                                          JOIN source_chain ON turns.id = source_chain.id
+                                          WHERE turns.parent_id IS NOT NULL
+                                      )
+                                      SELECT 1 FROM source_chain
+                                      WHERE id = invalid_ms.turn_id
+                                  ))
+                              )
+                        ) THEN 1 ELSE 0 END
+                 FROM memory_entries e
+                 LEFT JOIN memory_sources ms ON ms.id = (
+                     SELECT source.id FROM memory_sources source
+                     WHERE source.memory_id = e.id ORDER BY source.id LIMIT 1
+                 )
+                 WHERE e.id = ?1",
+                [id],
+                memory_from_row,
+            )
+            .map_err(StorageError::from)
+    }
+
     pub fn load_messages(&self, session_id: &str) -> Result<Vec<ConversationItem>, StorageError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
@@ -1113,6 +1451,83 @@ impl Storage {
                 }),
             })
             .collect()
+    }
+
+    /// Loads only the newest bounded working set from the active turn chain.
+    /// Unlike `load_messages`, this query applies the row and item limits in
+    /// SQLite before collecting strings, so restoring a session does not
+    /// materialize the entire historical transcript just to discard it.
+    pub fn load_messages_bounded(
+        &self,
+        session_id: &str,
+        max_items: usize,
+        max_bytes: usize,
+        max_item_bytes: usize,
+    ) -> Result<Vec<ConversationItem>, StorageError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "WITH RECURSIVE chain(id) AS (
+                 SELECT head_turn_id FROM sessions WHERE id = ?1
+                 UNION ALL
+                 SELECT turns.parent_id FROM turns JOIN chain ON turns.id = chain.id
+                 WHERE turns.parent_id IS NOT NULL
+             )
+             SELECT role, substr(content, 1, ?3), kind, metadata, length(content)
+             FROM messages
+             WHERE session_id = ?1 AND hidden = 0 AND partial = 0
+               AND (turn_id IN (SELECT id FROM chain) OR turn_id IS NULL)
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    session_id,
+                    max_items.max(1) as i64,
+                    max_item_bytes.max(1) as i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)? as usize,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut items = Vec::with_capacity(rows.len());
+        let mut used_bytes = 0usize;
+        let mut omitted = 0usize;
+        for (role, content, kind, metadata, actual_bytes) in rows {
+            if actual_bytes > max_item_bytes || content.len() > max_item_bytes {
+                omitted += 1;
+                continue;
+            }
+            let item = decode_conversation_item(&role, content, &kind, metadata)?;
+            let item_bytes = conversation_item_bytes(&item);
+            if used_bytes.saturating_add(item_bytes) > max_bytes {
+                omitted += 1;
+                continue;
+            }
+            used_bytes = used_bytes.saturating_add(item_bytes);
+            items.push(item);
+        }
+        items.reverse();
+        if omitted > 0 {
+            items.insert(
+                0,
+                ConversationItem::Message {
+                    role: Role::System,
+                    content: format!(
+                        "Earlier history was omitted during bounded recovery ({omitted} items)."
+                    ),
+                },
+            );
+        }
+        Ok(items)
     }
 
     /// Returns one page of raw message rows along the current head chain,
@@ -1327,6 +1742,84 @@ impl Storage {
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         self.connection.lock().map_err(|_| StorageError::Poisoned)
+    }
+}
+
+fn decode_conversation_item(
+    role: &str,
+    content: String,
+    kind: &str,
+    metadata: Option<String>,
+) -> Result<ConversationItem, StorageError> {
+    match kind {
+        "context" => Ok(ConversationItem::Context {
+            label: metadata.unwrap_or_else(|| "context".into()),
+            content,
+        }),
+        "thinking_summary" => Ok(ConversationItem::ThinkingSummary { content }),
+        "compaction_summary" => Ok(ConversationItem::CompactionSummary { content }),
+        "provider_item" => Ok(ConversationItem::ProviderItem {
+            item: serde_json::from_str(&content)?,
+        }),
+        "tool_calls" => Ok(ConversationItem::AssistantToolCalls {
+            calls: serde_json::from_str(&content)?,
+        }),
+        "tool_output" => Ok(ConversationItem::ToolOutput {
+            call_id: metadata.unwrap_or_default(),
+            output: content,
+        }),
+        _ if role == "context" => Ok(ConversationItem::Context {
+            label: metadata.unwrap_or_else(|| "context".into()),
+            content,
+        }),
+        _ => Ok(ConversationItem::Message {
+            role: match role {
+                "system" => Role::System,
+                "assistant" => Role::Assistant,
+                _ => Role::User,
+            },
+            content,
+        }),
+    }
+}
+
+fn memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
+    Ok(MemoryRecord {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        content: row.get(3)?,
+        topic: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        confirmed_at: row.get(8)?,
+        source_session_id: row.get(9)?,
+        source_turn_id: row.get(10)?,
+        source_message_id: row.get(11)?,
+        evidence: row.get(12)?,
+        recallable: row.get::<_, i64>(13)? != 0,
+    })
+}
+
+fn conversation_item_bytes(item: &ConversationItem) -> usize {
+    match item {
+        ConversationItem::Message { content, .. }
+        | ConversationItem::Context { content, .. }
+        | ConversationItem::CompactionSummary { content }
+        | ConversationItem::ThinkingSummary { content } => content.len(),
+        ConversationItem::ProviderItem { item } => item.to_string().len(),
+        ConversationItem::AssistantToolCalls { calls } => calls
+            .iter()
+            .map(|call| {
+                call.name
+                    .len()
+                    .saturating_add(call.arguments.to_string().len())
+            })
+            .sum(),
+        ConversationItem::ToolOutput { call_id, output } => {
+            call_id.len().saturating_add(output.len())
+        }
     }
 }
 
@@ -1934,6 +2427,181 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn memory_lifecycle_is_bounded_and_reviewable() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let workspace = root.path().display().to_string();
+
+        let candidate = storage
+            .create_memory(
+                &workspace,
+                "preference",
+                "Candidate title",
+                "Candidate content",
+                Some("preferences"),
+                "candidate",
+                Some(&session),
+                None,
+                None,
+                Some("user said this"),
+                8,
+                4,
+                1024,
+                4096,
+            )
+            .unwrap();
+        assert_eq!(candidate.status, "candidate");
+        assert!(!candidate.recallable);
+
+        let listed = storage
+            .list_memories(&workspace, Some("Candidate"), false)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].source_session_id.as_deref(),
+            Some(session.as_str())
+        );
+
+        let confirmed = storage.confirm_memory(&workspace, candidate.id).unwrap();
+        assert_eq!(confirmed.status, "active");
+        assert!(confirmed.recallable);
+
+        let updated = storage
+            .update_memory(
+                &workspace,
+                candidate.id,
+                "Updated title",
+                "Updated content",
+                1024,
+            )
+            .unwrap();
+        assert_eq!(updated.title, "Updated title");
+        assert_eq!(
+            storage
+                .recall_memories(&workspace, Some("Updated"), 8, 4096)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        storage.delete_memory(&workspace, candidate.id).unwrap();
+        assert!(
+            storage
+                .list_memories(&workspace, None, false)
+                .unwrap()
+                .is_empty()
+        );
+        let deleted = storage.list_memories(&workspace, None, true).unwrap();
+        assert_eq!(deleted[0].status, "deleted");
+        assert!(!deleted[0].recallable);
+    }
+
+    #[test]
+    fn memory_source_invalidation_disables_recall_without_erasing_record() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let workspace = root.path().display().to_string();
+        let memory = storage
+            .create_memory(
+                &workspace,
+                "fact",
+                "Source-bound fact",
+                "Keep this for audit",
+                None,
+                "active",
+                Some(&session),
+                None,
+                None,
+                None,
+                8,
+                4,
+                1024,
+                4096,
+            )
+            .unwrap();
+        assert!(memory.recallable);
+        storage.delete_session(&session).unwrap();
+
+        let listed = storage.list_memories(&workspace, None, false).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].recallable);
+        assert!(
+            storage
+                .recall_memories(&workspace, None, 8, 4096)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn undo_invalidates_memory_supported_only_by_detached_turn() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let workspace = root.path().display().to_string();
+        storage
+            .append_message(&session, Role::User, "first turn")
+            .unwrap();
+        storage
+            .append_message(&session, Role::User, "turn to undo")
+            .unwrap();
+        let detached_turn = storage.head_turn_id(&session).unwrap().unwrap();
+        let memory = storage
+            .create_memory(
+                &workspace,
+                "decision",
+                "Detached decision",
+                "This only came from the second turn",
+                None,
+                "active",
+                Some(&session),
+                Some(&detached_turn),
+                None,
+                None,
+                8,
+                4,
+                1024,
+                4096,
+            )
+            .unwrap();
+        assert!(memory.recallable);
+
+        assert!(storage.undo(&session).unwrap());
+        let listed = storage.list_memories(&workspace, None, false).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].recallable);
+    }
+
+    #[test]
+    fn bounded_history_drops_oversized_rows_with_notice() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        storage.append_message(&session, Role::User, "old").unwrap();
+        storage
+            .append_message(&session, Role::User, "this message is too long")
+            .unwrap();
+        storage.append_message(&session, Role::User, "new").unwrap();
+
+        let items = storage.load_messages_bounded(&session, 2, 1024, 8).unwrap();
+        assert!(items.iter().any(|item| matches!(
+            item,
+            ConversationItem::Message { content, .. }
+                if content.contains("Earlier history was omitted")
+        )));
+        assert!(items.iter().any(|item| matches!(
+            item,
+            ConversationItem::Message { content, .. } if content == "new"
+        )));
+        assert!(!items.iter().any(|item| matches!(
+            item,
+            ConversationItem::Message { content, .. } if content == "this message is too long"
+        )));
     }
 }
 

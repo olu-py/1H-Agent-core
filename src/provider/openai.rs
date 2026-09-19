@@ -22,6 +22,8 @@ pub struct OpenAiClient {
     retry_max_attempts: u32,
     retry_initial_backoff_ms: u64,
     retry_max_backoff_ms: u64,
+    max_sse_frame_bytes: usize,
+    max_sse_buffer_bytes: usize,
     #[cfg(test)]
     scripted_steps: Option<std::sync::Arc<Mutex<std::collections::VecDeque<ScriptedStep>>>>,
 }
@@ -63,9 +65,20 @@ impl OpenAiClient {
             retry_max_attempts,
             retry_initial_backoff_ms,
             retry_max_backoff_ms,
+            max_sse_frame_bytes: 2 * 1024 * 1024,
+            max_sse_buffer_bytes: 4 * 1024 * 1024,
             #[cfg(test)]
             scripted_steps: None,
         })
+    }
+
+    /// Applies the provider decoder limits owned by the core memory budget.
+    /// The constructor keeps conservative defaults so test and library users
+    /// that do not load a full Config still get bounded buffering.
+    pub fn with_sse_limits(mut self, max_frame_bytes: usize, max_buffer_bytes: usize) -> Self {
+        self.max_sse_frame_bytes = max_frame_bytes.max(1);
+        self.max_sse_buffer_bytes = max_buffer_bytes.max(self.max_sse_frame_bytes);
+        self
     }
 
     #[cfg(test)]
@@ -252,7 +265,10 @@ impl OpenAiClient {
         let mut saw_done = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| (true, ProviderError::Http(error)))?;
-            for event in decoder.push(&chunk) {
+            let decoded = decoder
+                .try_push(&chunk, self.max_sse_frame_bytes, self.max_sse_buffer_bytes)
+                .map_err(|error| (true, ProviderError::Protocol(error)))?;
+            for event in decoded {
                 if event.data.trim() == "[DONE]" {
                     saw_done = true;
                     continue;
@@ -1061,18 +1077,61 @@ pub struct SseDecoder {
     buffer: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SseDecodeError {
+    FrameTooLarge,
+    BufferTooLarge,
+}
+
+impl std::fmt::Display for SseDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::FrameTooLarge => "SSE frame exceeds the configured byte limit",
+            Self::BufferTooLarge => "SSE decoder buffer exceeds the configured byte limit",
+        })
+    }
+}
+
 impl SseDecoder {
-    pub fn push(&mut self, chunk: &Bytes) -> Vec<SseEvent> {
+    /// Bounded decoder entry point used by the live provider path. The check
+    /// happens before extending the buffer and again before materializing a
+    /// complete frame, so a single hostile chunk/frame cannot allocate without
+    /// a limit check.
+    pub fn try_push(
+        &mut self,
+        chunk: &Bytes,
+        max_frame_bytes: usize,
+        max_buffer_bytes: usize,
+    ) -> Result<Vec<SseEvent>, String> {
+        if chunk.len() > max_buffer_bytes
+            || self.buffer.len().saturating_add(chunk.len()) > max_buffer_bytes
+        {
+            return Err(SseDecodeError::BufferTooLarge.to_string());
+        }
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
         while let Some((position, delimiter_len)) = find_event_boundary(&self.buffer) {
+            if position > max_frame_bytes {
+                return Err(SseDecodeError::FrameTooLarge.to_string());
+            }
             let frame = self.buffer.drain(..position).collect::<Vec<_>>();
             self.buffer.drain(..delimiter_len);
             if let Some(event) = parse_sse_frame(&frame) {
                 events.push(event);
             }
         }
-        events
+        if self.buffer.len() > max_buffer_bytes {
+            return Err(SseDecodeError::BufferTooLarge.to_string());
+        }
+        Ok(events)
+    }
+
+    /// Compatibility helper for decoder callers/tests. Production streaming
+    /// uses [`Self::try_push`] so over-limit input becomes an observable
+    /// provider failure instead of silently disappearing.
+    pub fn push(&mut self, chunk: &Bytes) -> Vec<SseEvent> {
+        self.try_push(chunk, 2 * 1024 * 1024, 4 * 1024 * 1024)
+            .unwrap_or_default()
     }
 }
 

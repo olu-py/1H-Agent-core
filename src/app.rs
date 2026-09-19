@@ -20,9 +20,9 @@ use crate::{
     security::Workspace,
     session::{
         EventCtx, SessionRuntime, display_entries, estimate_context_tokens, estimate_used_tokens,
-        trim_conversation,
+        trim_conversation, trim_conversation_bounded,
     },
-    storage::{SessionSummary, Storage},
+    storage::{MemoryRecord, SessionSummary, Storage},
     tools::ToolRegistry,
 };
 
@@ -446,13 +446,145 @@ fn collect_file_context(app: &App, input: &str) -> Vec<(String, String)> {
     contexts
 }
 
+fn memory_command(app: &mut App, argument: Option<&str>) -> Result<()> {
+    let workspace = app.workspace.to_string_lossy().into_owned();
+    let argument = argument.unwrap_or("list").trim();
+    let mut parts = argument.splitn(2, char::is_whitespace);
+    let action = parts.next().unwrap_or("list").to_ascii_lowercase();
+    let rest = parts.next().map(str::trim).unwrap_or_default();
+    let source_session = app.current.session_id.clone();
+    let source_turn = app.storage.head_turn_id(&source_session)?;
+    let mut render = |records: Vec<MemoryRecord>| {
+        let mut content = String::from("## 工作区记忆\n");
+        if records.is_empty() {
+            content.push_str("\n暂无记忆或候选。\n");
+        }
+        for record in records {
+            let status = match record.status.as_str() {
+                "candidate" => "候选（待确认）",
+                status if record.recallable => status,
+                _ => "待核实（来源已失效）",
+            };
+            content.push_str(&format!(
+                "\n- #{} [{}] {}\n  {}\n",
+                record.id, status, record.title, record.content
+            ));
+            if record.source_session_id.is_some() || record.evidence.is_some() {
+                content.push_str(&format!(
+                    "  来源：{}{}\n",
+                    record
+                        .source_session_id
+                        .as_deref()
+                        .map(|id| id.chars().take(8).collect::<String>())
+                        .unwrap_or_else(|| "手动".into()),
+                    record
+                        .evidence
+                        .as_deref()
+                        .map(|evidence| format!(" · {evidence}"))
+                        .unwrap_or_default()
+                ));
+            }
+            if content.len() >= 64 * 1024 {
+                content.truncate(64 * 1024);
+                content.push_str("\n[记忆列表已截断]\n");
+                break;
+            }
+        }
+        app.current.push_entry(DisplayEntry {
+            kind: DisplayKind::System,
+            content: DisplayContent::Markdown(content),
+        });
+        app.current.status = "记忆管理".into();
+    };
+    match action.as_str() {
+        "list" => render(app.storage.list_memories(&workspace, None, false)?),
+        "search" => render(app.storage.list_memories(&workspace, Some(rest), false)?),
+        "add" | "candidate" => {
+            let mut values = rest.splitn(2, '|');
+            let title = values.next().unwrap_or_default().trim();
+            let content = values.next().unwrap_or_default().trim();
+            let record = app.storage.create_memory(
+                &workspace,
+                if action == "candidate" {
+                    "candidate"
+                } else {
+                    "explicit"
+                },
+                title,
+                content,
+                None,
+                if action == "candidate" {
+                    "candidate"
+                } else {
+                    "active"
+                },
+                Some(&source_session),
+                source_turn.as_deref(),
+                None,
+                Some("user-managed"),
+                app.config.memory.max_entries,
+                app.config.memory.max_candidates,
+                app.config.memory.max_entry_bytes,
+                app.config.memory.max_total_bytes,
+            )?;
+            app.current.push_entry(DisplayEntry {
+                kind: DisplayKind::System,
+                content: DisplayContent::Markdown(format!(
+                    "已{}记忆 #{}：**{}**",
+                    if action == "candidate" {
+                        "加入候选"
+                    } else {
+                        "保存"
+                    },
+                    record.id,
+                    record.title
+                )),
+            });
+        }
+        "confirm" => {
+            let id: i64 = rest.parse().map_err(|_| anyhow::anyhow!("记忆编号无效"))?;
+            let record = app.storage.confirm_memory(&workspace, id)?;
+            app.current.status = format!("已确认记忆 #{}", record.id);
+        }
+        "delete" | "remove" => {
+            let id: i64 = rest.parse().map_err(|_| anyhow::anyhow!("记忆编号无效"))?;
+            app.storage.delete_memory(&workspace, id)?;
+            app.current.status = format!("已删除记忆 #{id}");
+        }
+        "edit" => {
+            let mut values = rest.splitn(2, char::is_whitespace);
+            let id: i64 = values
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("用法：/memory edit <编号> 标题 | 内容"))?
+                .parse()
+                .map_err(|_| anyhow::anyhow!("记忆编号无效"))?;
+            let mut fields = values.next().unwrap_or_default().splitn(2, '|');
+            let title = fields.next().unwrap_or_default().trim();
+            let content = fields.next().unwrap_or_default().trim();
+            app.storage.update_memory(
+                &workspace,
+                id,
+                title,
+                content,
+                app.config.memory.max_entry_bytes,
+            )?;
+            app.current.status = format!("已更新记忆 #{id}");
+        }
+        _ => {
+            app.current.status =
+                "用法：/memory [list|search 关键词|add 标题 | 内容|candidate 标题 | 内容|confirm 编号|edit 编号 标题 | 内容|delete 编号]".into();
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn execute_command(app: &mut App, command: Command) -> Result<()> {
     match command {
         Command::Help => {
             app.current.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(
-                    "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell"
+                    "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/memory [search|add|candidate|confirm|edit|delete]` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell"
                         .into(),
                 ),
             });
@@ -505,6 +637,7 @@ pub(crate) fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 app.current.status = format!("当前 Agent 模式：{}", app.current.mode);
             }
         }
+        Command::Memory(argument) => memory_command(app, argument.as_deref())?,
         Command::Mode(mode) => {
             switch_mode(app, mode)?;
             app.current.push_entry(DisplayEntry {
@@ -823,7 +956,11 @@ pub(crate) fn rebuild_runner(app: &mut App) -> Result<()> {
         app.config.provider.retry_max_attempts,
         app.config.provider.retry_initial_backoff_ms,
         app.config.provider.retry_max_backoff_ms,
-    )?;
+    )?
+    .with_sse_limits(
+        app.config.memory.max_sse_frame_bytes,
+        app.config.memory.max_sse_buffer_bytes,
+    );
     let child_role = app.current.child_role.clone();
     let child_provider_resolver = provider_config_resolver(&app.config);
     app.current.runner = Some(
@@ -838,6 +975,7 @@ pub(crate) fn rebuild_runner(app: &mut App) -> Result<()> {
         .with_approval_lock(app.approval_lock.clone())
         .with_configured_agents(app.config.agents.clone())
         .with_compaction_config(app.config.compaction.clone())
+        .with_memory_config(app.config.memory)
         .with_child_role(child_role)
         .with_child_provider_resolver(child_provider_resolver)
         .with_token_calibration(app.current.token_calibration)
@@ -1057,8 +1195,19 @@ fn build_runtime(
     active_secret: Option<&(ProviderPreset, String)>,
     session_id: &str,
 ) -> SessionRuntime {
-    let mut conversation = storage.load_messages(session_id).unwrap_or_default();
-    trim_conversation(&mut conversation);
+    let mut conversation = storage
+        .load_messages_bounded(
+            session_id,
+            config.memory.max_history_items,
+            config.memory.max_history_bytes,
+            config.memory.max_history_item_bytes,
+        )
+        .unwrap_or_default();
+    trim_conversation_bounded(
+        &mut conversation,
+        config.memory.max_history_items,
+        config.memory.max_history_bytes,
+    );
     let todos = storage.list_tasks(session_id).unwrap_or_default();
     let entries = display_entries(&conversation);
     let mode = storage
@@ -1085,6 +1234,12 @@ fn build_runtime(
             provider_config.retry_initial_backoff_ms,
             provider_config.retry_max_backoff_ms,
         )
+        .map(|provider| {
+            provider.with_sse_limits(
+                config.memory.max_sse_frame_bytes,
+                config.memory.max_sse_buffer_bytes,
+            )
+        })
         .ok()
         .map(|provider| {
             AgentRunner::new(
@@ -1098,6 +1253,7 @@ fn build_runtime(
             .with_approval_lock(approval_lock.clone())
             .with_configured_agents(config.agents.clone())
             .with_compaction_config(config.compaction.clone())
+            .with_memory_config(config.memory)
             .with_child_role(child_role.clone())
             .with_child_provider_resolver(child_provider_resolver)
         })
@@ -1250,6 +1406,29 @@ pub(crate) fn activate_session(app: &mut App, session_id: String) -> Result<()> 
     {
         let _ = secrets::api_key_cached(provider_config.preset);
     }
+    // Pulling a fresh target adds the current runtime to the parked set. Make
+    // room before changing active state: unload one idle runtime, but never
+    // interrupt a busy background task merely because another session was
+    // selected. The caller surfaces this as a conflict and can retry after a
+    // task finishes.
+    if !app.background.contains_key(&session_id)
+        && app.background.len() >= app.config.runtime.max_background_sessions
+    {
+        let idle_id = app
+            .background
+            .iter()
+            .filter(|(_, runtime)| runtime.idle())
+            .min_by_key(|(_, runtime)| runtime.parked_at)
+            .map(|(session_id, _)| session_id.clone());
+        let Some(idle_id) = idle_id else {
+            return Err(anyhow::anyhow!(
+                "后台会话容量已满：现有任务均在运行，请等待任务完成后再切换"
+            ));
+        };
+        if let Some(mut runtime) = app.background.remove(&idle_id) {
+            runtime.shutdown();
+        }
+    }
     // Pull the target runtime from the background (preserving any in-flight
     // agent state) or build it fresh; the current runtime is parked so its
     // agent keeps running in the background.
@@ -1289,11 +1468,6 @@ pub(crate) fn evict_background_overflow(app: &mut App) {
             .iter()
             .filter(|(_, runtime)| runtime.idle())
             .min_by_key(|(_, runtime)| runtime.parked_at)
-            .or_else(|| {
-                app.background
-                    .iter()
-                    .min_by_key(|(_, runtime)| runtime.parked_at)
-            })
             .map(|(session_id, _)| session_id.clone());
         let Some(eviction_id) = eviction_id else {
             break;
@@ -1837,7 +2011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_capacity_protects_busy_and_approval_runtimes() {
+    async fn background_capacity_rejects_switch_when_all_runtimes_are_busy() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         app.config.runtime.max_background_sessions = 2;
@@ -1862,18 +2036,18 @@ mod tests {
             action: ApprovalAction::Agent(approval_reply),
             created_at: Instant::now(),
         });
-        activate_session(&mut app, active).unwrap();
+        assert!(activate_session(&mut app, active).is_err());
 
         assert_eq!(app.background.len(), 2);
         assert!(app.background.contains_key(&busy));
         assert!(app.background.contains_key(&waiting));
-        assert!(!app.background.contains_key(&evicted));
+        assert_eq!(app.active_session, evicted);
         app.background.get_mut(&waiting).unwrap().shutdown();
         assert!(!approval_result.await.unwrap());
     }
 
     #[tokio::test]
-    async fn background_capacity_stops_oldest_busy_runtime_when_required() {
+    async fn background_capacity_never_interrupts_busy_or_approval_runtime() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         app.config.runtime.max_background_sessions = 2;
@@ -1900,12 +2074,14 @@ mod tests {
         app.background.get_mut(&second).unwrap().busy = true;
         app.current.busy = true;
 
-        activate_session(&mut app, active).unwrap();
+        assert!(activate_session(&mut app, active).is_err());
 
         assert_eq!(app.background.len(), 2);
-        assert!(!app.background.contains_key(&oldest));
+        assert!(app.background.contains_key(&oldest));
         assert!(app.background.contains_key(&second));
-        assert!(app.background.contains_key(&third));
+        assert!(!app.background.contains_key(&third));
+        assert_eq!(app.active_session, third);
+        app.background.get_mut(&oldest).unwrap().shutdown();
         assert!(!approval_result.await.unwrap());
     }
 

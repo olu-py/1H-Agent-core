@@ -365,6 +365,27 @@ pub struct ProviderModelsDto {
     pub fetched_at: Option<i64>,
 }
 
+/// A bounded, workspace-scoped long-term memory row. Candidates are never
+/// injected into model requests until explicitly confirmed by the user.
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export)]
+pub struct MemoryDto {
+    pub id: i64,
+    pub kind: String,
+    pub title: String,
+    pub content: String,
+    pub topic: Option<String>,
+    pub status: String,
+    pub source_session_id: Option<String>,
+    pub source_turn_id: Option<String>,
+    pub source_message_id: Option<i64>,
+    pub evidence: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub confirmed_at: Option<String>,
+    pub recallable: bool,
+}
+
 /// Per-session context capacity, computed by the core.
 ///
 /// The core is the single authority for context capacity; the TUI must not

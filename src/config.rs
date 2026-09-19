@@ -22,6 +22,9 @@ pub struct Config {
     pub ui: UiConfig,
     pub server: ServerConfig,
     pub runtime: RuntimeConfig,
+    /// Bounded allocations shared by the provider, runtime queues and history
+    /// recovery paths. These are safety limits, not token-window settings.
+    pub memory: MemoryConfig,
     pub compaction: CompactionConfig,
     pub model_metadata: ModelMetadataConfig,
     pub security: SecurityConfig,
@@ -35,6 +38,91 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// Hard byte/count limits for data that can otherwise grow faster than the
+/// normal transcript/page limits. Every value is normalized at config load so
+/// a malformed TOML cannot disable a safety boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Long-term memory is opt-in at the feature level but the storage schema
+    /// is always migrated so it can be enabled without a later data move.
+    pub enabled: bool,
+    /// Explicit opt-in reserved for a future, user-authorized provider
+    /// context integration. Storage and management remain available when
+    /// this is false.
+    pub auto_recall: bool,
+    pub max_entries: usize,
+    pub max_candidates: usize,
+    pub max_entry_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_recall_entries: usize,
+    pub max_recall_bytes: usize,
+    pub max_sse_frame_bytes: usize,
+    pub max_sse_buffer_bytes: usize,
+    pub max_response_bytes: usize,
+    pub max_tool_call_bytes: usize,
+    pub max_tool_call_total_bytes: usize,
+    pub max_tool_calls: usize,
+    pub max_agent_event_bytes: usize,
+    pub max_history_items: usize,
+    pub max_history_bytes: usize,
+    pub max_history_item_bytes: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_recall: false,
+            max_entries: 512,
+            max_candidates: 128,
+            max_entry_bytes: 16 * 1024,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_recall_entries: 8,
+            max_recall_bytes: 16 * 1024,
+            max_sse_frame_bytes: 2 * 1024 * 1024,
+            max_sse_buffer_bytes: 4 * 1024 * 1024,
+            max_response_bytes: 2 * 1024 * 1024,
+            max_tool_call_bytes: 1024 * 1024,
+            max_tool_call_total_bytes: 4 * 1024 * 1024,
+            max_tool_calls: 32,
+            max_agent_event_bytes: 64 * 1024,
+            max_history_items: 200,
+            max_history_bytes: 1024 * 1024,
+            max_history_item_bytes: 256 * 1024,
+        }
+    }
+}
+
+impl MemoryConfig {
+    pub fn normalize(&mut self) {
+        self.max_entries = self.max_entries.clamp(1, 10_000);
+        self.max_candidates = self.max_candidates.clamp(1, self.max_entries);
+        self.max_entry_bytes = self.max_entry_bytes.clamp(256, 256 * 1024);
+        self.max_total_bytes = self
+            .max_total_bytes
+            .clamp(self.max_entry_bytes, 256 * 1024 * 1024);
+        self.max_recall_entries = self.max_recall_entries.clamp(1, 32);
+        self.max_recall_bytes = self.max_recall_bytes.clamp(1024, 128 * 1024);
+        self.max_sse_frame_bytes = self.max_sse_frame_bytes.clamp(64 * 1024, 8 * 1024 * 1024);
+        self.max_sse_buffer_bytes = self
+            .max_sse_buffer_bytes
+            .clamp(self.max_sse_frame_bytes, 16 * 1024 * 1024);
+        self.max_response_bytes = self.max_response_bytes.clamp(64 * 1024, 16 * 1024 * 1024);
+        self.max_tool_call_bytes = self.max_tool_call_bytes.clamp(16 * 1024, 4 * 1024 * 1024);
+        self.max_tool_call_total_bytes = self
+            .max_tool_call_total_bytes
+            .clamp(self.max_tool_call_bytes, 16 * 1024 * 1024);
+        self.max_tool_calls = self.max_tool_calls.clamp(1, 256);
+        self.max_agent_event_bytes = self.max_agent_event_bytes.clamp(4 * 1024, 256 * 1024);
+        self.max_history_items = self.max_history_items.clamp(20, 2_000);
+        self.max_history_bytes = self.max_history_bytes.clamp(128 * 1024, 16 * 1024 * 1024);
+        self.max_history_item_bytes = self
+            .max_history_item_bytes
+            .clamp(4 * 1024, self.max_history_bytes.min(2 * 1024 * 1024));
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -574,6 +662,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
+            memory: MemoryConfig::default(),
             compaction: CompactionConfig::default(),
             model_metadata: ModelMetadataConfig::default(),
             security: SecurityConfig::default(),
@@ -642,6 +731,7 @@ impl Config {
         // that complete profile before applying process-only environment
         // overrides, so migration never loses the user's connection details.
         config.ensure_provider_profiles();
+        config.memory.normalize();
         config.compaction.normalize();
 
         if let Ok(value) = env::var("AGENT_API_BASE") {

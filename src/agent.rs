@@ -15,8 +15,8 @@ use tokio::{
 
 use crate::{
     config::{
-        AgentConfig, ClusterConfig, CompactionConfig, NativeWebSearch, ProviderConfig,
-        ProviderKind, ProviderPreset, ThinkingCapability, thinking_profile,
+        AgentConfig, ClusterConfig, CompactionConfig, MemoryConfig, NativeWebSearch,
+        ProviderConfig, ProviderKind, ProviderPreset, ThinkingCapability, thinking_profile,
     },
     model::{TodoStatus, TodoTask},
     prompt,
@@ -638,6 +638,7 @@ pub struct AgentRunner {
     /// full calibrated estimate. Never re-read after an in-run compaction
     /// rewrote the prefix — the recovery gate compares calibrated estimates.
     usage_anchor: Option<UsageAnchor>,
+    memory: MemoryConfig,
 }
 
 #[derive(Default)]
@@ -658,6 +659,10 @@ struct StreamCollector {
     completed_ids: HashSet<String>,
     saw_done: bool,
     max_text_bytes: Option<usize>,
+    max_tool_call_bytes: usize,
+    max_tool_call_total_bytes: usize,
+    max_tool_calls: usize,
+    tool_call_bytes: usize,
 }
 
 impl StreamCollector {
@@ -670,25 +675,43 @@ impl StreamCollector {
             completed_ids: HashSet::new(),
             saw_done: false,
             max_text_bytes,
+            max_tool_call_bytes: 1024 * 1024,
+            max_tool_call_total_bytes: 4 * 1024 * 1024,
+            max_tool_calls: 32,
+            tool_call_bytes: 0,
         }
+    }
+
+    fn with_memory_limits(mut self, memory: MemoryConfig) -> Self {
+        self.max_tool_call_bytes = memory.max_tool_call_bytes;
+        self.max_tool_call_total_bytes = memory.max_tool_call_total_bytes;
+        self.max_tool_calls = memory.max_tool_calls;
+        self
     }
 
     /// Accumulates text/tool-call state. Returns the event unchanged when it
     /// needs caller-level side effects (web search, provider items, usage,
     /// response id, or reasoning forwarding); returns None when fully handled.
-    fn on_event(&mut self, event: ModelEvent) -> Option<ModelEvent> {
+    fn on_event(&mut self, event: ModelEvent) -> Result<Option<ModelEvent>, String> {
         match event {
             ModelEvent::TextDelta(delta) => {
                 if let Some(max_bytes) = self.max_text_bytes {
+                    if self.assistant_text.len().saturating_add(delta.len()) > max_bytes {
+                        append_text_bounded(&mut self.assistant_text, &delta, max_bytes);
+                        return Err(format!(
+                            "model response exceeded the {} byte limit",
+                            max_bytes
+                        ));
+                    }
                     append_text_bounded(&mut self.assistant_text, &delta, max_bytes);
                 } else {
                     self.assistant_text.push_str(&delta);
                 }
-                Some(ModelEvent::TextDelta(delta))
+                Ok(Some(ModelEvent::TextDelta(delta)))
             }
             ModelEvent::ReasoningDelta(delta) => {
                 append_reasoning_bounded(&mut self.reasoning_text, &delta);
-                Some(ModelEvent::ReasoningDelta(delta))
+                Ok(Some(ModelEvent::ReasoningDelta(delta)))
             }
             ModelEvent::ToolCallDelta {
                 slot,
@@ -696,44 +719,92 @@ impl StreamCollector {
                 name,
                 arguments_delta,
             } => {
-                // Build the forwarded copy first: the closure only needs the
-                // name and the payload length, so clone the small fields and
-                // move the payload instead of cloning it.
+                let delta_bytes = arguments_delta.len();
+                let forwarded_name = name.clone();
+                let forwarded_slot = slot.clone();
+                if !self.partials.contains_key(&slot)
+                    && self
+                        .partials
+                        .len()
+                        .saturating_add(self.completed_calls.len())
+                        >= self.max_tool_calls
+                {
+                    return Err(format!(
+                        "model returned more than {} tool calls",
+                        self.max_tool_calls
+                    ));
+                }
+                {
+                    let partial = self.partials.entry(slot).or_default();
+                    if partial.arguments.len().saturating_add(delta_bytes)
+                        > self.max_tool_call_bytes
+                        || self.tool_call_bytes.saturating_add(delta_bytes)
+                            > self.max_tool_call_total_bytes
+                    {
+                        return Err("tool call arguments exceeded the configured byte limit".into());
+                    }
+                    if let Some(id) = id {
+                        partial.id = id;
+                    }
+                    if let Some(name) = name {
+                        partial.name = name;
+                    }
+                    partial.arguments.push_str(&arguments_delta);
+                }
+                self.tool_call_bytes = self.tool_call_bytes.saturating_add(delta_bytes);
                 let forwarded = ModelEvent::ToolCallDelta {
-                    slot: slot.clone(),
+                    slot: forwarded_slot,
                     id: None,
-                    name: name.clone(),
+                    name: forwarded_name,
                     arguments_delta,
                 };
-                let partial = self.partials.entry(slot).or_default();
-                if let Some(id) = id {
-                    partial.id = id;
-                }
-                if let Some(name) = name {
-                    partial.name = name;
-                }
-                if let ModelEvent::ToolCallDelta {
-                    arguments_delta, ..
-                } = &forwarded
-                {
-                    partial.arguments.push_str(arguments_delta);
-                }
                 // Forward the raw delta so the caller's closure can merge it
                 // into streaming progress events (TextDelta/ReasoningDelta
                 // follow the same pass-through pattern). `id` is internal to
                 // partial accumulation; the closure only needs name + bytes.
-                Some(forwarded)
+                Ok(Some(forwarded))
             }
             ModelEvent::ToolCallComplete(call) => {
+                let completed_partial = self
+                    .partials
+                    .iter()
+                    .find(|(_, partial)| partial.id == call.id)
+                    .map(|(slot, partial)| (slot.clone(), partial.arguments.len()));
+                if let Some((slot, partial_bytes)) = completed_partial {
+                    self.partials.remove(&slot);
+                    self.tool_call_bytes = self.tool_call_bytes.saturating_sub(partial_bytes);
+                }
+                let call_bytes = call
+                    .name
+                    .len()
+                    .saturating_add(call.arguments.to_string().len());
+                if self
+                    .completed_calls
+                    .len()
+                    .saturating_add(self.partials.len())
+                    >= self.max_tool_calls
+                {
+                    return Err(format!(
+                        "model returned more than {} tool calls",
+                        self.max_tool_calls
+                    ));
+                }
+                if call_bytes > self.max_tool_call_bytes
+                    || self.tool_call_bytes.saturating_add(call_bytes)
+                        > self.max_tool_call_total_bytes
+                {
+                    return Err("tool call arguments exceeded the configured byte limit".into());
+                }
+                self.tool_call_bytes = self.tool_call_bytes.saturating_add(call_bytes);
                 self.completed_ids.insert(call.id.clone());
                 self.completed_calls.push(call);
-                None
+                Ok(None)
             }
             ModelEvent::Done => {
                 self.saw_done = true;
-                None
+                Ok(None)
             }
-            other => Some(other),
+            other => Ok(Some(other)),
         }
     }
 
@@ -786,6 +857,10 @@ enum StreamFailure {
     Provider(ProviderError),
     /// The spawned provider task failed to join (fatal).
     Join(String),
+    /// The local hard limit stopped the provider round. The collector retains
+    /// the bounded partial answer, but incomplete tool arguments are never
+    /// passed to execution.
+    Limit(String),
     /// The stream ended without a Done marker (fatal).
     EndedWithoutCompletion,
 }
@@ -797,6 +872,7 @@ async fn stream_once(
     request: ModelRequest,
     collector: &mut StreamCollector,
     channel_capacity: usize,
+    max_agent_event_bytes: usize,
     ui_events: &mpsc::Sender<AgentEvent>,
     mut forward: impl FnMut(ModelEvent) -> Result<Forwarded, String>,
 ) -> Result<(), StreamFailure> {
@@ -804,21 +880,38 @@ async fn stream_once(
     let provider = provider.clone();
     let provider_task = tokio::spawn(async move { provider.stream(request, model_tx).await });
     while let Some(event) = model_rx.recv().await {
-        if let Some(event) = collector.on_event(event) {
+        let forwarded = match collector.on_event(event) {
+            Ok(forwarded) => forwarded,
+            Err(error) => {
+                // Dropping a JoinHandle does not cancel the provider task. An
+                // explicit abort is required here or a rejected oversized
+                // stream would keep reading the network in the background.
+                provider_task.abort();
+                let _ = provider_task.await;
+                return Err(StreamFailure::Limit(error));
+            }
+        };
+        if let Some(event) = forwarded {
             match forward(event).map_err(StreamFailure::Handler)? {
-                Forwarded::Send(agent_event) => ui_events
-                    .send(agent_event)
-                    .await
-                    .map_err(|_| StreamFailure::Handler("UI event receiver closed".to_owned()))?,
+                Forwarded::Send(agent_event) => {
+                    send_agent_event_bounded(ui_events, agent_event, max_agent_event_bytes)
+                        .await
+                        .map_err(|_| {
+                            StreamFailure::Handler("UI event receiver closed".to_owned())
+                        })?
+                }
                 Forwarded::SendMany(agent_events) => {
                     for agent_event in agent_events {
-                        ui_events.send(agent_event).await.map_err(|_| {
-                            StreamFailure::Handler("UI event receiver closed".to_owned())
-                        })?;
+                        send_agent_event_bounded(ui_events, agent_event, max_agent_event_bytes)
+                            .await
+                            .map_err(|_| {
+                                StreamFailure::Handler("UI event receiver closed".to_owned())
+                            })?;
                     }
                 }
                 Forwarded::SendIgnore(agent_event) => {
-                    let _ = ui_events.send(agent_event).await;
+                    let _ = send_agent_event_bounded(ui_events, agent_event, max_agent_event_bytes)
+                        .await;
                 }
                 Forwarded::Ignore => {}
             }
@@ -837,6 +930,56 @@ async fn stream_once(
         return Err(StreamFailure::EndedWithoutCompletion);
     }
     Ok(())
+}
+
+/// Keeps individual queue payloads bounded even when a provider sends one
+/// unusually large delta. The collector's total response limit still decides
+/// whether the round may continue; this helper only controls queue pressure.
+async fn send_agent_event_bounded(
+    sender: &mpsc::Sender<AgentEvent>,
+    event: AgentEvent,
+    max_bytes: usize,
+) -> Result<(), Box<mpsc::error::SendError<AgentEvent>>> {
+    let max_bytes = max_bytes.max(1);
+    match event {
+        AgentEvent::TextDelta(mut text) => {
+            while !text.is_empty() {
+                let mut end = text.len().min(max_bytes);
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end == 0 {
+                    end = text.chars().next().map(char::len_utf8).unwrap_or(0);
+                }
+                let chunk = text[..end].to_owned();
+                text.drain(..end);
+                sender
+                    .send(AgentEvent::TextDelta(chunk))
+                    .await
+                    .map_err(Box::new)?;
+            }
+            Ok(())
+        }
+        AgentEvent::ReasoningDelta(mut text) => {
+            while !text.is_empty() {
+                let mut end = text.len().min(max_bytes);
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end == 0 {
+                    end = text.chars().next().map(char::len_utf8).unwrap_or(0);
+                }
+                let chunk = text[..end].to_owned();
+                text.drain(..end);
+                sender
+                    .send(AgentEvent::ReasoningDelta(chunk))
+                    .await
+                    .map_err(Box::new)?;
+            }
+            Ok(())
+        }
+        event => sender.send(event).await.map_err(Box::new),
+    }
 }
 
 impl AgentRunner {
@@ -862,6 +1005,7 @@ impl AgentRunner {
             compaction: CompactionConfig::default(),
             token_calibration: 1.0,
             usage_anchor: None,
+            memory: MemoryConfig::default(),
         }
     }
 
@@ -909,6 +1053,12 @@ impl AgentRunner {
     /// calibrated whole-conversation estimate.
     pub fn with_usage_anchor(mut self, anchor: Option<UsageAnchor>) -> Self {
         self.usage_anchor = anchor;
+        self
+    }
+
+    pub fn with_memory_config(mut self, memory: MemoryConfig) -> Self {
+        self.memory = memory;
+        self.memory.normalize();
         self
     }
 
@@ -1001,6 +1151,12 @@ impl AgentRunner {
                 provider_config.retry_initial_backoff_ms,
                 provider_config.retry_max_backoff_ms,
             )
+            .map(|provider| {
+                provider.with_sse_limits(
+                    self.memory.max_sse_frame_bytes,
+                    self.memory.max_sse_buffer_bytes,
+                )
+            })
             .map_err(|error| error.to_string())?;
             (provider, provider_config)
         };
@@ -1149,18 +1305,22 @@ impl AgentRunner {
             .compaction
             .max_summary_bytes
             .min(target_tokens.saturating_sub(recent_budget) as usize * 4);
-        let mut collector = StreamCollector::new(Some(summary_limit));
+        let mut collector =
+            StreamCollector::new(Some(summary_limit)).with_memory_limits(self.memory);
         stream_once(
             &self.provider,
             request,
             &mut collector,
             128,
+            self.memory.max_agent_event_bytes,
             ui_events,
             |_| Ok(Forwarded::Ignore),
         )
         .await
         .map_err(|failure| match failure {
-            StreamFailure::Handler(error) | StreamFailure::Join(error) => error,
+            StreamFailure::Handler(error)
+            | StreamFailure::Join(error)
+            | StreamFailure::Limit(error) => error,
             StreamFailure::Provider(error) => error.to_string(),
             StreamFailure::EndedWithoutCompletion => {
                 "compaction stream ended without completion".into()
@@ -1302,7 +1462,8 @@ impl AgentRunner {
                 .send(AgentEvent::ModelStreaming)
                 .await
                 .map_err(|_| "UI event receiver closed".to_owned())?;
-            let mut collector = StreamCollector::new(None);
+            let mut collector = StreamCollector::new(Some(self.memory.max_response_bytes))
+                .with_memory_limits(self.memory);
             let mut search_results = 0usize;
             let mut search_bytes = 0usize;
             // Per-round reasoning phase tracking: this closure is rebuilt on every
@@ -1322,6 +1483,7 @@ impl AgentRunner {
                 request,
                 &mut collector,
                 128,
+                self.memory.max_agent_event_bytes,
                 ui_events,
                 |event| match event {
                     ModelEvent::WebSearchStarted { query } => {
@@ -1538,7 +1700,9 @@ impl AgentRunner {
                     self.save_partial(&collector.assistant_text);
                     return Err(error.to_string());
                 }
-                Err(StreamFailure::Handler(error)) | Err(StreamFailure::Join(error)) => {
+                Err(StreamFailure::Handler(error))
+                | Err(StreamFailure::Join(error))
+                | Err(StreamFailure::Limit(error)) => {
                     self.save_partial(&collector.assistant_text);
                     return Err(error);
                 }
@@ -2193,7 +2357,10 @@ impl AgentRunner {
                 thinking_profile_kind,
                 max_output_tokens: provider_config.max_output_tokens,
             };
-            let mut collector = StreamCollector::new(Some(child_max_output_bytes));
+            let mut collector = StreamCollector::new(Some(
+                child_max_output_bytes.min(self.memory.max_response_bytes),
+            ))
+            .with_memory_limits(self.memory);
             emit_child_progress(
                 ui_events,
                 &child_id,
@@ -2208,22 +2375,30 @@ impl AgentRunner {
             let mut streaming_reported = false;
             let stream_result = timeout(
                 active_budget,
-                stream_once(&provider, request, &mut collector, 512, ui_events, |_| {
-                    if streaming_reported {
-                        Ok(Forwarded::Ignore)
-                    } else {
-                        streaming_reported = true;
-                        Ok(Forwarded::SendIgnore(AgentEvent::ChildSessionProgress {
-                            session_id: child_id.clone(),
-                            progress: child_progress(
-                                ChildSessionStatus::Streaming,
-                                turn,
-                                max_turns,
-                                None,
-                            ),
-                        }))
-                    }
-                }),
+                stream_once(
+                    &provider,
+                    request,
+                    &mut collector,
+                    512,
+                    self.memory.max_agent_event_bytes,
+                    ui_events,
+                    |_| {
+                        if streaming_reported {
+                            Ok(Forwarded::Ignore)
+                        } else {
+                            streaming_reported = true;
+                            Ok(Forwarded::SendIgnore(AgentEvent::ChildSessionProgress {
+                                session_id: child_id.clone(),
+                                progress: child_progress(
+                                    ChildSessionStatus::Streaming,
+                                    turn,
+                                    max_turns,
+                                    None,
+                                ),
+                            }))
+                        }
+                    },
+                ),
             )
             .await;
             active_budget = active_budget.saturating_sub(stream_started.elapsed());
@@ -2248,7 +2423,9 @@ impl AgentRunner {
                     failure = Some(error.to_string());
                     break;
                 }
-                Err(StreamFailure::Handler(error)) | Err(StreamFailure::Join(error)) => {
+                Err(StreamFailure::Handler(error))
+                | Err(StreamFailure::Join(error))
+                | Err(StreamFailure::Limit(error)) => {
                     return Err(error);
                 }
                 Err(StreamFailure::EndedWithoutCompletion) => {

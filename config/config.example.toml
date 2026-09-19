@@ -54,6 +54,29 @@ max_background_sessions = 8
 checkpoint_max_file_bytes = 1048576
 checkpoint_max_session_bytes = 16777216
 
+# Bounded provider/history allocations. Values are clamped when loaded.
+[memory]
+enabled = true
+# Provider-context recall is deliberately opt-in and currently reserved until
+# the user explicitly authorizes persisted memory to leave local storage.
+auto_recall = false
+max_entries = 512
+max_candidates = 128
+max_entry_bytes = 16384
+max_total_bytes = 8388608
+max_recall_entries = 8
+max_recall_bytes = 16384
+max_sse_frame_bytes = 2097152
+max_sse_buffer_bytes = 4194304
+max_response_bytes = 2097152
+max_tool_call_bytes = 1048576
+max_tool_call_total_bytes = 4194304
+max_tool_calls = 32
+max_agent_event_bytes = 65536
+max_history_items = 200
+max_history_bytes = 1048576
+max_history_item_bytes = 262144
+
 [compaction]
 enabled = true
 auto_threshold = 0.80

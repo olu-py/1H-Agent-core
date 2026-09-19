@@ -36,12 +36,12 @@ use crate::{
     config::Config,
     model::{AgentPhase, ApprovalAction, PendingApproval},
     protocol::{
-        self, ApiError, AppSnapshotV2, ApprovalDto, ContextBudgetDto, Event, MessageDto,
+        self, ApiError, AppSnapshotV2, ApprovalDto, ContextBudgetDto, Event, MemoryDto, MessageDto,
         MessagePage, SessionStateDto, TodoDto,
     },
     provider::ToolCall,
     secrets,
-    storage::{Storage, StoredMessage},
+    storage::{MemoryRecord, Storage, StoredMessage},
 };
 
 /// Everything the core needs to start, decoupled from any UI-specific config.
@@ -77,6 +77,31 @@ enum CoreCommand {
         before: Option<i64>,
         limit: usize,
         reply: oneshot::Sender<Result<MessagePage, ApiError>>,
+    },
+    GetMemories {
+        query: Option<String>,
+        include_deleted: bool,
+        reply: oneshot::Sender<Result<Vec<MemoryDto>, ApiError>>,
+    },
+    SaveMemory {
+        title: String,
+        content: String,
+        candidate: bool,
+        reply: oneshot::Sender<Result<MemoryDto, ApiError>>,
+    },
+    ConfirmMemory {
+        id: i64,
+        reply: oneshot::Sender<Result<MemoryDto, ApiError>>,
+    },
+    UpdateMemory {
+        id: i64,
+        title: String,
+        content: String,
+        reply: oneshot::Sender<Result<MemoryDto, ApiError>>,
+    },
+    DeleteMemory {
+        id: i64,
+        reply: oneshot::Sender<Result<(), ApiError>>,
     },
     SubmitInput {
         session_id: Option<String>,
@@ -532,6 +557,77 @@ impl AppHandle {
             .map_err(|_| ApiError::internal("messages unavailable"))?
     }
 
+    /// Lists workspace memories. Candidates and source-invalid rows are
+    /// returned for review; the core never lets consumers query another
+    /// workspace because workspace ownership is held by this service.
+    pub async fn memories(
+        &self,
+        query: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<Vec<MemoryDto>, ApiError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CoreCommand::GetMemories {
+            query: query.map(str::to_owned),
+            include_deleted,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| ApiError::internal("memories unavailable"))?
+    }
+
+    pub async fn save_memory(
+        &self,
+        title: &str,
+        content: &str,
+        candidate: bool,
+    ) -> Result<MemoryDto, ApiError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CoreCommand::SaveMemory {
+            title: title.to_owned(),
+            content: content.to_owned(),
+            candidate,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| ApiError::internal("memory save unavailable"))?
+    }
+
+    pub async fn confirm_memory(&self, id: i64) -> Result<MemoryDto, ApiError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CoreCommand::ConfirmMemory { id, reply: tx })
+            .await?;
+        rx.await
+            .map_err(|_| ApiError::internal("memory confirmation unavailable"))?
+    }
+
+    pub async fn update_memory(
+        &self,
+        id: i64,
+        title: &str,
+        content: &str,
+    ) -> Result<MemoryDto, ApiError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CoreCommand::UpdateMemory {
+            id,
+            title: title.to_owned(),
+            content: content.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| ApiError::internal("memory update unavailable"))?
+    }
+
+    pub async fn delete_memory(&self, id: i64) -> Result<(), ApiError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CoreCommand::DeleteMemory { id, reply: tx })
+            .await?;
+        rx.await
+            .map_err(|_| ApiError::internal("memory deletion unavailable"))?
+    }
+
     /// Submits user input, creating the session when `session_id` is `None`
     /// (the home-screen "first message creates a session" semantic). Returns the
     /// request sequence assigned to the new request; pass it to [`Self::cancel`]
@@ -823,6 +919,66 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             reply,
         } => {
             let _ = reply.send(message_page(engine, &session_id, before, limit));
+        }
+        CoreCommand::GetMemories {
+            query,
+            include_deleted,
+            reply,
+        } => {
+            let workspace = engine.app.workspace.to_string_lossy().into_owned();
+            let result = engine
+                .app
+                .storage
+                .list_memories(&workspace, query.as_deref(), include_deleted)
+                .map(|records| records.iter().map(memory_dto).collect())
+                .map_err(storage_api_error);
+            let _ = reply.send(result);
+        }
+        CoreCommand::SaveMemory {
+            title,
+            content,
+            candidate,
+            reply,
+        } => {
+            let result = save_memory(engine, &title, &content, candidate);
+            let _ = reply.send(result);
+        }
+        CoreCommand::ConfirmMemory { id, reply } => {
+            let result = mutate_memory(engine, |storage, workspace, config| {
+                storage
+                    .confirm_memory(workspace, id)
+                    .map(|record| memory_dto(&record))
+                    .map_err(|error| memory_api_error(error, config))
+            });
+            let _ = reply.send(result);
+        }
+        CoreCommand::UpdateMemory {
+            id,
+            title,
+            content,
+            reply,
+        } => {
+            let result = mutate_memory(engine, |storage, workspace, config| {
+                storage
+                    .update_memory(
+                        workspace,
+                        id,
+                        &title,
+                        &content,
+                        config.memory.max_entry_bytes,
+                    )
+                    .map(|record| memory_dto(&record))
+                    .map_err(|error| memory_api_error(error, config))
+            });
+            let _ = reply.send(result);
+        }
+        CoreCommand::DeleteMemory { id, reply } => {
+            let result = mutate_memory(engine, |storage, workspace, config| {
+                storage
+                    .delete_memory(workspace, id)
+                    .map_err(|error| memory_api_error(error, config))
+            });
+            let _ = reply.send(result);
         }
         CoreCommand::SubmitInput {
             session_id,
@@ -1917,7 +2073,82 @@ fn session_allow_for_call(call: &crate::provider::ToolCall) -> (String, Option<S
 }
 
 fn api_error(error: anyhow::Error) -> ApiError {
-    ApiError::internal(error.to_string())
+    let message = error.to_string();
+    if message.contains("后台会话容量已满") {
+        ApiError::conflict(message)
+    } else {
+        ApiError::internal(message)
+    }
+}
+
+fn memory_dto(record: &MemoryRecord) -> MemoryDto {
+    MemoryDto {
+        id: record.id,
+        kind: record.kind.clone(),
+        title: record.title.clone(),
+        content: record.content.clone(),
+        topic: record.topic.clone(),
+        status: record.status.clone(),
+        source_session_id: record.source_session_id.clone(),
+        source_turn_id: record.source_turn_id.clone(),
+        source_message_id: record.source_message_id,
+        evidence: record.evidence.clone(),
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+        confirmed_at: record.confirmed_at.clone(),
+        recallable: record.recallable,
+    }
+}
+
+fn storage_api_error(error: crate::storage::StorageError) -> ApiError {
+    match error {
+        crate::storage::StorageError::MemoryLimit(message) => ApiError::conflict(message),
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
+fn memory_api_error(error: crate::storage::StorageError, _config: &Config) -> ApiError {
+    storage_api_error(error)
+}
+
+fn mutate_memory<T>(
+    engine: &mut Engine,
+    operation: impl FnOnce(&Storage, &str, &Config) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let workspace = engine.app.workspace.to_string_lossy().into_owned();
+    operation(&engine.app.storage, &workspace, &engine.app.config)
+}
+
+fn save_memory(
+    engine: &mut Engine,
+    title: &str,
+    content: &str,
+    candidate: bool,
+) -> Result<MemoryDto, ApiError> {
+    let workspace = engine.app.workspace.to_string_lossy().into_owned();
+    let session_id = engine.app.active_session.clone();
+    let turn_id = engine.app.storage.head_turn_id(&session_id).ok().flatten();
+    engine
+        .app
+        .storage
+        .create_memory(
+            &workspace,
+            if candidate { "candidate" } else { "explicit" },
+            title,
+            content,
+            None,
+            if candidate { "candidate" } else { "active" },
+            Some(&session_id),
+            turn_id.as_deref(),
+            None,
+            Some("user-managed"),
+            engine.app.config.memory.max_entries,
+            engine.app.config.memory.max_candidates,
+            engine.app.config.memory.max_entry_bytes,
+            engine.app.config.memory.max_total_bytes,
+        )
+        .map(|record| memory_dto(&record))
+        .map_err(storage_api_error)
 }
 
 /// Per-workspace exclusive lock. A second program opening the same canonical

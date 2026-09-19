@@ -18,6 +18,7 @@ pub enum Command {
     Model(Option<String>),
     Provider,
     Agent(Option<String>),
+    Memory(Option<String>),
     Mode(AgentMode),
     Todo(TodoCommand),
     Clear,
@@ -128,6 +129,7 @@ pub fn parse(input: &str) -> Option<Command> {
         "model" => Command::Model(argument.map(str::to_owned)),
         "provider" => Command::Provider,
         "agent" => Command::Agent(argument.map(str::to_owned)),
+        "memory" | "mem" => Command::Memory(argument.map(str::to_owned)),
         "plan" => Command::Mode(AgentMode::Plan),
         "build" => Command::Mode(AgentMode::Build),
         "explore" => Command::Mode(AgentMode::Explore),
@@ -376,6 +378,10 @@ mod tests {
         assert_eq!(parse("/plan"), Some(Command::Mode(AgentMode::Plan)));
         assert_eq!(parse("/build"), Some(Command::Mode(AgentMode::Build)));
         assert_eq!(parse("/explore"), Some(Command::Mode(AgentMode::Explore)));
+        assert_eq!(
+            parse("/memory search preference"),
+            Some(Command::Memory(Some("search preference".into())))
+        );
         assert_eq!(parse("/missing"), None);
     }
 
