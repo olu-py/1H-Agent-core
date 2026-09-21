@@ -22,7 +22,7 @@ jobs:
           github-token: ${{ secrets.CORE_UPGRADE_TOKEN }}
           script: |
             const repositories = [
-              { owner: 'olu-py', repo: '1H-Agent' },
+              { owner: 'olu-py', repo: '1H-Agent-TUI' },
               { owner: 'olu-py', repo: '1H-Agent-webUI' },
             ];
             for (const repository of repositories) {
