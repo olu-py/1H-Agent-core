@@ -37,3 +37,14 @@ git diff --check
 ```
 
 push core 后分别在 TUI/WebUI 更新和验证；消费端失败时修消费端适配，不把状态机或协议逻辑复制过去。
+
+## CI 与合并门禁
+
+`.github/workflows/ci.yml` 的 required checks 名称为：
+
+- `Linux quality`
+- `Minimum Rust (1.85.0)`
+- `Test (macos-latest)`
+- `Test (windows-latest)`
+
+core 的 `main` 应要求 PR 通过以上检查并与目标分支同步后再合并。消费端更新应在各自仓库完成完整锁定测试；跨仓库升级 PR 不应直接写入 `main`。
