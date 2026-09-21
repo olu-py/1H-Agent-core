@@ -21,7 +21,7 @@ jobs:
           path: core
       - uses: actions/checkout@v4
         with:
-          repository: olu-py/1H-Agent
+          repository: olu-py/1H-Agent-TUI
           path: tui
           ref: main
       - uses: dtolnay/rust-toolchain@stable

@@ -11,12 +11,12 @@ permissions:
 jobs:
   dispatch:
     name: Notify downstream repositories
-    if: ${{ env.CORE_UPGRADE_TOKEN != '' }}
     runs-on: ubuntu-latest
     env:
       CORE_UPGRADE_TOKEN: ${{ secrets.CORE_UPGRADE_TOKEN }}
     steps:
       - name: Send release event
+        if: ${{ env.CORE_UPGRADE_TOKEN != '' }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.CORE_UPGRADE_TOKEN }}
