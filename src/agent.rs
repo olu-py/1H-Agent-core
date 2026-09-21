@@ -196,14 +196,14 @@ fn validate_child_model(provider_config: &ProviderConfig) -> Result<(), String> 
     if selectable.contains(&normalized.as_str()) {
         return Ok(());
     }
-    if let Some(prefix_preset) = model_prefix_preset(&normalized)
-        && prefix_preset != provider_config.preset
-    {
-        return Err(format!(
-            "model \"{model}\" belongs to {}; set provider={} or omit provider to infer it",
-            prefix_preset.label(),
-            prefix_preset.key_id()
-        ));
+    if let Some(prefix_preset) = model_prefix_preset(&normalized) {
+        if prefix_preset != provider_config.preset {
+            return Err(format!(
+                "model \"{model}\" belongs to {}; set provider={} or omit provider to infer it",
+                prefix_preset.label(),
+                prefix_preset.key_id()
+            ));
+        }
     }
     let looks_like_full_id =
         normalized.contains('-') || normalized.contains('.') || normalized.contains(':');
@@ -482,13 +482,13 @@ impl Drop for ChildCancellationGuard {
                 session_id: self.session_id.clone(),
                 progress: child_progress(ChildSessionStatus::Cancelled, 0, self.max_turns, None),
             };
-            if let Err(mpsc::error::TrySendError::Full(event)) = self.ui_events.try_send(event)
-                && let Ok(runtime) = tokio::runtime::Handle::try_current()
-            {
-                let ui_events = self.ui_events.clone();
-                runtime.spawn(async move {
-                    let _ = ui_events.send(event).await;
-                });
+            if let Err(mpsc::error::TrySendError::Full(event)) = self.ui_events.try_send(event) {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let ui_events = self.ui_events.clone();
+                    runtime.spawn(async move {
+                        let _ = ui_events.send(event).await;
+                    });
+                }
             }
         }
     }
@@ -1774,17 +1774,23 @@ impl AgentRunner {
                         .map_err(|error| error.to_string())?;
                     continue;
                 }
-                if let Some(role) = &self.child_role
-                    && !child_tool_name_allowed(&call.name, Some(role), &[])
-                {
-                    let result =
-                        format!("denied by policy: child role does not allow {}", call.name);
-                    self.storage
-                        .begin_tool(&self.session_id, &call, "denied")
-                        .map_err(|error| error.to_string())?;
-                    self.complete_tool(&call, &result, ui_events, items, &mut executed_tool_calls)
+                if let Some(role) = &self.child_role {
+                    if !child_tool_name_allowed(&call.name, Some(role), &[]) {
+                        let result =
+                            format!("denied by policy: child role does not allow {}", call.name);
+                        self.storage
+                            .begin_tool(&self.session_id, &call, "denied")
+                            .map_err(|error| error.to_string())?;
+                        self.complete_tool(
+                            &call,
+                            &result,
+                            ui_events,
+                            items,
+                            &mut executed_tool_calls,
+                        )
                         .await?;
-                    continue;
+                        continue;
+                    }
                 }
                 if matches!(call.name.as_str(), "todo_read" | "todo_write") {
                     self.storage
@@ -2294,11 +2300,11 @@ impl AgentRunner {
 
         let tools = self.child_tool_definitions(role.as_deref(), &allowed_tools);
         let mut child_system = prompt::child_system_prompt(role.as_deref(), &allowed_tools);
-        if let Some(agent) = &configured_agent
-            && !agent.system_prompt.trim().is_empty()
-        {
-            child_system.push_str("\n\nADDITIONAL AGENT INSTRUCTIONS\n");
-            child_system.push_str(agent.system_prompt.trim());
+        if let Some(agent) = &configured_agent {
+            if !agent.system_prompt.trim().is_empty() {
+                child_system.push_str("\n\nADDITIONAL AGENT INSTRUCTIONS\n");
+                child_system.push_str(agent.system_prompt.trim());
+            }
         }
 
         // Multi-turn loop: execute the child's role-filtered tools, keep its

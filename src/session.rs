@@ -310,15 +310,19 @@ impl SessionRuntime {
                 self.finish_thinking("思考完成");
                 self.agent_phase = AgentPhase::StreamingText;
                 self.model_phase = ModelPhase::Streaming;
-                if let Some(entry) = self.entries.last_mut()
-                    && matches!(
+                let mut appended = false;
+                if let Some(entry) = self.entries.last_mut() {
+                    if matches!(
                         entry.kind,
                         DisplayKind::Assistant | DisplayKind::AssistantPartial
-                    )
-                    && let DisplayContent::Markdown(text) = &mut entry.content
-                {
-                    text.push_str(&delta);
-                } else {
+                    ) {
+                        if let DisplayContent::Markdown(text) = &mut entry.content {
+                            text.push_str(&delta);
+                            appended = true;
+                        }
+                    }
+                }
+                if !appended {
                     self.push_entry(DisplayEntry {
                         kind: DisplayKind::Assistant,
                         content: DisplayContent::Markdown(delta),
@@ -628,11 +632,12 @@ impl SessionRuntime {
     /// persisted tool-round assistant entry is never touched (the last entry is
     /// then a tool, not an assistant).
     pub(crate) fn mark_partial_if_streaming(&mut self) {
-        if let Some(entry) = self.entries.last_mut()
-            && matches!(entry.kind, DisplayKind::Assistant)
-            && matches!(&entry.content, DisplayContent::Markdown(t) if !t.trim().is_empty())
-        {
-            entry.kind = DisplayKind::AssistantPartial;
+        if let Some(entry) = self.entries.last_mut() {
+            if matches!(entry.kind, DisplayKind::Assistant)
+                && matches!(&entry.content, DisplayContent::Markdown(t) if !t.trim().is_empty())
+            {
+                entry.kind = DisplayKind::AssistantPartial;
+            }
         }
     }
 
@@ -837,15 +842,16 @@ pub fn estimate_used_tokens(
     items: &[ConversationItem],
     calibration: f64,
 ) -> u64 {
-    if let Some(anchor) = anchor
-        && anchor.at_len <= items.len()
-    {
-        let suffix = &items[anchor.at_len..];
-        if suffix.is_empty() {
-            return anchor.real_input;
+    if let Some(anchor) = anchor {
+        if anchor.at_len <= items.len() {
+            let suffix = &items[anchor.at_len..];
+            if suffix.is_empty() {
+                return anchor.real_input;
+            }
+            let suffix_tokens =
+                (estimate_context_tokens(suffix) as f64 * calibration).ceil() as u64;
+            return anchor.real_input.saturating_add(suffix_tokens);
         }
-        let suffix_tokens = (estimate_context_tokens(suffix) as f64 * calibration).ceil() as u64;
-        return anchor.real_input.saturating_add(suffix_tokens);
     }
     (estimate_context_tokens(items) as f64 * calibration).ceil() as u64
 }

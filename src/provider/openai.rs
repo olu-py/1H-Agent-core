@@ -423,8 +423,10 @@ fn apply_chat_thinking(body: &mut Value, request: &ModelRequest) {
         ThinkingProfileKind::Qwen37 => {
             let enabled = request.thinking_level == ThinkingLevel::Enabled;
             body["enable_thinking"] = Value::Bool(enabled);
-            if enabled && let Some(budget) = request.thinking_budget_tokens {
-                body["thinking_budget"] = Value::Number(budget.into());
+            if enabled {
+                if let Some(budget) = request.thinking_budget_tokens {
+                    body["thinking_budget"] = Value::Number(budget.into());
+                }
             }
         }
         ThinkingProfileKind::DeepSeekPro | ThinkingProfileKind::DeepSeekFlash => {
@@ -486,17 +488,17 @@ fn responses_body(request: &ModelRequest) -> Value {
         .items
         .iter()
         .filter(|item| {
-            if instructions.is_none()
-                && let ConversationItem::Message {
+            if instructions.is_none() {
+                if let ConversationItem::Message {
                     role: Role::System,
                     content,
                 } = item
-            {
-                instructions = Some(content.clone());
-                false
-            } else {
-                true
+                {
+                    instructions = Some(content.clone());
+                    return false;
+                }
             }
+            true
         })
         .flat_map(responses_item)
         .collect();

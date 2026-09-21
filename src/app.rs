@@ -87,9 +87,10 @@ pub(crate) async fn build_app(
         .session_provider_model(&session_id)
         .ok()
         .and_then(|(provider_id, model)| session_provider_config(&config, &provider_id, &model))
-        && provider_config.preset != config.provider.preset
     {
-        let _ = secrets::api_key_cached(provider_config.preset);
+        if provider_config.preset != config.provider.preset {
+            let _ = secrets::api_key_cached(provider_config.preset);
+        }
     }
     let (active_secret, initial_status) = match secrets::api_key_cached(config.provider.preset) {
         Ok(api_key) => (
@@ -262,11 +263,11 @@ pub(crate) fn cancel_active_request(app: &mut App) {
     // Capture the half-generated assistant text (accumulated in the live
     // entries by TextDelta) and persist it as `assistant_partial` before
     // aborting, so an interrupted stream survives for review.
-    if let Some(text) = streaming_assistant_text(&app.current.entries)
-        && !text.trim().is_empty()
-    {
-        let _ = app.storage.save_partial(&app.current.session_id, text);
-        let _ = app.storage.clear_response_id(&app.current.session_id);
+    if let Some(text) = streaming_assistant_text(&app.current.entries) {
+        if !text.trim().is_empty() {
+            let _ = app.storage.save_partial(&app.current.session_id, text);
+            let _ = app.storage.clear_response_id(&app.current.session_id);
+        }
     }
     if let Some(task) = app.current.active_task.take() {
         task.abort();
@@ -1528,12 +1529,13 @@ impl App {
             .as_ref()
             .map(|approval| (approval.created_at, self.active_session.clone()));
         for (session_id, runtime) in &self.background {
-            if let Some(approval) = &runtime.pending_approval
-                && owner
+            if let Some(approval) = &runtime.pending_approval {
+                if owner
                     .as_ref()
                     .is_none_or(|(created_at, _)| approval.created_at < *created_at)
-            {
-                owner = Some((approval.created_at, session_id.clone()));
+                {
+                    owner = Some((approval.created_at, session_id.clone()));
+                }
             }
         }
         let (_, owner) = owner?;

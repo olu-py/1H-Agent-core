@@ -56,10 +56,10 @@ fn environment_key(preset: ProviderPreset) -> Option<String> {
 /// while startup performs only one potentially interactive keyring read.
 pub fn preload_environment_keys() {
     for preset in ProviderPreset::ALL {
-        if cached_key(preset).is_none()
-            && let Some(key) = environment_key(preset)
-        {
-            remember_key(preset, Ok(key));
+        if cached_key(preset).is_none() {
+            if let Some(key) = environment_key(preset) {
+                remember_key(preset, Ok(key));
+            }
         }
     }
 }

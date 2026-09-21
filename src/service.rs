@@ -1766,10 +1766,10 @@ fn set_provider_profile(
     };
     profile.preset = preset;
     profile.model = model.trim().to_owned();
-    if let Some(base_url) = base_url
-        && !base_url.trim().is_empty()
-    {
-        profile.base_url = base_url.trim().to_owned();
+    if let Some(base_url) = base_url {
+        if !base_url.trim().is_empty() {
+            profile.base_url = base_url.trim().to_owned();
+        }
     }
     if let Some(kind) = kind {
         profile.kind = kind;

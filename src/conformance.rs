@@ -657,12 +657,12 @@ pub fn check_stream_invariants(envelopes: &[Envelope]) -> Result<(), Vec<String>
             Event::ToolCallStreaming { received_bytes, .. } => match phase {
                 RoundPhase::Unopened => {}
                 RoundPhase::Reasoning | RoundPhase::Body | RoundPhase::ToolStreaming => {
-                    if let Some(previous) = tool_stream_bytes
-                        && *received_bytes < previous
-                    {
-                        violations.push(format!(
-                            "envelope {index}: tool call streaming bytes went backwards in round {round} ({previous} -> {received_bytes})"
-                        ));
+                    if let Some(previous) = tool_stream_bytes {
+                        if *received_bytes < previous {
+                            violations.push(format!(
+                                "envelope {index}: tool call streaming bytes went backwards in round {round} ({previous} -> {received_bytes})"
+                            ));
+                        }
                     }
                     tool_stream_bytes = Some(*received_bytes);
                     phase = RoundPhase::ToolStreaming;
