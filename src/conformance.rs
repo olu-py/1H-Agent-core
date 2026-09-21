@@ -825,7 +825,7 @@ mod tests {
             let mut json = serde_json::to_string_pretty(&scenario).expect("serialize scenario");
             json.push('\n');
             match std::fs::read_to_string(&path) {
-                Ok(existing) if existing == json => {}
+                Ok(existing) if existing.replace("\r\n", "\n") == json => {}
                 _ => {
                     std::fs::write(&path, json).expect("write conformance fixture");
                     drifted.push(scenario.name);
