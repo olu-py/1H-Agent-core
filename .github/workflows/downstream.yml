@@ -34,7 +34,9 @@ jobs:
           sudo apt-get install --yes libdbus-1-dev pkg-config
       - name: TUI conformance
         working-directory: tui
-        run: cargo test --lib conformance --locked --config 'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
+        run: |
+          trap 'git restore --source=HEAD -- Cargo.lock' EXIT
+          cargo test --lib conformance --config 'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
 
   webui:
     name: WebUI compatibility
@@ -58,7 +60,9 @@ jobs:
           sudo apt-get install --yes libdbus-1-dev pkg-config
       - name: Rust compatibility
         working-directory: webui
-        run: cargo test --all-features --locked --config 'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
+        run: |
+          trap 'git restore --source=HEAD -- Cargo.lock' EXIT
+          cargo test --all-features --config 'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
       - name: Bindings drift
         working-directory: webui
         env:
