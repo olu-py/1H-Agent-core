@@ -48,3 +48,9 @@ push core 后分别在 TUI/WebUI 更新和验证；消费端失败时修消费�
 - `Test (windows-latest)`
 
 core 的 `main` 应要求 PR 通过以上检查并与目标分支同步后再合并。消费端更新应在各自仓库完成完整锁定测试；跨仓库升级 PR 不应直接写入 `main`。
+
+## 自动升级
+
+发布 `v*` tag 时，`release-dispatch.yml` 会将 tag 和 commit SHA 发送给 TUI/WebUI。该 workflow 使用 core 仓库 secret `CORE_UPGRADE_TOKEN`；未配置时不跨仓库写入，消费端的每周 schedule 仍会检测 core `main` 并创建升级 PR。
+
+消费端的 `core-upgrade.yml` 只更新固定 rev、Cargo.lock 和（WebUI）bindings，运行锁定验证后创建 PR，不自动合并。PR 正文必须列出旧 SHA、新 SHA、core commit 链接和验证结果。

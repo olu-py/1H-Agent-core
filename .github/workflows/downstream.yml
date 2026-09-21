@@ -1,0 +1,66 @@
+name: Downstream compatibility
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: downstream-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tui:
+    name: TUI compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: core
+      - uses: actions/checkout@v4
+        with:
+          repository: olu-py/1H-Agent
+          path: tui
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libdbus-1-dev pkg-config
+      - name: TUI conformance
+        working-directory: tui
+        run: cargo test --lib conformance --locked --config 'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
+
+  webui:
+    name: WebUI compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: core
+      - uses: actions/checkout@v4
+        with:
+          repository: olu-py/1H-Agent-webUI
+          path: webui
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: webui
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libdbus-1-dev pkg-config
+      - name: Rust compatibility
+        working-directory: webui
+        run: cargo test --all-features --locked --config 'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
+      - name: Bindings drift
+        working-directory: webui
+        env:
+          PROTIUM_CORE_PATH: ${{ github.workspace }}/core
+        run: bash scripts/core-bindings.sh check
