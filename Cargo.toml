@@ -53,7 +53,12 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 test-util = []
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3"
+
+[[bench]]
+name = "maintainability"
+harness = false
 
 [profile.release]
 opt-level = "s"

@@ -54,3 +54,13 @@ core 的 `main` 应要求 PR 通过以上检查并与目标分支同步后再合
 发布 `v*` tag 时，`release-dispatch.yml` 会将 tag 和 commit SHA 发送给 TUI/WebUI。该 workflow 使用 core 仓库 secret `CORE_UPGRADE_TOKEN`；未配置时不跨仓库写入，消费端的每周 schedule 仍会检测 core `main` 并创建升级 PR。
 
 消费端的 `core-upgrade.yml` 只更新固定 rev、Cargo.lock 和（WebUI）bindings，运行锁定验证后创建 PR，不自动合并。PR 正文必须列出旧 SHA、新 SHA、core commit 链接和验证结果。
+
+## 性能基线
+
+core 的 Criterion 基线位于 `benches/maintainability.rs`，覆盖 EventBridge 的 1k/10k 发布、回放和逐出路径，以及 Storage 的 10k message 追加、分页和恢复。使用临时目录和固定 payload，不访问公网：
+
+```bash
+cargo bench --bench maintainability
+```
+
+benchmark 先作为非阻塞报告使用；连续三次在固定机器上的结果稳定后，再考虑把关键指标退化超过 20% 设置为预警。
