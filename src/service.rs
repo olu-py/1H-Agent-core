@@ -27,11 +27,11 @@ use fs2::FileExt;
 use tokio::sync::{mpsc, oneshot};
 
 mod engine;
-use engine::{CoreCommand, Engine, run_engine};
 #[cfg(test)]
 pub(crate) use engine::routed_to_event;
 #[cfg(test)]
 use engine::stored_to_message_dto;
+use engine::{CoreCommand, Engine, run_engine};
 
 mod handle;
 pub use handle::AppHandle;
