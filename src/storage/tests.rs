@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::ToolCall;
 use tempfile::tempdir;
 
 #[test]
