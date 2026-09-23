@@ -41,6 +41,7 @@ push core 后分别在 TUI/WebUI 更新和验证；消费端失败时修消费�
 ## CI 与自动升级
 
 - core `main` 的 required checks：`Linux quality`、`Minimum Rust (1.85.0)`、`Test (macos-latest)`、`Test (windows-latest)`；跨仓库升级 PR 不直接写 `main`。
+- required-check 名保持稳定；runner 固定 Ubuntu 24.04、macOS 26、Windows 2025（发布 ARM64/Intel 各用原生 macOS runner）；Action 固定完整 SHA并由每周 Dependabot 分组更新，checkout 不保留凭据，缓存仅允许 `main` CI 写入。
 - 发布 `v*` tag 后，`release-dispatch.yml` 使用 `CORE_UPGRADE_TOKEN` 通知消费端；未配置时由消费端每周 schedule 检测 core `main`。
 - 消费端 workflow 只更新固定 rev、lock 和 WebUI bindings，完整验证后创建包含新旧 SHA 的 PR，不自动合并。
 

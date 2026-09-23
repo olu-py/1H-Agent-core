@@ -14,46 +14,60 @@ concurrency:
 jobs:
   tui:
     name: TUI compatibility
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: core
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           repository: olu-py/1H-Agent-TUI
           path: tui
           ref: main
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: tui
+          save-if: false
       - name: Install Linux system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --yes libdbus-1-dev pkg-config
-      - name: TUI conformance
+      - name: TUI compatibility
         working-directory: tui
         run: |
           trap 'git restore --source=HEAD -- Cargo.lock' EXIT
-          cargo test --lib conformance --config 'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
+          patch='patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
+          cargo update -p protium-core --config "$patch"
+          cargo test --all-features --locked --config "$patch"
 
   webui:
     name: WebUI compatibility
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: core
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           repository: olu-py/1H-Agent-webUI
           path: webui
           ref: main
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: webui
+          save-if: false
       - name: Install Linux system dependencies
         run: |
           sudo apt-get update
@@ -62,7 +76,9 @@ jobs:
         working-directory: webui
         run: |
           trap 'git restore --source=HEAD -- Cargo.lock' EXIT
-          cargo test --all-features --config 'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
+          patch='patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../core"'
+          cargo update -p protium-core --config "$patch"
+          cargo test --all-features --locked --config "$patch"
       - name: Bindings drift
         working-directory: webui
         env:
