@@ -1,5 +1,6 @@
 use std::{
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -32,7 +33,7 @@ use super::{
 /// delete tools are ever delegated to a child.
 pub(super) fn child_tool_name_allowed(
     tool: &str,
-    role: Option<&str>,
+    can_write: bool,
     allowed_tools: &[String],
 ) -> bool {
     const READ_TOOLS: &[&str] = &[
@@ -54,13 +55,8 @@ pub(super) fn child_tool_name_allowed(
         "file_move",
     ];
 
-    if READ_TOOLS.contains(&tool) {
-        return true;
-    }
-    if !allowed_tools.is_empty() {
-        return WRITE_TOOLS.contains(&tool) && allowed_tools.iter().any(|name| name == tool);
-    }
-    WRITE_TOOLS.contains(&tool) && is_implement_role(role)
+    let role_allows = READ_TOOLS.contains(&tool) || (can_write && WRITE_TOOLS.contains(&tool));
+    role_allows && (allowed_tools.is_empty() || allowed_tools.iter().any(|name| name == tool))
 }
 /// Truncates `value` to at most `max_bytes` at a UTF-8 character boundary,
 /// appending a marker when bytes were dropped.
@@ -191,22 +187,33 @@ pub(super) fn child_title(
 /// Whether a child role implies write access. Planning/review roles stay
 /// read-only; implementation/coding roles may write files (subject to the
 /// normal approval policy).
-fn is_implement_role(role: Option<&str>) -> bool {
+pub(super) fn is_implement_role(role: Option<&str>) -> bool {
     role.is_some_and(|role| {
-        let role = role.to_ascii_lowercase();
-        [
-            "implement",
-            "implementation",
-            "code",
-            "coder",
-            "write",
-            "build",
-            "实施",
-            "编码",
-        ]
-        .iter()
-        .any(|keyword| role.contains(keyword))
+        matches!(
+            role.trim().to_ascii_lowercase().as_str(),
+            "implement" | "implementation" | "code" | "coder" | "build" | "实施" | "编码"
+        )
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildCapability {
+    ReadOnly,
+    Implement,
+}
+
+impl ChildCapability {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "read_only" | "readonly" => Some(Self::ReadOnly),
+            "implementation" | "implement" => Some(Self::Implement),
+            _ => None,
+        }
+    }
+
+    fn can_write(self) -> bool {
+        self == Self::Implement
+    }
 }
 
 /// Summarizes a child agent's completed tool results so a turn-limited child
@@ -267,6 +274,8 @@ async fn emit_child_progress(
 
 pub(super) struct ChildCancellationGuard {
     pub(super) ui_events: mpsc::Sender<AgentEvent>,
+    pub(super) storage: crate::storage::Storage,
+    pub(super) partial_output: Arc<std::sync::Mutex<String>>,
     pub(super) session_id: String,
     pub(super) max_turns: usize,
     pub(super) finished: bool,
@@ -289,6 +298,17 @@ impl ChildCancellationGuard {
 impl Drop for ChildCancellationGuard {
     fn drop(&mut self) {
         if !self.finished {
+            let partial = self
+                .partial_output
+                .lock()
+                .map(|output| output.clone())
+                .unwrap_or_default();
+            if !partial.trim().is_empty() {
+                let _ = self
+                    .storage
+                    .append_message(&self.session_id, Role::Assistant, &partial);
+            }
+            let _ = self.storage.set_child_status(&self.session_id, "cancelled");
             let event = AgentEvent::ChildSessionProgress {
                 session_id: self.session_id.clone(),
                 progress: child_progress(ChildSessionStatus::Cancelled, 0, self.max_turns, None),
@@ -308,13 +328,13 @@ impl Drop for ChildCancellationGuard {
 impl AgentRunner {
     fn child_tool_definitions(
         &self,
-        role: Option<&str>,
+        can_write: bool,
         allowed_tools: &[String],
     ) -> Vec<ToolDefinition> {
         self.tools
             .definitions()
             .into_iter()
-            .filter(|tool| child_tool_name_allowed(&tool.name, role, allowed_tools))
+            .filter(|tool| child_tool_name_allowed(&tool.name, can_write, allowed_tools))
             .collect()
     }
 
@@ -515,6 +535,23 @@ impl AgentRunner {
         call: &ToolCall,
         ui_events: &mpsc::Sender<AgentEvent>,
     ) -> Result<String, String> {
+        match self.run_child_inner(call, ui_events).await {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Ok(child_outcome(
+                None,
+                "子 Agent".into(),
+                ChildSessionStatus::Failed,
+                String::new(),
+                Some(error),
+            )),
+        }
+    }
+
+    async fn run_child_inner(
+        &self,
+        call: &ToolCall,
+        ui_events: &mpsc::Sender<AgentEvent>,
+    ) -> Result<String, String> {
         let arguments: ChildArgs = serde_json::from_value(call.arguments.clone())
             .map_err(|error| format!("invalid child agent arguments: {error}"))?;
         if arguments.prompt.trim().is_empty() {
@@ -535,19 +572,10 @@ impl AgentRunner {
             .as_ref()
             .map(|agent| agent.allowed_tools.clone())
             .unwrap_or_default();
-        let role = match role {
-            Some(role) => Some(role),
-            None if allowed_tools.iter().any(|tool| {
-                tool == "file_write"
-                    || tool == "file_edit"
-                    || tool == "file_mkdir"
-                    || tool == "file_copy"
-                    || tool == "file_move"
-            }) =>
-            {
-                Some("implement".to_owned())
-            }
-            None => None,
+        let capability = match arguments.capability.as_deref() {
+            Some(value) => ChildCapability::parse(value).unwrap_or(ChildCapability::ReadOnly),
+            None if is_implement_role(role.as_deref()) => ChildCapability::Implement,
+            None => ChildCapability::ReadOnly,
         };
         let max_turns = arguments
             .max_turns
@@ -571,12 +599,16 @@ impl AgentRunner {
             .session_workspace(&self.session_id)
             .map_err(|error| error.to_string())?;
         let title = child_title(&arguments, configured_agent.as_ref(), role.as_deref());
-        let child_mode = if is_implement_role(role.as_deref()) {
+        let child_mode = if capability.can_write() {
             "build"
         } else {
             "explore"
         };
-        let child_role = role.as_deref().unwrap_or("");
+        let child_role = if capability.can_write() {
+            "implement"
+        } else {
+            "read_only"
+        };
         let child_id = self
             .storage
             .create_child_session(
@@ -589,275 +621,354 @@ impl AgentRunner {
                 child_role,
             )
             .map_err(|error| error.to_string())?;
-        self.storage
-            .append_message(&child_id, Role::User, &arguments.prompt)
-            .map_err(|error| error.to_string())?;
+        let partial_output = Arc::new(std::sync::Mutex::new(String::new()));
         let mut cancellation_guard = ChildCancellationGuard {
             ui_events: ui_events.clone(),
+            storage: self.storage.clone(),
+            partial_output: partial_output.clone(),
             session_id: child_id.clone(),
             max_turns,
             finished: false,
         };
-        // Let the UI refresh the session tree as soon as the child exists,
-        // rather than waiting for the whole turn to complete.
-        let _ = ui_events.send(AgentEvent::SessionsChanged).await;
-        emit_child_progress(
-            ui_events,
-            &child_id,
-            child_progress(ChildSessionStatus::Queued, 0, max_turns, None),
-        )
-        .await;
-        let _child_slot = self
-            .child_slots
-            .acquire()
-            .await
-            .map_err(|_| "child concurrency limiter closed".to_owned())?;
-
-        let tools = self.child_tool_definitions(role.as_deref(), &allowed_tools);
-        let mut child_system = prompt::child_system_prompt(role.as_deref(), &allowed_tools);
-        if let Some(agent) = &configured_agent {
-            if !agent.system_prompt.trim().is_empty() {
-                child_system.push_str("\n\nADDITIONAL AGENT INSTRUCTIONS\n");
-                child_system.push_str(agent.system_prompt.trim());
-            }
-        }
-
-        // Multi-turn loop: execute the child's role-filtered tools, keep its
-        // context bounded, and return only the final deliverable.
-        let thinking_profile_kind =
-            thinking_profile(provider_config.preset, &provider_config.model).kind;
-        let native_web_search = provider_config.preset == ProviderPreset::DeepSeek
-            && provider_config.kind == ProviderKind::Responses
-            && provider_config.native_web_search != NativeWebSearch::Disabled;
-        let child_max_output_bytes = self.cluster.child_max_output_bytes;
-
-        let mut items = vec![ConversationItem::Message {
-            role: Role::User,
-            content: arguments.prompt.clone(),
-        }];
         let mut final_answer = String::new();
-        let mut tool_call_count = 0usize;
-        let mut remaining_turns = max_turns;
-        let mut completed_turns = 0usize;
-        let mut active_budget =
-            Duration::from_secs(self.cluster.child_active_timeout_seconds.max(1));
-        let mut failure: Option<String> = None;
-        let mut status = ChildSessionStatus::Completed;
-        'turns: loop {
-            if max_turns > 0 && remaining_turns == 0 {
-                status = ChildSessionStatus::TurnLimit;
-                let trail = summarize_child_trail(&items, 3, 512);
-                append_text_bounded(
-                    &mut final_answer,
-                    &format!("\n[child agent reached its turn limit]{trail}"),
-                    child_max_output_bytes,
-                );
-                break;
-            }
-            if max_turns > 0 {
-                remaining_turns -= 1;
-            }
-            completed_turns = completed_turns.saturating_add(1);
-            let turn = completed_turns;
-
-            let mut request_items = vec![ConversationItem::Message {
-                role: Role::System,
-                content: child_system.clone(),
-            }];
-            request_items.extend(items.clone());
-            let request = ModelRequest {
-                kind: provider_config.kind,
-                model: provider_config.model.clone(),
-                items: request_items,
-                tools: tools.clone(),
-                previous_response_id: None,
-                native_web_search,
-                thinking_mode: thinking_mode_for(&provider_config),
-                thinking_level: provider_config.thinking_level,
-                thinking_budget_tokens: provider_config.thinking_budget_tokens,
-                thinking_profile_kind,
-                max_output_tokens: provider_config.max_output_tokens,
-            };
-            let mut collector = StreamCollector::new(Some(
-                child_max_output_bytes.min(self.memory.max_response_bytes),
-            ))
-            .with_memory_limits(self.memory);
+        let child_result: Result<String, String> = async {
+            self.storage
+                .set_child_allowed_tools(&child_id, &allowed_tools)
+                .map_err(|error| error.to_string())?;
+            self.storage
+                .append_message(&child_id, Role::User, &arguments.prompt)
+                .map_err(|error| error.to_string())?;
+            // Let the UI refresh the session tree as soon as the child exists,
+            // rather than waiting for the whole turn to complete.
+            let _ = ui_events.send(AgentEvent::SessionsChanged).await;
             emit_child_progress(
                 ui_events,
                 &child_id,
-                child_progress(ChildSessionStatus::WaitingModel, turn, max_turns, None),
+                child_progress(ChildSessionStatus::Queued, 0, max_turns, None),
             )
             .await;
-            if active_budget.is_zero() {
-                status = ChildSessionStatus::TimedOut;
-                break;
-            }
-            let stream_started = Instant::now();
-            let mut streaming_reported = false;
-            let stream_result = timeout(
-                active_budget,
-                stream_once(
-                    &provider,
-                    request,
-                    &mut collector,
-                    512,
-                    self.memory.max_agent_event_bytes,
-                    ui_events,
-                    |_| {
-                        if streaming_reported {
-                            Ok(Forwarded::Ignore)
-                        } else {
-                            streaming_reported = true;
-                            Ok(Forwarded::SendIgnore(AgentEvent::ChildSessionProgress {
-                                session_id: child_id.clone(),
-                                progress: child_progress(
-                                    ChildSessionStatus::Streaming,
-                                    turn,
-                                    max_turns,
-                                    None,
-                                ),
-                            }))
-                        }
-                    },
-                ),
-            )
-            .await;
-            active_budget = active_budget.saturating_sub(stream_started.elapsed());
-            let stream_result = match stream_result {
-                Ok(result) => result,
-                Err(_) => {
-                    status = ChildSessionStatus::TimedOut;
-                    if !collector.assistant_text.is_empty() {
-                        append_text_bounded(
-                            &mut final_answer,
-                            &collector.assistant_text,
-                            child_max_output_bytes,
-                        );
-                    }
-                    break;
+            let _child_slot = self
+                .child_slots
+                .acquire()
+                .await
+                .map_err(|_| "child concurrency limiter closed".to_owned())?;
+
+            let tools = self.child_tool_definitions(capability.can_write(), &allowed_tools);
+            let mut child_system = prompt::child_system_prompt(
+                role.as_deref(),
+                capability.can_write(),
+                &allowed_tools,
+            );
+            if let Some(agent) = &configured_agent {
+                if !agent.system_prompt.trim().is_empty() {
+                    child_system.push_str("\n\nADDITIONAL AGENT INSTRUCTIONS\n");
+                    child_system.push_str(agent.system_prompt.trim());
                 }
-            };
-            match stream_result {
-                Ok(()) => {}
-                Err(StreamFailure::Provider(error)) => {
-                    status = ChildSessionStatus::Failed;
-                    failure = Some(error.to_string());
-                    break;
-                }
-                Err(StreamFailure::Handler(error))
-                | Err(StreamFailure::Join(error))
-                | Err(StreamFailure::Limit(error)) => {
-                    return Err(error);
-                }
-                Err(StreamFailure::EndedWithoutCompletion) => {
-                    status = ChildSessionStatus::Failed;
-                    failure = Some("child stream ended without completion".into());
-                    break;
-                }
-            }
-            collector.finish_partials("child tool")?;
-            if collector.completed_calls.is_empty() {
-                final_answer = collector.assistant_text.clone();
-                break;
             }
 
-            if !collector.assistant_text.is_empty() {
-                items.push(ConversationItem::Message {
-                    role: Role::Assistant,
-                    content: std::mem::take(&mut collector.assistant_text),
-                });
-            }
-            items.push(ConversationItem::AssistantToolCalls {
-                calls: collector.completed_calls.clone(),
-            });
-            self.storage
-                .append_tool_calls(&child_id, &collector.completed_calls)
-                .map_err(|error| error.to_string())?;
-            for tool_call in std::mem::take(&mut collector.completed_calls) {
-                tool_call_count += 1;
-                let context = ChildToolContext {
-                    child_id: &child_id,
-                    child_title: &title,
-                    ui_events,
-                    turn,
-                    max_turns,
+            // Multi-turn loop: execute the child's role-filtered tools, keep its
+            // context bounded, and return only the final deliverable.
+            let thinking_profile_kind =
+                thinking_profile(provider_config.preset, &provider_config.model).kind;
+            let native_web_search = provider_config.preset == ProviderPreset::DeepSeek
+                && provider_config.kind == ProviderKind::Responses
+                && provider_config.native_web_search != NativeWebSearch::Disabled;
+            let child_max_output_bytes = self.cluster.child_max_output_bytes;
+
+            let mut items = vec![ConversationItem::Message {
+                role: Role::User,
+                content: arguments.prompt.clone(),
+            }];
+            let mut tool_call_count = 0usize;
+            let mut remaining_turns = max_turns;
+            let mut completed_turns = 0usize;
+            let mut active_budget =
+                Duration::from_secs(self.cluster.child_active_timeout_seconds.max(1));
+            let mut failure: Option<String> = None;
+            let mut outcome_error: Option<String> = None;
+            let mut status = ChildSessionStatus::Completed;
+            'turns: loop {
+                if max_turns > 0 && remaining_turns == 0 {
+                    status = ChildSessionStatus::TurnLimit;
+                    let trail = summarize_child_trail(&items, 3, 512);
+                    append_text_bounded(
+                        &mut final_answer,
+                        &format!("\n[child agent reached its turn limit]{trail}"),
+                        child_max_output_bytes,
+                    );
+                    break;
+                }
+                if max_turns > 0 {
+                    remaining_turns -= 1;
+                }
+                completed_turns = completed_turns.saturating_add(1);
+                let turn = completed_turns;
+
+                let mut request_items = vec![ConversationItem::Message {
+                    role: Role::System,
+                    content: child_system.clone(),
+                }];
+                request_items.extend(items.clone());
+                let request = ModelRequest {
+                    kind: provider_config.kind,
+                    model: provider_config.model.clone(),
+                    items: request_items,
+                    tools: tools.clone(),
+                    previous_response_id: None,
+                    native_web_search,
+                    thinking_mode: thinking_mode_for(&provider_config),
+                    thinking_level: provider_config.thinking_level,
+                    thinking_budget_tokens: provider_config.thinking_budget_tokens,
+                    thinking_profile_kind,
+                    max_output_tokens: provider_config.max_output_tokens,
                 };
-                let Some(result) = self
-                    .execute_child_tool(&context, &tool_call, &mut active_budget)
-                    .await
-                else {
-                    let result = "child active execution budget exceeded".to_owned();
-                    let _ = self.storage.finish_tool(&tool_call.id, &result);
-                    let _ = self
-                        .storage
-                        .append_tool_output(&child_id, &tool_call.id, &result);
+                let mut collector = StreamCollector::new(Some(
+                    child_max_output_bytes.min(self.memory.max_response_bytes),
+                ))
+                .with_memory_limits(self.memory)
+                .with_partial_output_sink(partial_output.clone());
+                emit_child_progress(
+                    ui_events,
+                    &child_id,
+                    child_progress(ChildSessionStatus::WaitingModel, turn, max_turns, None),
+                )
+                .await;
+                if active_budget.is_zero() {
+                    status = ChildSessionStatus::TimedOut;
+                    break;
+                }
+                let stream_started = Instant::now();
+                let mut streaming_reported = false;
+                let stream_result = timeout(
+                    active_budget,
+                    stream_once(
+                        &provider,
+                        request,
+                        &mut collector,
+                        512,
+                        self.memory.max_agent_event_bytes,
+                        ui_events,
+                        |_| {
+                            if streaming_reported {
+                                Ok(Forwarded::Ignore)
+                            } else {
+                                streaming_reported = true;
+                                Ok(Forwarded::SendIgnore(AgentEvent::ChildSessionProgress {
+                                    session_id: child_id.clone(),
+                                    progress: child_progress(
+                                        ChildSessionStatus::Streaming,
+                                        turn,
+                                        max_turns,
+                                        None,
+                                    ),
+                                }))
+                            }
+                        },
+                    ),
+                )
+                .await;
+                active_budget = active_budget.saturating_sub(stream_started.elapsed());
+                let stream_result = match stream_result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        status = ChildSessionStatus::TimedOut;
+                        if !collector.assistant_text.is_empty() {
+                            append_text_bounded(
+                                &mut final_answer,
+                                &collector.assistant_text,
+                                child_max_output_bytes,
+                            );
+                        }
+                        break;
+                    }
+                };
+                match stream_result {
+                    Ok(()) => {}
+                    Err(StreamFailure::Provider(error)) => {
+                        status = ChildSessionStatus::Failed;
+                        failure = Some(error.to_string());
+                        break;
+                    }
+                    Err(StreamFailure::Handler(error))
+                    | Err(StreamFailure::Join(error))
+                    | Err(StreamFailure::Limit(error)) => {
+                        return Err(error);
+                    }
+                    Err(StreamFailure::EndedWithoutCompletion) => {
+                        status = ChildSessionStatus::Failed;
+                        failure = Some("child stream ended without completion".into());
+                        break;
+                    }
+                }
+                collector.finish_partials("child tool")?;
+                if collector.completed_calls.is_empty() {
+                    final_answer = collector.assistant_text.clone();
+                    break;
+                }
+
+                if !collector.assistant_text.is_empty() {
+                    items.push(ConversationItem::Message {
+                        role: Role::Assistant,
+                        content: std::mem::take(&mut collector.assistant_text),
+                    });
+                }
+                items.push(ConversationItem::AssistantToolCalls {
+                    calls: collector.completed_calls.clone(),
+                });
+                self.storage
+                    .append_tool_calls(&child_id, &collector.completed_calls)
+                    .map_err(|error| error.to_string())?;
+                for tool_call in std::mem::take(&mut collector.completed_calls) {
+                    tool_call_count += 1;
+                    let context = ChildToolContext {
+                        child_id: &child_id,
+                        child_title: &title,
+                        ui_events,
+                        turn,
+                        max_turns,
+                    };
+                    let Some(result) = self
+                        .execute_child_tool(&context, &tool_call, &mut active_budget)
+                        .await
+                    else {
+                        let result = "child active execution budget exceeded".to_owned();
+                        let _ = self.storage.finish_tool(&tool_call.id, &result);
+                        let _ = self
+                            .storage
+                            .append_tool_output(&child_id, &tool_call.id, &result);
+                        items.push(ConversationItem::ToolOutput {
+                            call_id: tool_call.id,
+                            output: result,
+                        });
+                        status = ChildSessionStatus::TimedOut;
+                        break 'turns;
+                    };
+                    let result =
+                        truncate_utf8_bounded(&result, self.cluster.child_max_tool_output_bytes);
+                    self.storage
+                        .append_tool_output(&child_id, &tool_call.id, &result)
+                        .map_err(|error| error.to_string())?;
                     items.push(ConversationItem::ToolOutput {
-                        call_id: tool_call.id,
+                        call_id: tool_call.id.clone(),
                         output: result,
                     });
-                    status = ChildSessionStatus::TimedOut;
-                    break 'turns;
-                };
-                let result =
-                    truncate_utf8_bounded(&result, self.cluster.child_max_tool_output_bytes);
-                self.storage
-                    .append_tool_output(&child_id, &tool_call.id, &result)
-                    .map_err(|error| error.to_string())?;
-                items.push(ConversationItem::ToolOutput {
-                    call_id: tool_call.id.clone(),
-                    output: result,
-                });
-                trim_conversation_bounded(
-                    &mut items,
-                    self.cluster.child_max_context_items,
-                    self.cluster.child_max_context_bytes,
+                    trim_conversation_bounded(
+                        &mut items,
+                        self.cluster.child_max_context_items,
+                        self.cluster.child_max_context_bytes,
+                    );
+                }
+            }
+
+            if let Some(error) = failure {
+                outcome_error = Some(error.clone());
+                append_text_bounded(
+                    &mut final_answer,
+                    &format!("\n[child failed: {error}]"),
+                    child_max_output_bytes,
                 );
             }
+            if status == ChildSessionStatus::TimedOut {
+                outcome_error
+                    .get_or_insert_with(|| "child active execution budget exceeded".to_owned());
+                let trail = summarize_child_trail(&items, 3, 512);
+                append_text_bounded(
+                    &mut final_answer,
+                    &format!("\n[child agent exceeded its active execution budget]{trail}"),
+                    child_max_output_bytes,
+                );
+            }
+            if final_answer.trim().is_empty() {
+                if tool_call_count > 0 {
+                    final_answer.push_str(&format!(
+                        "[child agent issued {tool_call_count} tool call(s) but returned no text]"
+                    ));
+                } else {
+                    final_answer.push_str("[child agent returned no text]");
+                }
+            }
+            let final_answer = truncate_utf8_bounded(&final_answer, child_max_output_bytes);
+            self.storage
+                .append_message(&child_id, Role::Assistant, &final_answer)
+                .map_err(|error| error.to_string())?;
+            self.storage
+                .set_child_status(&child_id, status.wire_name())
+                .map_err(|error| error.to_string())?;
+            emit_child_progress(
+                ui_events,
+                &child_id,
+                child_progress(status, completed_turns, max_turns, None),
+            )
+            .await;
+            Ok(serde_json::to_string(&json!({
+                "session_id": child_id,
+                "title": title,
+                "status": status.wire_name(),
+                "output": final_answer,
+                "error": outcome_error,
+            }))
+            .unwrap_or_else(|_| final_answer.clone()))
         }
-
-        if let Some(error) = failure {
-            append_text_bounded(
-                &mut final_answer,
-                &format!("\n[child failed: {error}]"),
-                child_max_output_bytes,
-            );
-        }
-        if status == ChildSessionStatus::TimedOut {
-            let trail = summarize_child_trail(&items, 3, 512);
-            append_text_bounded(
-                &mut final_answer,
-                &format!("\n[child agent exceeded its active execution budget]{trail}"),
-                child_max_output_bytes,
-            );
-        }
-        if final_answer.trim().is_empty() {
-            if tool_call_count > 0 {
-                final_answer.push_str(&format!(
-                    "[child agent issued {tool_call_count} tool call(s) but returned no text]"
-                ));
-            } else {
-                final_answer.push_str("[child agent returned no text]");
+        .await;
+        match child_result {
+            Ok(outcome) => {
+                cancellation_guard.finish();
+                Ok(outcome)
+            }
+            Err(error) => {
+                if let Ok(partial) = partial_output.lock()
+                    && !partial.trim().is_empty()
+                {
+                    append_text_bounded(
+                        &mut final_answer,
+                        &partial,
+                        self.cluster.child_max_output_bytes,
+                    );
+                }
+                let message = format!("[child failed: {error}]");
+                append_text_bounded(
+                    &mut final_answer,
+                    &message,
+                    self.cluster.child_max_output_bytes,
+                );
+                let _ = self
+                    .storage
+                    .append_message(&child_id, Role::Assistant, &final_answer);
+                let _ = self.storage.set_child_status(&child_id, "failed");
+                emit_child_progress(
+                    ui_events,
+                    &child_id,
+                    child_progress(ChildSessionStatus::Failed, 0, max_turns, None),
+                )
+                .await;
+                cancellation_guard.finish();
+                Ok(child_outcome(
+                    Some(child_id),
+                    title,
+                    ChildSessionStatus::Failed,
+                    final_answer,
+                    Some(error),
+                ))
             }
         }
-        let final_answer = truncate_utf8_bounded(&final_answer, child_max_output_bytes);
-        self.storage
-            .append_message(&child_id, Role::Assistant, &final_answer)
-            .map_err(|error| error.to_string())?;
-        emit_child_progress(
-            ui_events,
-            &child_id,
-            child_progress(status, completed_turns, max_turns, None),
-        )
-        .await;
-        cancellation_guard.finish();
-        Ok(serde_json::to_string(&json!({
-            "session_id": child_id,
-            "title": title,
-            "status": status.wire_name(),
-            "output": final_answer,
-        }))
-        .unwrap_or_else(|_| final_answer.clone()))
     }
+}
+
+fn child_outcome(
+    session_id: Option<String>,
+    title: String,
+    status: ChildSessionStatus,
+    output: String,
+    error: Option<String>,
+) -> String {
+    serde_json::to_string(&json!({
+        "session_id": session_id,
+        "title": title,
+        "status": status.wire_name(),
+        "output": output,
+        "error": error,
+    }))
+    .unwrap_or_else(|_| "{\"session_id\":null,\"title\":\"子 Agent\",\"status\":\"failed\",\"output\":\"\",\"error\":\"failed to serialize child outcome\"}".into())
 }
 
 #[derive(Deserialize)]
@@ -866,6 +977,7 @@ pub(super) struct ChildArgs {
     pub(super) prompt: String,
     pub(super) max_turns: Option<usize>,
     pub(super) role: Option<String>,
+    pub(super) capability: Option<String>,
     pub(super) model: Option<String>,
     pub(super) provider: Option<String>,
     pub(super) agent: Option<String>,

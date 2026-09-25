@@ -115,6 +115,7 @@ pub struct SessionRuntime {
     pub pending_approval: Option<PendingApproval>,
     pub mode: AgentMode,
     pub child_role: Option<String>,
+    pub child_allowed_tools: Vec<String>,
     pub conversation: Vec<ConversationItem>,
     pub runner: Option<AgentRunner>,
     pub agent_tx: mpsc::Sender<AgentEvent>,
@@ -357,6 +358,7 @@ impl SessionRuntime {
                 self.model_phase = ModelPhase::Idle;
                 self.status = "需要确认工具权限".into();
                 self.pending_approval = Some(PendingApproval {
+                    approval_id: None,
                     call,
                     reason,
                     source_session_id,
@@ -1076,6 +1078,7 @@ mod tests {
             pending_approval: None,
             mode: AgentMode::default(),
             child_role: None,
+            child_allowed_tools: Vec::new(),
             conversation: Vec::new(),
             runner: None,
             agent_tx,

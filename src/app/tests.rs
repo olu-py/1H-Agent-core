@@ -394,6 +394,7 @@ async fn delete_running_session_aborts_task_and_rejects_approval() {
     }));
     let (approval_reply, approval_result) = oneshot::channel();
     app.current.pending_approval = Some(PendingApproval {
+        approval_id: None,
         call: ToolCall {
             id: "delete-running".into(),
             name: "file_write".into(),
@@ -455,6 +456,7 @@ async fn background_capacity_rejects_switch_when_all_runtimes_are_busy() {
     activate_session(&mut app, evicted.clone()).unwrap();
     let (approval_reply, approval_result) = oneshot::channel();
     app.background.get_mut(&waiting).unwrap().pending_approval = Some(PendingApproval {
+        approval_id: None,
         call: ToolCall {
             id: "capacity-approval".into(),
             name: "file_write".into(),
@@ -489,6 +491,7 @@ async fn background_capacity_never_interrupts_busy_or_approval_runtime() {
     activate_session(&mut app, second.clone()).unwrap();
     let (approval_reply, approval_result) = oneshot::channel();
     app.background.get_mut(&oldest).unwrap().pending_approval = Some(PendingApproval {
+        approval_id: None,
         call: ToolCall {
             id: "forced-capacity-approval".into(),
             name: "file_write".into(),
@@ -575,6 +578,7 @@ fn test_app(temp: &TempDir) -> App {
         pending_approval: None,
         mode: AgentMode::default(),
         child_role: None,
+        child_allowed_tools: Vec::new(),
         conversation: Vec::new(),
         runner: None,
         agent_tx,
@@ -601,6 +605,61 @@ fn test_app(temp: &TempDir) -> App {
         router_rx,
         should_quit: false,
     }
+}
+
+#[tokio::test]
+async fn approval_take_requires_matching_owner_and_id() {
+    let temp = TempDir::new().unwrap();
+    let mut app = test_app(&temp);
+    let first = app.active_session.clone();
+    let second = app.storage.create_session(&app.workspace).unwrap();
+    activate_session(&mut app, second.clone()).unwrap();
+
+    let (first_reply, _first_receiver) = oneshot::channel();
+    app.background.get_mut(&first).unwrap().pending_approval = Some(PendingApproval {
+        approval_id: Some("approval-first".into()),
+        call: ToolCall {
+            id: "first".into(),
+            name: "file_write".into(),
+            arguments: serde_json::json!({"path":"first.txt"}),
+        },
+        reason: "first".into(),
+        source_session_id: None,
+        source_title: None,
+        action: ApprovalAction::Agent(first_reply),
+        created_at: Instant::now(),
+    });
+    let (second_reply, _second_receiver) = oneshot::channel();
+    app.current.pending_approval = Some(PendingApproval {
+        approval_id: Some("approval-second".into()),
+        call: ToolCall {
+            id: "second".into(),
+            name: "file_write".into(),
+            arguments: serde_json::json!({"path":"second.txt"}),
+        },
+        reason: "second".into(),
+        source_session_id: None,
+        source_title: None,
+        action: ApprovalAction::Agent(second_reply),
+        created_at: Instant::now(),
+    });
+
+    assert!(
+        app.take_pending_approval(&first, "approval-second")
+            .is_none()
+    );
+    assert!(app.background[&first].pending_approval.is_some());
+    assert!(
+        app.take_pending_approval(&first, "approval-first")
+            .is_some()
+    );
+    assert_eq!(
+        app.current
+            .pending_approval
+            .as_ref()
+            .and_then(|approval| approval.approval_id.as_deref()),
+        Some("approval-second")
+    );
 }
 
 #[test]

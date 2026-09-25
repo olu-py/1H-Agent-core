@@ -86,7 +86,23 @@ pub(super) fn build_runtime(
         .ok()
         .and_then(|(provider_id, model)| session_provider_config(config, &provider_id, &model))
         .unwrap_or_else(|| config.provider.clone());
-    let child_role = storage.session_child_role(session_id).ok().flatten();
+    let mut child_role = storage.session_child_role(session_id).ok().flatten();
+    let child_allowed_tools = storage
+        .session_child_allowed_tools(session_id)
+        .ok()
+        .flatten();
+    let is_child = storage
+        .session_parent_id(session_id)
+        .ok()
+        .flatten()
+        .is_some();
+    if is_child && child_allowed_tools.is_none() {
+        // Older child sessions did not persist template restrictions or an
+        // explicit capability. Restore them read-only because the original
+        // effective tool set cannot be reconstructed safely.
+        child_role = Some("read_only".into());
+    }
+    let child_allowed_tools = child_allowed_tools.unwrap_or_default();
     let child_provider_resolver = provider_config_resolver(config);
     let runtime_key = active_secret
         .filter(|(preset, _)| *preset == provider_config.preset)
@@ -121,6 +137,7 @@ pub(super) fn build_runtime(
             .with_compaction_config(config.compaction.clone())
             .with_memory_config(config.memory)
             .with_child_role(child_role.clone())
+            .with_child_allowed_tools(child_allowed_tools.clone())
             .with_child_provider_resolver(child_provider_resolver)
         })
     });
@@ -165,6 +182,7 @@ pub(super) fn build_runtime(
         pending_approval: None,
         mode,
         child_role,
+        child_allowed_tools,
         conversation,
         runner,
         agent_tx,

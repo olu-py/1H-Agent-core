@@ -53,7 +53,7 @@ impl Storage {
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
         connection.execute(
-            "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, parent_id, head_turn_id, child_role) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, parent_id, head_turn_id, child_role, child_status) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running')",
             params![id, workspace.display().to_string(), title, now, mode, provider, model, parent_id, turn_id, child_role],
         )?;
         connection.execute(
@@ -82,6 +82,17 @@ impl Storage {
         self.lock()?
             .query_row(
                 "SELECT child_role FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    pub fn session_parent_id(&self, session_id: &str) -> Result<Option<String>, StorageError> {
+        self.lock()?
+            .query_row(
+                "SELECT parent_id FROM sessions WHERE id = ?1",
                 [session_id],
                 |row| row.get(0),
             )
@@ -126,17 +137,84 @@ impl Storage {
     pub fn list_sessions(&self, workspace: &Path) -> Result<Vec<SessionSummary>, StorageError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT id, title, parent_id FROM sessions WHERE workspace = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC",
+            "SELECT id, title, parent_id, child_status FROM sessions WHERE workspace = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC",
         )?;
         let rows = statement.query_map([workspace.display().to_string()], |row| {
             Ok(SessionSummary {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 parent_id: row.get(2)?,
+                child_status: row.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
+    }
+
+    pub fn set_child_status(&self, session_id: &str, status: &str) -> Result<(), StorageError> {
+        self.lock()?.execute(
+            "UPDATE sessions SET child_status = ?2, updated_at = ?3 WHERE id = ?1 AND parent_id IS NOT NULL",
+            params![session_id, status, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_child_allowed_tools(
+        &self,
+        session_id: &str,
+        tools: &[String],
+    ) -> Result<(), StorageError> {
+        let encoded = serde_json::to_string(tools).map_err(StorageError::from)?;
+        self.lock()?.execute(
+            "UPDATE sessions SET child_allowed_tools = ?2 WHERE id = ?1 AND parent_id IS NOT NULL",
+            params![session_id, encoded],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_child_allowed_tools(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Vec<String>>, StorageError> {
+        let encoded = self
+            .lock()?
+            .query_row(
+                "SELECT child_allowed_tools FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        encoded
+            .map(|value| serde_json::from_str(&value).map_err(StorageError::from))
+            .transpose()
+    }
+
+    /// Marks children left in the active state by a previous process as failed
+    /// and leaves a message explaining the interruption in their transcript.
+    pub fn mark_running_children_interrupted(&self) -> Result<(), StorageError> {
+        let ids = {
+            let connection = self.lock()?;
+            let mut statement = connection.prepare(
+                "SELECT id FROM sessions WHERE parent_id IS NOT NULL AND child_status = 'running'",
+            )?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            connection.execute(
+                "UPDATE sessions SET child_status = 'failed', updated_at = ?1 WHERE parent_id IS NOT NULL AND child_status = 'running'",
+                [Utc::now().to_rfc3339()],
+            )?;
+            ids
+        };
+        for id in ids {
+            self.append_message(
+                &id,
+                Role::Assistant,
+                "[child interrupted by process restart]",
+            )?;
+        }
+        Ok(())
     }
 
     pub fn append_message(

@@ -149,6 +149,9 @@ impl Engine {
             let Some(approval) = &runtime.pending_approval else {
                 continue;
             };
+            if approval.approval_id.as_deref() != Some(approval_id) {
+                continue;
+            }
             if best
                 .as_ref()
                 .is_none_or(|(_, _, current)| approval.created_at < current.created_at)
@@ -166,7 +169,7 @@ impl Engine {
     fn handle_routed(&mut self, routed: crate::app::RoutedEvent) {
         let crate::app::RoutedEvent { session_id, event } = routed;
 
-        if let AgentEvent::Approval {
+        let approval_id = if let AgentEvent::Approval {
             call,
             reason,
             source_session_id,
@@ -185,16 +188,20 @@ impl Engine {
             self.bridge.push(
                 session_id.clone(),
                 Event::Approval {
-                    approval_id,
+                    approval_id: approval_id.clone(),
                     call: call.clone(),
                     reason: reason.clone(),
                     source_session_id: source_session_id.clone(),
                     source_title: source_title.clone(),
                 },
             );
+            Some(approval_id)
         } else if let Some(event) = routed_to_event(&event) {
             self.bridge.push(session_id.clone(), event);
-        }
+            None
+        } else {
+            None
+        };
 
         // The session's context budget changes whenever usage or a terminal
         // turn outcome updates the estimated used tokens; keep the TUI meter
@@ -214,6 +221,15 @@ impl Engine {
                 event,
             },
         );
+        if let Some(approval_id) = approval_id {
+            if let Some(approval) = self
+                .app
+                .runtime_mut(&session_id)
+                .and_then(|runtime| runtime.pending_approval.as_mut())
+            {
+                approval.approval_id = Some(approval_id);
+            }
+        }
         if context_dirty {
             push_context_updated(self, &session_id);
         }
@@ -234,6 +250,25 @@ impl Engine {
         }
     }
 
+    fn clear_session_approvals(&mut self, session_id: &str) {
+        let ids = self
+            .pending
+            .iter()
+            .filter(|(_, record)| record.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for approval_id in ids {
+            self.pending.remove(&approval_id);
+            self.bridge.push(
+                session_id.to_owned(),
+                Event::ApprovalResolved {
+                    approval_id,
+                    approved: false,
+                },
+            );
+        }
+    }
+
     /// Resolves an approval: extracts the oneshot sender from the owning
     /// session's runtime and sends the decision. Shell (`!`) approvals reuse
     /// the same flow; an accepted shell command is executed through the
@@ -246,17 +281,22 @@ impl Engine {
     ) -> Result<(), ApiError> {
         let record = self
             .pending
-            .remove(approval_id)
+            .get(approval_id)
             .ok_or_else(|| ApiError::not_found(format!("unknown approval {approval_id}")))?;
-        let owner = record.session_id;
-        let Some((actual_owner, approval)) = self.app.take_pending_approval_global() else {
+        let owner = record.session_id.clone();
+        let matches = self
+            .app
+            .runtime(&owner)
+            .and_then(|runtime| runtime.pending_approval.as_ref())
+            .is_some_and(|approval| approval.approval_id.as_deref() == Some(approval_id));
+        if !matches {
             return Err(ApiError::conflict("approval already resolved"));
-        };
-        if actual_owner != owner {
-            return Err(ApiError::conflict(
-                "approval does not belong to that session",
-            ));
         }
+        let approval = self
+            .app
+            .take_pending_approval(&owner, approval_id)
+            .ok_or_else(|| ApiError::conflict("approval already resolved"))?;
+        self.pending.remove(approval_id);
 
         if accept && allow_session {
             let (tool, prefix, label) = match &approval.action {
@@ -571,6 +611,28 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
                     .map(|r| r.agent_phase.label().to_owned())
                     .unwrap_or_else(|| AgentPhase::Idle.label().to_owned()),
                 status: runtime.map(|r| r.status.clone()).unwrap_or_default(),
+                child_status: app
+                    .child_status
+                    .get(&session.id)
+                    .map(|progress| progress.status.wire_name().to_owned())
+                    .or_else(|| session.child_status.clone()),
+                child_phase: app
+                    .child_status
+                    .get(&session.id)
+                    .and_then(|progress| progress.status.phase_name())
+                    .map(str::to_owned),
+                child_turn: app
+                    .child_status
+                    .get(&session.id)
+                    .map(|progress| progress.turn),
+                child_max_turns: app
+                    .child_status
+                    .get(&session.id)
+                    .map(|progress| progress.max_turns),
+                child_tool: app
+                    .child_status
+                    .get(&session.id)
+                    .and_then(|progress| progress.tool.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -861,6 +923,7 @@ pub(crate) fn routed_to_event(event: &AgentEvent) -> Option<Event> {
         } => Event::ChildSessionProgress {
             child_session_id: child_id.clone(),
             status: progress.status.wire_name().to_owned(),
+            phase: progress.status.phase_name().map(str::to_owned),
             turn: progress.turn,
             max_turns: progress.max_turns,
             tool: progress.tool.clone(),
@@ -969,8 +1032,15 @@ fn register_shell_approval(engine: &mut Engine, _command: &str) {
     let Some(approval) = &engine.app.current.pending_approval else {
         return;
     };
+    let call = approval.call.clone();
+    let reason = approval.reason.clone();
+    let source_session_id = approval.source_session_id.clone();
+    let source_title = approval.source_title.clone();
     let session_id = engine.app.active_session.clone();
     let approval_id = uuid::Uuid::new_v4().to_string();
+    if let Some(approval) = engine.app.current.pending_approval.as_mut() {
+        approval.approval_id = Some(approval_id.clone());
+    }
     engine.pending.insert(
         approval_id.clone(),
         PendingRecord {
@@ -982,10 +1052,10 @@ fn register_shell_approval(engine: &mut Engine, _command: &str) {
         session_id.clone(),
         Event::Approval {
             approval_id,
-            call: approval.call.clone(),
-            reason: approval.reason.clone(),
-            source_session_id: approval.source_session_id.clone(),
-            source_title: approval.source_title.clone(),
+            call,
+            reason,
+            source_session_id,
+            source_title,
         },
     );
 }
@@ -1012,12 +1082,14 @@ fn execute_command(
 struct CommandOutcome {
     todo_changed: bool,
     transcript_invalidated: bool,
+    deleted_session: bool,
 }
 
 impl CommandOutcome {
     fn from_command(command: &Command) -> Self {
         Self {
             todo_changed: matches!(command, Command::Todo(_)),
+            deleted_session: matches!(command, Command::Delete),
             // History-modifying commands invalidate the cached transcript.
             transcript_invalidated: matches!(
                 command,
@@ -1040,6 +1112,9 @@ impl CommandOutcome {
 /// history-modifying commands, and a `SessionsChanged` so the consumer
 /// refreshes its sidebar and clears transient "发送中…" state.
 fn sync_state_after_command(engine: &mut Engine, session_id: &str, outcome: CommandOutcome) {
+    if outcome.deleted_session {
+        engine.clear_session_approvals(session_id);
+    }
     if outcome.todo_changed {
         let tasks = engine
             .app
@@ -1118,6 +1193,7 @@ fn cancel_session(
         }
     }
     app::cancel_active_request(&mut engine.app);
+    engine.clear_session_approvals(session_id);
     // `cancel_active_request` mutates the runtime in place without an
     // `AgentEvent` round trip, so broadcast the terminal event ourselves.
     engine.bridge.push(
@@ -1637,4 +1713,103 @@ fn save_memory(
         )
         .map(|record| memory_dto(&record))
         .map_err(storage_api_error)
+}
+
+#[cfg(test)]
+mod approval_routing_tests {
+    use super::*;
+    use crate::{
+        app::{ApprovalAction, PendingApproval},
+        provider::ToolCall,
+    };
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn resolves_two_session_approvals_by_id_in_reverse_order() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().to_path_buf();
+        let mut config = crate::config::Config::default();
+        config.data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let storage = crate::storage::Storage::open(&temp.path().join("data/agent.db")).unwrap();
+        let first = storage.create_session(&workspace).unwrap();
+        let app = crate::app::build_app(workspace.clone(), config, storage.clone(), first.clone())
+            .await
+            .unwrap();
+        let mut app = app;
+        let second = storage.create_session(&workspace).unwrap();
+        crate::app::activate_session(&mut app, second.clone()).unwrap();
+
+        let (first_tx, first_rx) = oneshot::channel();
+        app.background.get_mut(&first).unwrap().pending_approval = Some(PendingApproval {
+            approval_id: Some("approval-first".into()),
+            call: ToolCall {
+                id: "first-call".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"first.txt"}),
+            },
+            reason: "first".into(),
+            source_session_id: None,
+            source_title: None,
+            action: ApprovalAction::Agent(first_tx),
+            created_at: Instant::now(),
+        });
+        let (second_tx, second_rx) = oneshot::channel();
+        app.current.pending_approval = Some(PendingApproval {
+            approval_id: Some("approval-second".into()),
+            call: ToolCall {
+                id: "second-call".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"second.txt"}),
+            },
+            reason: "second".into(),
+            source_session_id: None,
+            source_title: None,
+            action: ApprovalAction::Agent(second_tx),
+            created_at: Instant::now(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let mut pending = HashMap::new();
+        pending.insert(
+            "approval-first".into(),
+            PendingRecord {
+                session_id: first.clone(),
+                deadline,
+            },
+        );
+        pending.insert(
+            "approval-second".into(),
+            PendingRecord {
+                session_id: second.clone(),
+                deadline,
+            },
+        );
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let mut engine = Engine {
+            app,
+            bridge: Arc::new(crate::bridge::EventBridge::new(64, 1024 * 1024)),
+            pending,
+            approval_timeout: Duration::from_secs(300),
+            command_tx,
+        };
+
+        engine
+            .resolve_approval("approval-second", false, false)
+            .unwrap();
+        assert!(!second_rx.await.unwrap());
+        assert!(
+            engine
+                .resolve_approval("approval-second", true, false)
+                .is_err()
+        );
+        assert!(engine.app.background[&first].pending_approval.is_some());
+        engine
+            .resolve_approval("approval-first", true, false)
+            .unwrap();
+        assert!(first_rx.await.unwrap());
+        assert!(engine.pending.is_empty());
+        assert!(engine.app.background[&first].pending_approval.is_none());
+        assert!(engine.app.current.pending_approval.is_none());
+        engine.shutdown();
+    }
 }

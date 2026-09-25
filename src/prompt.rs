@@ -42,6 +42,18 @@ pub fn system_prompt(preset: ProviderPreset, mode: AgentMode) -> String {
         "Set `max_turns` explicitly to match the task: 1 for pure-text deliverables, 3-8 for read+write+self-check tasks.",
         "Set `max_turns` only when a hard turn limit is required; omit it for iterative production work.",
     );
+    let cluster_rules = cluster_rules.replace(
+        "`role` decides tool access.",
+        "`role` is display text; set `capability` to `read_only` or `implementation`.",
+    );
+    let cluster_rules = cluster_rules.replace(
+        "Only implement roles (role containing \"implement\"/\"code\"/\"build\"/\"实施\"/\"编码\")",
+        "Only children with implementation capability",
+    );
+    let cluster_rules = cluster_rules.replace(
+        "{\"session_id\":\"...\",\"title\":\"...\",\"status\":\"completed|failed|turn_limit|...\",\"output\":\"...\"}",
+        "{\"session_id\":\"...|null\",\"title\":\"...\",\"status\":\"completed|failed|turn_limit|timed_out|cancelled\",\"output\":\"...\",\"error\":\"...|null\"}",
+    );
 
     format!(
         "You are 1H-Agent, a local Rust/Tokio terminal coding agent.\n\n\
@@ -80,7 +92,11 @@ FINAL RULE\n\
 /// Stable system prompt injected into every child-agent request. The parent
 /// system prompt describes the contract to the orchestrator; this one makes the
 /// same contract binding for the child itself.
-pub fn child_system_prompt(role: Option<&str>, allowed_tools: &[String]) -> String {
+pub fn child_system_prompt(
+    role: Option<&str>,
+    can_write: bool,
+    allowed_tools: &[String],
+) -> String {
     let role_text = role
         .map(str::trim)
         .filter(|role| !role.is_empty())
@@ -93,11 +109,17 @@ pub fn child_system_prompt(role: Option<&str>, allowed_tools: &[String]) -> Stri
             allowed_tools.join(", ")
         )
     };
+    let capability_text = if can_write {
+        "Implementation capability is enabled; the supplied tool list is still authoritative."
+    } else {
+        "This child is read-only and cannot write files."
+    };
     format!(
         "You are a child agent in 1H-Agent cluster mode.\n\
 ROLE\n\
 - Execute only the assigned subtask: {role_text}.\n\
 - {tool_text}\n\
+- {capability_text}\n\
 - You have NO terminal, shell, git-mutation, browser, MCP, or agent_spawn tools. Do not ask for them.\n\
 - Read-only roles may not write files. Implement roles may use file_write/file_edit/file_mkdir/file_copy/file_move only; every write still requires user approval and may be rejected.\n\
 DELIVERABLE CONTRACT\n\
@@ -190,18 +212,22 @@ mod tests {
         let build = system_prompt(ProviderPreset::OpenAi, AgentMode::Build);
         assert!(cluster.contains("CLUSTER MODE (ACTIVE)"));
         assert!(cluster.contains("MODE: CLUSTER"));
+        assert!(cluster.contains("`role` is display text"));
+        assert!(cluster.contains("`capability` to `read_only` or `implementation`"));
+        assert!(cluster.contains("\"session_id\":\"...|null\""));
+        assert!(!cluster.contains("role containing"));
         assert!(!build.contains("CLUSTER MODE (ACTIVE)"));
     }
 
     #[test]
     fn child_system_prompt_carries_role_tool_contract() {
-        let prompt = child_system_prompt(Some("implement"), &[]);
+        let prompt = child_system_prompt(Some("implement"), true, &[]);
         assert!(prompt.contains("child agent"));
         assert!(prompt.contains("implement"));
         assert!(prompt.contains("FINAL answer"));
         assert!(prompt.contains("NO terminal"));
 
-        let restricted = child_system_prompt(None, &["file_read".into()]);
+        let restricted = child_system_prompt(None, false, &["file_read".into()]);
         assert!(restricted.contains("file_read"));
     }
 }

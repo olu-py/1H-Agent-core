@@ -20,6 +20,7 @@
       "type": "child_session_progress",
       "child_session_id": "child-1",
       "status": "running",
+      "phase": "running_tool",
       "turn": 2,
       "max_turns": 10,
       "tool": "file_read"

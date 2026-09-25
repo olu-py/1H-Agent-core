@@ -404,6 +404,11 @@ pub(crate) fn handle_routed_event(app: &mut App, routed: RoutedEvent) -> bool {
             .or_default()
             .insert(child_id.clone());
         app.child_status.insert(child_id.clone(), progress.clone());
+        if progress.status.is_terminal() {
+            let _ = app
+                .storage
+                .set_child_status(child_id, progress.status.wire_name());
+        }
         let _ = refresh_sessions(app);
         update_cluster_batch_status(app, &session_id);
         return true;
@@ -466,6 +471,7 @@ pub(crate) fn request_shell_approval(app: &mut App, command: String) -> Result<(
         arguments: serde_json::json!({ "command": command }),
     };
     app.current.pending_approval = Some(PendingApproval {
+        approval_id: None,
         call,
         reason: "! 命令将通过 workspace Shell 执行".into(),
         source_session_id: None,
@@ -528,31 +534,20 @@ impl App {
             .map(|(_, approval)| approval)
     }
 
-    pub(crate) fn take_pending_approval_global(&mut self) -> Option<(String, PendingApproval)> {
-        let mut owner = self
-            .current
+    pub(crate) fn take_pending_approval(
+        &mut self,
+        owner: &str,
+        approval_id: &str,
+    ) -> Option<PendingApproval> {
+        let runtime = self.runtime_mut(owner)?;
+        if !runtime
             .pending_approval
             .as_ref()
-            .map(|approval| (approval.created_at, self.active_session.clone()));
-        for (session_id, runtime) in &self.background {
-            if let Some(approval) = &runtime.pending_approval {
-                if owner
-                    .as_ref()
-                    .is_none_or(|(created_at, _)| approval.created_at < *created_at)
-                {
-                    owner = Some((approval.created_at, session_id.clone()));
-                }
-            }
+            .is_some_and(|approval| approval.approval_id.as_deref() == Some(approval_id))
+        {
+            return None;
         }
-        let (_, owner) = owner?;
-        let approval = if owner == self.active_session {
-            self.current.take_pending_approval()
-        } else {
-            self.background
-                .get_mut(&owner)
-                .and_then(SessionRuntime::take_pending_approval)
-        }?;
-        Some((owner, approval))
+        runtime.take_pending_approval()
     }
 
     pub(crate) fn runtime_mut(&mut self, session_id: &str) -> Option<&mut SessionRuntime> {

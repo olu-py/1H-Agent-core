@@ -32,6 +32,40 @@ fn child_session_nests_under_parent_and_keeps_provider_model() {
         storage.session_child_role(&child).unwrap().as_deref(),
         Some("planner")
     );
+    assert_eq!(child_summary.child_status.as_deref(), Some("running"));
+}
+
+#[test]
+fn running_child_sessions_restore_as_failed_after_restart() {
+    let storage = Storage::in_memory().unwrap();
+    let root = tempdir().unwrap();
+    let parent = storage.create_session(root.path()).unwrap();
+    let child = storage
+        .create_child_session(
+            root.path(),
+            &parent,
+            "openai",
+            "gpt-5-mini",
+            "child",
+            "explore",
+            "read_only",
+        )
+        .unwrap();
+
+    storage.mark_running_children_interrupted().unwrap();
+
+    let summary = storage
+        .list_sessions(root.path())
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == child)
+        .unwrap();
+    assert_eq!(summary.child_status.as_deref(), Some("failed"));
+    assert!(storage
+        .load_messages(&child)
+        .unwrap()
+        .iter()
+        .any(|item| matches!(item, ConversationItem::Message { content, .. } if content == "[child interrupted by process restart]")));
 }
 
 #[test]

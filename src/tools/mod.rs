@@ -333,7 +333,7 @@ impl ToolRegistry {
             definition(
                 "agent_spawn",
                 "Run one bounded child agent for a focused subtask",
-                json!({"type":"object","properties":{"prompt":{"type":"string"},"max_turns":{"type":"integer","minimum":0},"role":{"type":"string"},"model":{"type":"string"},"provider":{"type":"string"},"agent":{"type":"string"},"title":{"type":"string"}},"required":["prompt"],"additionalProperties":false}),
+                json!({"type":"object","properties":{"prompt":{"type":"string"},"max_turns":{"type":"integer","minimum":0},"role":{"type":"string"},"capability":{"type":"string","enum":["read_only","implementation"]},"model":{"type":"string"},"provider":{"type":"string"},"agent":{"type":"string"},"title":{"type":"string"}},"required":["prompt"],"additionalProperties":false}),
             ),
             definition(
                 "git",

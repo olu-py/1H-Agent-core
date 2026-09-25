@@ -20,6 +20,9 @@ pub enum ChildSessionStatus {
     TurnLimit,
     TimedOut,
     Cancelled,
+    /// Generic active state used by consumers when replaying older protocol
+    /// events that only carry `status: running` and no phase.
+    Running,
 }
 impl ChildSessionStatus {
     pub fn is_terminal(self) -> bool {
@@ -37,6 +40,7 @@ impl ChildSessionStatus {
             Self::RunningTool => "执行工具",
             Self::WaitingApprovalSlot => "等待审批槽",
             Self::WaitingApproval => "等待审批",
+            Self::Running => "运行中",
             Self::Completed => "完成",
             Self::Failed => "失败",
             Self::TurnLimit => "达到轮次上限",
@@ -58,6 +62,22 @@ impl ChildSessionStatus {
             | Self::RunningTool
             | Self::WaitingApprovalSlot
             | Self::WaitingApproval => "running",
+            Self::Running => "running",
+        }
+    }
+
+    pub fn phase_name(self) -> Option<&'static str> {
+        match self {
+            Self::Queued => Some("queued"),
+            Self::WaitingModel => Some("waiting_model"),
+            Self::Streaming => Some("streaming"),
+            Self::RunningTool => Some("running_tool"),
+            Self::WaitingApprovalSlot => Some("waiting_approval_slot"),
+            Self::WaitingApproval => Some("waiting_approval"),
+            Self::Running => Some("running"),
+            Self::Completed | Self::Failed | Self::TurnLimit | Self::TimedOut | Self::Cancelled => {
+                None
+            }
         }
     }
 }
