@@ -916,14 +916,14 @@ impl AgentRunner {
                 Ok(outcome)
             }
             Err(error) => {
-                if let Ok(partial) = partial_output.lock()
-                    && !partial.trim().is_empty()
-                {
-                    append_text_bounded(
-                        &mut final_answer,
-                        &partial,
-                        self.cluster.child_max_output_bytes,
-                    );
+                if let Ok(partial) = partial_output.lock() {
+                    if !partial.trim().is_empty() {
+                        append_text_bounded(
+                            &mut final_answer,
+                            &partial,
+                            self.cluster.child_max_output_bytes,
+                        );
+                    }
                 }
                 let message = format!("[child failed: {error}]");
                 append_text_bounded(

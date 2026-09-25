@@ -274,10 +274,10 @@ impl StreamCollector {
                 if let Some(max_bytes) = self.max_text_bytes {
                     if self.assistant_text.len().saturating_add(delta.len()) > max_bytes {
                         append_text_bounded(&mut self.assistant_text, &delta, max_bytes);
-                        if let Some(sink) = &self.partial_output_sink
-                            && let Ok(mut output) = sink.lock()
-                        {
-                            *output = self.assistant_text.clone();
+                        if let Some(sink) = &self.partial_output_sink {
+                            if let Ok(mut output) = sink.lock() {
+                                *output = self.assistant_text.clone();
+                            }
                         }
                         return Err(format!(
                             "model response exceeded the {} byte limit",
@@ -288,10 +288,10 @@ impl StreamCollector {
                 } else {
                     self.assistant_text.push_str(&delta);
                 }
-                if let Some(sink) = &self.partial_output_sink
-                    && let Ok(mut output) = sink.lock()
-                {
-                    *output = self.assistant_text.clone();
+                if let Some(sink) = &self.partial_output_sink {
+                    if let Ok(mut output) = sink.lock() {
+                        *output = self.assistant_text.clone();
+                    }
                 }
                 Ok(Some(ModelEvent::TextDelta(delta)))
             }
