@@ -35,7 +35,7 @@ excluded: TUI/WebUI/Desktop 源码、HTTP/SSE 服务器、内置浏览器、远�
 | 工具、路径、SSRF、外部进程 | `src/tools/`、`src/security.rs` | [Tools](docs/guides/tools.md) |
 | 会话、分支、迁移、持久化 | `src/storage.rs`、`src/session.rs` | [Storage](docs/guides/storage.md) |
 | 配置上限、容量归一化、新增配置键 | `src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | Provider 专题（容量预算）；同步 `defaults_are_bounded` 类测试 |
-| 版本、bindings/conformance 交付、消费端更新 | `Cargo.toml`、`Cargo.lock`、`bindings/`、`conformance/` | [Release](docs/guides/release.md) |
+| 版本、GitHub PR、提交推送与本地同步 | `Cargo.toml`、`Cargo.lock`、`bindings/`、`conformance/` | [Release](docs/guides/release.md)、[Git 交付流程](docs/git-pr-local-sync.md)；可用项目 Skill [`git-pr-local-sync`](.agents/skills/git-pr-local-sync/SKILL.md) |
 
 指南与源码不一致时以源码为准，并在同一改动中更新该指南；一个事实只归属根文档或一个专题。
 

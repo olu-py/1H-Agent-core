@@ -2,7 +2,7 @@
 
 ## 适用范围
 
-core 版本、Git `main` 交付、bindings/conformance 产物，以及 TUI/WebUI 消费端更新顺序。
+core 版本、Git `main` 交付、bindings/conformance 产物，以及 TUI/WebUI 消费端更新顺序。完整 commit/push/PR/merge/本地同步闭环见 [GitHub 交付与本地同步流程](../git-pr-local-sync.md)。
 
 ## 入口
 

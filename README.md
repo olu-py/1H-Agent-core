@@ -170,6 +170,7 @@ cargo --config \
 | [Tools](docs/guides/tools.md) | 内置工具、权限分类、路径安全与 SSRF |
 | [Storage](docs/guides/storage.md) | schema/迁移、会话树、undo/redo 与快照 |
 | [Release](docs/guides/release.md) | 版本、Git 交付与消费端更新顺序 |
+| [GitHub 交付与本地同步](docs/git-pr-local-sync.md) | commit、push、PR 检查/合并、合并后本地对齐与异常处理 |
 
 ## License
 
