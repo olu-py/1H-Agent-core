@@ -163,6 +163,8 @@ pub(super) fn initialize(connection: Connection) -> Result<Connection, StorageEr
     ensure_column(&connection, "sessions", "deleted_at", "TEXT")?;
     ensure_column(&connection, "sessions", "head_turn_id", "TEXT")?;
     ensure_column(&connection, "sessions", "child_role", "TEXT")?;
+    ensure_column(&connection, "sessions", "child_status", "TEXT")?;
+    ensure_column(&connection, "sessions", "child_allowed_tools", "TEXT")?;
     ensure_column(&connection, "messages", "turn_id", "TEXT")?;
     ensure_column(
         &connection,

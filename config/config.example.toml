@@ -102,14 +102,11 @@ ttl_hours = 24 # 1..=168; gates refresh attempts only, cached values stay usable
 timeout_ms = 5000 # 1000..=15000, per request
 
 # Cluster mode (AI 集群) child-agent concurrency and execution budgets.
-# Per-turn/session fan-out counts remain reserved; active children are bounded
-# by max_parallel_children.
+# Child concurrency is bounded by max_parallel_children.
 [cluster]
 max_parallel_children = 4
 # Active model/tool time per child. Queueing and approval waits are excluded.
 child_active_timeout_seconds = 300
-# max_children_per_turn = 8
-# max_children_per_session = 24
 child_max_output_bytes = 262144
 child_max_tool_output_bytes = 131072
 child_max_context_items = 48

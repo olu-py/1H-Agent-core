@@ -93,6 +93,7 @@ impl AppService {
             format!("cannot create data directory {}", config.data_dir.display())
         })?;
         let storage = Storage::open(&config.data_dir.join("agent.db"))?;
+        storage.mark_running_children_interrupted()?;
         secrets::preload_environment_keys();
         // Startup loads the default provider's key once (environment first,
         // then the system keychain) so the restored session owns a usable

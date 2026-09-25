@@ -16,11 +16,15 @@
 - 子 Agent 仅一层、不能 spawn、无终端；写入仍经过 mode、安全和审批。
 - 调度、审批 owner、取消、预算和子会话持久化全部由 core 独占；TUI/WebUI/Desktop 不得自行调度子 Agent、维护审批 owner 或复制批次状态机，只能展示公共事件。
 - 同一父 runner 的 clone 共享 `child_slots`，默认并发 4；不同父 runner 不共享 semaphore，App runtime 共享审批锁。
+- 子任务数量不按轮次或父会话累计限制；唯一 fan-out 上限是运行中的 `max_parallel_children` 并发槽。
 - 主动预算默认 300 秒，只计模型和工具；并发槽、审批槽和用户等待不计。范围由 `Config::load` 归一化。
 - `max_turns = 0` 无固定轮次；正数才产生 `turn_limit`，预算和资源上限始终有效。
 - 同轮 spawn 结果齐全后主 Agent 才继续；单个完成时立即持久化和更新，不等整批。
 - 机器终态固定为 `completed`、`failed`、`turn_limit`、`timed_out`、`cancelled`；失败也携带部分 output。
+- `role` 只作为展示文本；`capability` 是明确的 `read_only`/`implementation` 值。旧子会话按精确、无歧义的 role 别名兼容，且无法恢复旧模板允许清单的会话一律只读。
+- `allowed_tools` 只能缩小子 Agent 固定工具集与能力权限的交集；展示工具定义和执行调用必须共用该过滤器。
 - 进度只传阶段、轮次、工具和时间；排队、模型、流式、工具、审批槽、用户审批和终态可区分。
+- 子会话终态持久化到会话行；进程恢复时将残留 `running` 标为 `failed` 并写入中断说明，活跃阶段只在有界事件和 snapshot 中传递。
 - 全局展示最早审批并按 owner 路由；取消覆盖全部等待/执行阶段，释放 permit/lock 并可靠发送终态。
 - 跟踪表（`child_status`/`child_batches`）中的会话 id 必须来自真实存储行（`create_child_session`）；测试夹具不得伪造 id，面板跟踪按活会话集合收敛会将其剔除。
 

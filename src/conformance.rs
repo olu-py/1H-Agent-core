@@ -476,6 +476,7 @@ pub fn scenarios() -> Vec<Scenario> {
         stream.push(Event::ChildSessionProgress {
             child_session_id: "child-1".to_owned(),
             status: "running".to_owned(),
+            phase: Some("running_tool".to_owned()),
             turn: 2,
             max_turns: 10,
             tool: Some("file_read".to_owned()),
@@ -483,6 +484,7 @@ pub fn scenarios() -> Vec<Scenario> {
         stream.push(Event::ChildSessionProgress {
             child_session_id: "child-1".to_owned(),
             status: "completed".to_owned(),
+            phase: None,
             turn: 3,
             max_turns: 10,
             tool: None,

@@ -1171,11 +1171,27 @@ async fn zero_child_tool_budget_does_not_execute_the_tool() {
 
 #[tokio::test]
 async fn cancellation_progress_survives_a_temporarily_full_channel() {
+    let temp = TempDir::new().unwrap();
+    let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+    let parent = storage.create_session(temp.path()).unwrap();
+    let child = storage
+        .create_child_session(
+            temp.path(),
+            &parent,
+            "openai",
+            "gpt-5-mini",
+            "cancelled child",
+            "explore",
+            "read_only",
+        )
+        .unwrap();
     let (events, mut receiver) = mpsc::channel(1);
     events.send(AgentEvent::SessionsChanged).await.unwrap();
     let guard = ChildCancellationGuard {
         ui_events: events,
-        session_id: "cancelled-child".into(),
+        storage: storage.clone(),
+        partial_output: Arc::new(std::sync::Mutex::new("partial answer".into())),
+        session_id: child.clone(),
         max_turns: 3,
         finished: false,
     };
@@ -1197,39 +1213,52 @@ async fn cancellation_progress_survives_a_temporarily_full_channel() {
                 status: ChildSessionStatus::Cancelled,
                 ..
             },
-        } if session_id == "cancelled-child"
+        } if session_id == child
     ));
+    let summary = storage
+        .list_sessions(temp.path())
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == child)
+        .unwrap();
+    assert_eq!(summary.child_status.as_deref(), Some("cancelled"));
+    assert!(storage
+        .load_messages(&child)
+        .unwrap()
+        .iter()
+        .any(|item| matches!(item, ConversationItem::Message { content, .. } if content == "partial answer")));
 }
 
 #[test]
 fn child_tool_filter_never_grants_terminal_or_spawn() {
-    assert!(child_tool_name_allowed("file_read", Some("plan"), &[]));
-    assert!(child_tool_name_allowed(
+    assert!(child_tool_name_allowed("file_read", false, &[]));
+    assert!(child_tool_name_allowed("file_write", true, &[]));
+    assert!(!child_tool_name_allowed("file_write", false, &[]));
+    assert!(!child_tool_name_allowed(
         "file_write",
-        Some("implement"),
-        &[]
+        false,
+        &["file_write".into()]
     ));
-    assert!(!child_tool_name_allowed("file_write", Some("plan"), &[]));
-    assert!(!child_tool_name_allowed(
-        "terminal_exec",
-        Some("implement"),
-        &[]
-    ));
-    assert!(!child_tool_name_allowed(
-        "agent_spawn",
-        Some("implement"),
-        &[]
-    ));
-    assert!(!child_tool_name_allowed(
-        "file_delete",
-        Some("implement"),
-        &[]
-    ));
+    assert!(!child_tool_name_allowed("terminal_exec", true, &[]));
+    assert!(!child_tool_name_allowed("agent_spawn", true, &[]));
+    assert!(!child_tool_name_allowed("file_delete", true, &[]));
     assert!(child_tool_name_allowed(
         "file_read",
-        None,
+        false,
         &["file_read".into()]
     ));
+    assert!(!child_tool_name_allowed(
+        "file_read",
+        false,
+        &["file_write".into()]
+    ));
+    assert!(!child_tool_name_allowed(
+        "file_write",
+        true,
+        &["file_read".into()]
+    ));
+    assert!(!is_implement_role(Some("review implementation")));
+    assert!(is_implement_role(Some("implement")));
 }
 
 #[test]
@@ -1280,6 +1309,7 @@ fn child_title_prefers_explicit_then_role_with_prompt_snippet() {
         prompt: "review the database schema carefully".into(),
         max_turns: None,
         role: Some("reviewer".into()),
+        capability: None,
         model: None,
         provider: None,
         agent: None,
@@ -1341,8 +1371,10 @@ async fn child_agent_uses_configured_agent_template() {
     let (ui_events, mut receiver) = mpsc::channel(16);
     let result = runner.run_child(&call, &ui_events).await.unwrap();
     let payload: Value = serde_json::from_str(&result).unwrap();
+    assert!(payload["session_id"].as_str().is_some());
     assert_eq!(payload["status"], "completed");
     assert_eq!(payload["output"], "review done");
+    assert_eq!(payload["error"], Value::Null);
     assert_eq!(payload["title"], "reviewer");
 
     let sessions = storage.list_sessions(temp.path()).unwrap();
@@ -1350,7 +1382,11 @@ async fn child_agent_uses_configured_agent_template() {
     assert_eq!(storage.session_mode(&child.id).unwrap(), "explore");
     assert_eq!(
         storage.session_child_role(&child.id).unwrap().as_deref(),
-        Some("reviewer")
+        Some("read_only")
+    );
+    assert_eq!(
+        storage.session_child_allowed_tools(&child.id).unwrap(),
+        Some(vec!["file_read".into()])
     );
     // The child session must be created before the result is returned.
     assert!(receiver.recv().await.is_some());
@@ -1379,9 +1415,12 @@ async fn child_agent_rejects_invalid_model_name() {
         arguments: serde_json::json!({"prompt":"x","model":"v4pro"}),
     };
     let (ui_events, _receiver) = mpsc::channel(16);
-    let error = runner.run_child(&call, &ui_events).await.unwrap_err();
-    assert!(error.contains("unknown model"));
-    assert!(error.contains("gpt-5-mini"));
+    let result = runner.run_child(&call, &ui_events).await.unwrap();
+    let outcome: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(outcome["session_id"], Value::Null);
+    assert_eq!(outcome["status"], "failed");
+    assert!(outcome["error"].as_str().unwrap().contains("unknown model"));
+    assert!(outcome["error"].as_str().unwrap().contains("gpt-5-mini"));
 }
 
 #[tokio::test]
@@ -1617,11 +1656,7 @@ fn todo_tools_are_session_scoped_and_replace_the_whole_list() {
         }),
         PolicyDecision::Allow
     ));
-    assert!(!child_tool_name_allowed(
-        "todo_write",
-        Some("implement"),
-        &[]
-    ));
+    assert!(!child_tool_name_allowed("todo_write", true, &[]));
     assert!(
         tools
             .definitions()

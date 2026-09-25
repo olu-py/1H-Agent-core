@@ -192,10 +192,6 @@ pub struct RuntimeConfig {
 pub struct ClusterConfig {
     /// Maximum active children. Missing values use the safe default of four.
     pub max_parallel_children: Option<usize>,
-    /// Reserved count limits; parallel execution is currently bounded by
-    /// `max_parallel_children`.
-    pub max_children_per_turn: Option<usize>,
-    pub max_children_per_session: Option<usize>,
     /// Active model/tool time available to one child. Queueing and approval
     /// waits are excluded from this budget.
     pub child_active_timeout_seconds: u64,
@@ -211,8 +207,6 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             max_parallel_children: Some(4),
-            max_children_per_turn: None,
-            max_children_per_session: None,
             child_active_timeout_seconds: 300,
             child_max_output_bytes: 256 * 1024,
             child_max_tool_output_bytes: 128 * 1024,

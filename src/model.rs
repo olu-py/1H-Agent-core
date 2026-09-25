@@ -185,6 +185,7 @@ pub struct ToolDisplay {
 }
 
 pub struct PendingApproval {
+    pub approval_id: Option<String>,
     pub call: ToolCall,
     pub reason: String,
     pub source_session_id: Option<String>,

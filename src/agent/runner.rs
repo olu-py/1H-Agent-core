@@ -17,6 +17,7 @@ impl AgentRunner {
             approval_lock: Arc::new(Mutex::new(())),
             child_slots: Arc::new(Semaphore::new(4)),
             child_role: None,
+            child_allowed_tools: Vec::new(),
             cluster: ClusterConfig::default(),
             configured_agents: Arc::new(Vec::new()),
             child_provider_resolver: None,
@@ -47,6 +48,11 @@ impl AgentRunner {
 
     pub fn with_child_role(mut self, child_role: Option<String>) -> Self {
         self.child_role = child_role;
+        self
+    }
+
+    pub fn with_child_allowed_tools(mut self, child_allowed_tools: Vec<String>) -> Self {
+        self.child_allowed_tools = child_allowed_tools;
         self
     }
 
@@ -105,7 +111,13 @@ impl AgentRunner {
                 .tools
                 .definitions()
                 .into_iter()
-                .filter(|tool| child_tool_name_allowed(&tool.name, Some(role), &[]))
+                .filter(|tool| {
+                    child_tool_name_allowed(
+                        &tool.name,
+                        is_implement_role(Some(role)),
+                        &self.child_allowed_tools,
+                    )
+                })
                 .collect(),
             None => self.tools.definitions(),
         }
@@ -365,7 +377,11 @@ impl AgentRunner {
                     ConversationItem::Message {
                         role: Role::System,
                         content: match &self.child_role {
-                            Some(role) => prompt::child_system_prompt(Some(role), &[]),
+                            Some(role) => prompt::child_system_prompt(
+                                Some(role),
+                                is_implement_role(Some(role)),
+                                &self.child_allowed_tools,
+                            ),
                             None => prompt::system_prompt(
                                 self.provider_config.preset,
                                 self.tools.mode(),
@@ -717,7 +733,11 @@ impl AgentRunner {
                     continue;
                 }
                 if let Some(role) = &self.child_role {
-                    if !child_tool_name_allowed(&call.name, Some(role), &[]) {
+                    if !child_tool_name_allowed(
+                        &call.name,
+                        is_implement_role(Some(role)),
+                        &self.child_allowed_tools,
+                    ) {
                         let result =
                             format!("denied by policy: child role does not allow {}", call.name);
                         self.storage

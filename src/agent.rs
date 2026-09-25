@@ -30,7 +30,7 @@ mod events;
 mod runner;
 mod tool_loop;
 
-use child::child_tool_name_allowed;
+use child::{child_tool_name_allowed, is_implement_role};
 pub use events::{AgentEvent, ChildSessionProgress, ChildSessionStatus};
 
 #[cfg(test)]
@@ -191,6 +191,7 @@ pub struct AgentRunner {
     approval_lock: Arc<Mutex<()>>,
     child_slots: Arc<Semaphore>,
     child_role: Option<String>,
+    child_allowed_tools: Vec<String>,
     cluster: ClusterConfig,
     configured_agents: Arc<Vec<AgentConfig>>,
     child_provider_resolver: Option<Arc<ChildProviderResolver>>,
@@ -231,6 +232,7 @@ struct StreamCollector {
     max_tool_call_total_bytes: usize,
     max_tool_calls: usize,
     tool_call_bytes: usize,
+    partial_output_sink: Option<Arc<std::sync::Mutex<String>>>,
 }
 
 impl StreamCollector {
@@ -247,6 +249,7 @@ impl StreamCollector {
             max_tool_call_total_bytes: 4 * 1024 * 1024,
             max_tool_calls: 32,
             tool_call_bytes: 0,
+            partial_output_sink: None,
         }
     }
 
@@ -254,6 +257,11 @@ impl StreamCollector {
         self.max_tool_call_bytes = memory.max_tool_call_bytes;
         self.max_tool_call_total_bytes = memory.max_tool_call_total_bytes;
         self.max_tool_calls = memory.max_tool_calls;
+        self
+    }
+
+    fn with_partial_output_sink(mut self, sink: Arc<std::sync::Mutex<String>>) -> Self {
+        self.partial_output_sink = Some(sink);
         self
     }
 
@@ -266,6 +274,11 @@ impl StreamCollector {
                 if let Some(max_bytes) = self.max_text_bytes {
                     if self.assistant_text.len().saturating_add(delta.len()) > max_bytes {
                         append_text_bounded(&mut self.assistant_text, &delta, max_bytes);
+                        if let Some(sink) = &self.partial_output_sink {
+                            if let Ok(mut output) = sink.lock() {
+                                *output = self.assistant_text.clone();
+                            }
+                        }
                         return Err(format!(
                             "model response exceeded the {} byte limit",
                             max_bytes
@@ -274,6 +287,11 @@ impl StreamCollector {
                     append_text_bounded(&mut self.assistant_text, &delta, max_bytes);
                 } else {
                     self.assistant_text.push_str(&delta);
+                }
+                if let Some(sink) = &self.partial_output_sink {
+                    if let Ok(mut output) = sink.lock() {
+                        *output = self.assistant_text.clone();
+                    }
                 }
                 Ok(Some(ModelEvent::TextDelta(delta)))
             }

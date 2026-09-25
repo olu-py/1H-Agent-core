@@ -27,6 +27,7 @@ pub struct SessionSummary {
     pub id: String,
     pub title: String,
     pub parent_id: Option<String>,
+    pub child_status: Option<String>,
 }
 
 /// A single file snapshot captured around a mutating file tool call.

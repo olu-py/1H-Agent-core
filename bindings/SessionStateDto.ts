@@ -3,4 +3,4 @@
 /**
  * Serialized form of a session used by [`AppSnapshotV2`].
  */
-export type SessionStateDto = { id: string, title: string, parent_id: string | null, busy: boolean, phase: string, status: string, };
+export type SessionStateDto = { id: string, title: string, parent_id: string | null, busy: boolean, phase: string, status: string, child_status?: string, child_phase?: string, child_turn?: number, child_max_turns?: number, child_tool?: string, };

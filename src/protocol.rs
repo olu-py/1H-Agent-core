@@ -185,6 +185,9 @@ pub enum Event {
     ChildSessionProgress {
         child_session_id: String,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        phase: Option<String>,
         turn: usize,
         max_turns: usize,
         tool: Option<String>,
@@ -241,6 +244,21 @@ pub struct SessionStateDto {
     pub busy: bool,
     pub phase: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub child_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub child_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub child_turn: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub child_max_turns: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub child_tool: Option<String>,
 }
 
 /// A pending approval exposed to the frontend. `approval_id` is echoed back on
@@ -566,6 +584,7 @@ mod tests {
             Event::ChildSessionProgress {
                 child_session_id: "c".into(),
                 status: "running".into(),
+                phase: None,
                 turn: 1,
                 max_turns: 2,
                 tool: None,
