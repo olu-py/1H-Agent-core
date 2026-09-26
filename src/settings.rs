@@ -22,8 +22,8 @@ pub enum SettingsState {
 
 pub struct ProviderList {
     pub providers: Vec<ProviderConfig>,
-    pub active: ProviderPreset,
-    pub connected: HashSet<ProviderPreset>,
+    pub active: String,
+    pub connected: HashSet<String>,
     /// Rows are profiles followed by the stable "add provider" command.
     pub selected: usize,
 }
@@ -34,13 +34,13 @@ pub struct TemplateList {
 }
 
 impl SettingsState {
-    pub fn list(providers: Vec<ProviderConfig>, active: ProviderPreset) -> Self {
+    pub fn list(providers: Vec<ProviderConfig>, active: String) -> Self {
         let connected = providers
             .iter()
             .filter_map(|provider| {
                 secrets::api_key_cached_only(provider.preset, provider.id())
                     .ok()
-                    .map(|_| provider.preset)
+                    .map(|_| provider.id().to_owned())
             })
             .collect();
         Self::List(ProviderList {
@@ -366,7 +366,7 @@ mod tests {
                 ProviderPreset::OpenAi.defaults(),
                 ProviderPreset::DeepSeek.defaults(),
             ],
-            ProviderPreset::OpenAi,
+            "openai".to_owned(),
         );
         state.open_templates();
         let SettingsState::Templates(templates) = state else {
