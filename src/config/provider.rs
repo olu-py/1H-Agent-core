@@ -1,9 +1,27 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Upper bound on a custom provider's display name (characters, not bytes).
+pub const MAX_PROVIDER_NAME_CHARS: usize = 64;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProviderConfig {
+    /// Stable identity of this connection profile. Built-in providers use their
+    /// preset key ("openai", "deepseek", "qwen", "volcano", "custom");
+    /// additional custom providers get a generated `custom-<uuid>` id. Older
+    /// configs that predate this field leave it empty and are normalized to
+    /// `preset.key_id()` by [`Self::ensure_id`] during `Config::load`. Session
+    /// rows, keyring entries and child-agent resolution address a provider by
+    /// this id, never by the `preset` template.
+    pub id: String,
+    /// User-assigned display name for a custom provider. Empty for built-ins and
+    /// for legacy profiles, which fall back to the preset label. Names are the
+    /// user-facing handle; `id` remains the machine identity.
+    pub name: String,
+    /// The provider template/family this profile is built from. Drives request
+    /// protocol defaults, thinking profiles, selectable models and the built-in
+    /// context-window registry. It is no longer the profile's identity.
     pub preset: ProviderPreset,
     pub kind: ProviderKind,
     pub base_url: String,
@@ -20,6 +38,11 @@ pub struct ProviderConfig {
     pub thinking: ThinkingCapability,
     pub thinking_level: ThinkingLevel,
     pub thinking_budget_tokens: Option<u32>,
+    /// Models the user explicitly enabled for this provider. Empty means
+    /// "unrestricted" (every discovered/registry model is offered). Reserved for
+    /// the selectable-model picker: the field round-trips through config and the
+    /// protocol DTO, but is not yet enforced when building requests.
+    pub enabled_models: Vec<String>,
     /// Max HTTP-level retry attempts before giving up. 0 disables retries.
     pub retry_max_attempts: u32,
     pub retry_initial_backoff_ms: u64,
@@ -299,6 +322,14 @@ impl ProviderKind {
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
+            // Intentionally empty: `#[serde(default)]` copies these struct
+            // defaults into every missing field, so a hard-coded built-in id
+            // here would wrongly stamp `id = "openai"` onto configs whose
+            // `preset` says otherwise. `ensure_id()` derives the real id from
+            // the parsed preset instead, and `id()` falls back for direct
+            // `Default` users that never call it.
+            id: String::new(),
+            name: String::new(),
             preset: ProviderPreset::OpenAi,
             kind: ProviderKind::Responses,
             base_url: "https://api.openai.com/v1".into(),
@@ -310,6 +341,7 @@ impl Default for ProviderConfig {
             thinking: ThinkingCapability::Auto,
             thinking_level: ThinkingLevel::Auto,
             thinking_budget_tokens: None,
+            enabled_models: Vec::new(),
             retry_max_attempts: 3,
             retry_initial_backoff_ms: 500,
             retry_max_backoff_ms: 8000,
@@ -319,6 +351,69 @@ impl Default for ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// Fills in a missing id from the preset key, then trims it. Older configs
+    /// (and any profile created before ids existed) are stamped to their preset
+    /// key, so a single legacy `custom` profile keeps the "custom" id and its
+    /// existing keyring entry.
+    pub fn ensure_id(&mut self) {
+        let current = std::mem::take(&mut self.id);
+        let trimmed = current.trim();
+        self.id = if trimmed.is_empty() {
+            self.preset.key_id().to_owned()
+        } else {
+            trimmed.to_owned()
+        };
+    }
+
+    /// The id used for keyring entries, session rows and cross-provider
+    /// resolution. Always non-empty after [`Self::ensure_id`].
+    pub fn id(&self) -> &str {
+        if self.id.is_empty() {
+            self.preset.key_id()
+        } else {
+            &self.id
+        }
+    }
+
+    /// Human-facing label: the custom name when set, else the preset label.
+    pub fn display_label(&self) -> &str {
+        let name = self.name.trim();
+        if name.is_empty() {
+            self.preset.label()
+        } else {
+            name
+        }
+    }
+
+    /// Whether this profile is a user-defined custom connection, which may be
+    /// instantiated many times (unlike the one-profile-per-preset built-ins).
+    pub fn is_custom(&self) -> bool {
+        self.preset == ProviderPreset::Custom
+    }
+
+    /// Generates a fresh id for a new custom provider. The `custom-<hex>` shape
+    /// keeps generated ids distinguishable from built-in preset keys.
+    pub fn new_custom_id() -> String {
+        format!("custom-{}", uuid::Uuid::new_v4().simple())
+    }
+
+    /// Validates the display name shape when one is set. Empty names are
+    /// permitted so legacy unnamed profiles keep loading; callers that require a
+    /// name for a *new* custom provider enforce that separately.
+    pub fn validate_name(&self) -> Result<()> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Ok(());
+        }
+        if name.chars().count() > MAX_PROVIDER_NAME_CHARS {
+            anyhow::bail!("provider name must be at most {MAX_PROVIDER_NAME_CHARS} characters");
+        }
+        if name.chars().any(|c| c.is_control()) {
+            anyhow::bail!("provider name must not contain control characters");
+        }
+        Ok(())
+    }
+
     pub fn normalize_thinking(&mut self) {
         let profile = thinking_profile(self.preset, &self.model);
         if !profile.options.contains(&self.thinking_level) {
@@ -347,6 +442,8 @@ impl ProviderConfig {
     pub fn validate(&mut self) -> Result<()> {
         self.base_url = self.base_url.trim().trim_end_matches('/').to_owned();
         self.model = self.model.trim().to_owned();
+        self.name = self.name.trim().to_owned();
+        self.validate_name()?;
         if self.base_url.contains('{') || self.base_url.contains('}') {
             anyhow::bail!("replace placeholders in the provider Base URL");
         }
@@ -429,6 +526,8 @@ impl ProviderPreset {
             ),
         };
         let mut config = ProviderConfig {
+            id: self.key_id().to_owned(),
+            name: String::new(),
             preset: self,
             kind,
             base_url: base_url.into(),
@@ -440,6 +539,7 @@ impl ProviderPreset {
             thinking: ThinkingCapability::Auto,
             thinking_level: ThinkingLevel::Auto,
             thinking_budget_tokens: None,
+            enabled_models: Vec::new(),
             retry_max_attempts: 3,
             retry_initial_backoff_ms: 500,
             retry_max_backoff_ms: 8000,

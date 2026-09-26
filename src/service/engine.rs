@@ -66,7 +66,7 @@ pub(super) enum CoreCommand {
         reply: oneshot::Sender<Result<(), ApiError>>,
     },
     SetProvider {
-        preset: String,
+        provider_id: String,
         model: String,
         reply: oneshot::Sender<Result<(), ApiError>>,
     },
@@ -82,13 +82,18 @@ pub(super) enum CoreCommand {
     /// (falling back to the preset template when nothing is saved), then
     /// commits it through the `SetProviderConfig` path.
     SetProviderProfile {
-        preset: crate::config::ProviderPreset,
+        provider_id: String,
+        template: crate::config::ProviderPreset,
+        /// New display name for a custom provider; `None` keeps the merged one.
+        name: Option<String>,
         model: String,
         base_url: Option<String>,
         kind: Option<crate::config::ProviderKind>,
         /// Optional explicit window override (clamped 4096..=10_000_000);
         /// `None` keeps the merged profile's value.
         context_window_tokens: Option<u64>,
+        /// Reserved selectable-model list; `None` keeps the merged value.
+        enabled_models: Option<Vec<String>>,
         reply: oneshot::Sender<Result<(), ApiError>>,
     },
     /// Reads the provider settings view (active + saved profiles, connected
@@ -109,7 +114,7 @@ pub(super) enum CoreCommand {
     /// Removes a saved provider profile, switching the active provider when it
     /// was the one removed.
     RemoveProvider {
-        preset: crate::config::ProviderPreset,
+        provider_id: String,
         reply: oneshot::Sender<Result<(), ApiError>>,
     },
     ActivateSession {
@@ -542,11 +547,11 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             let _ = reply.send(result);
         }
         CoreCommand::SetProvider {
-            preset,
+            provider_id,
             model,
             reply,
         } => {
-            let result = set_provider(engine, &preset, &model);
+            let result = set_provider(engine, &provider_id, &model);
             let _ = reply.send(result);
         }
         CoreCommand::SetProviderConfig { provider, reply } => {
@@ -554,20 +559,26 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             let _ = reply.send(result);
         }
         CoreCommand::SetProviderProfile {
-            preset,
+            provider_id,
+            template,
+            name,
             model,
             base_url,
             kind,
             context_window_tokens,
+            enabled_models,
             reply,
         } => {
             let result = set_provider_profile(
                 engine,
-                preset,
+                &provider_id,
+                template,
+                name,
                 &model,
                 base_url,
                 kind,
                 context_window_tokens,
+                enabled_models,
             );
             let _ = reply.send(result);
         }
@@ -582,8 +593,8 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
         CoreCommand::ModelMetadataRefreshed => {
             model_metadata_refreshed(engine);
         }
-        CoreCommand::RemoveProvider { preset, reply } => {
-            let result = remove_provider(engine, preset);
+        CoreCommand::RemoveProvider { provider_id, reply } => {
+            let result = remove_provider(engine, &provider_id);
             let _ = reply.send(result);
         }
         CoreCommand::ActivateSession { session_id, reply } => {
@@ -674,7 +685,8 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
         event_cursor: engine.bridge.current_cursor(),
         active_session,
         sessions,
-        provider: app.config.provider.preset.label().to_owned(),
+        provider: app.config.provider.display_label().to_owned(),
+        provider_id: app.config.provider.id().to_owned(),
         model: app.config.provider.model.clone(),
         mode: app.current.mode.as_str().to_owned(),
         approval,
@@ -1205,36 +1217,39 @@ fn cancel_session(
     Ok(())
 }
 
-/// Applies non-secret provider settings: switches the preset when given and
-/// sets the model. API keys are never handled here (they stay in the keyring).
-fn set_provider(engine: &mut Engine, preset: &str, model: &str) -> Result<(), ApiError> {
-    use crate::config::ProviderPreset;
-    let Some(preset) = ProviderPreset::parse(preset) else {
-        return Err(ApiError::bad_request(format!(
-            "unknown provider preset {preset}"
-        )));
-    };
-    let current_preset = engine.app.config.provider.preset;
-    if preset != current_preset {
-        app::apply_provider_choice(&mut engine.app, preset).map_err(api_error)?;
-        // `apply_provider_choice` reports an unavailable key as a status, not an
-        // error. Detect an unchanged preset and refuse to apply the model so we
-        // never leave an inconsistent preset/model pair.
-        if engine.app.config.provider.preset != preset {
+/// Applies non-secret provider settings: switches the provider (by stable id)
+/// when given and sets the model. API keys are never handled here (they stay in
+/// the keyring). A bare built-in preset name resolves to its own id, so legacy
+/// callers keep working.
+fn set_provider(engine: &mut Engine, provider_id: &str, model: &str) -> Result<(), ApiError> {
+    // Resolve the target profile first so an unknown id is rejected up front.
+    let target = engine
+        .app
+        .config
+        .provider_for_id(provider_id)
+        .or_else(|| {
+            crate::config::ProviderPreset::parse(provider_id)
+                .and_then(|preset| engine.app.config.provider_for(preset))
+        })
+        .ok_or_else(|| ApiError::bad_request(format!("unknown provider {provider_id}")))?;
+    let target_id = target.id().to_owned();
+    let target_label = target.display_label().to_owned();
+    let current_id = engine.app.config.provider.id().to_owned();
+    if target_id != current_id {
+        app::apply_provider_choice_by_id(&mut engine.app, &target_id).map_err(api_error)?;
+        // `apply_provider_choice_by_id` reports an unavailable key as a status,
+        // not an error. Detect an unchanged provider and refuse to apply the
+        // model so we never leave an inconsistent provider/model pair.
+        if engine.app.config.provider.id() != target_id {
             return Err(ApiError::bad_request(format!(
-                "{} 的 API Key 不可用",
-                crate::config::ProviderPreset::ALL
-                    .iter()
-                    .find(|candidate| **candidate == preset)
-                    .map(|preset| preset.label())
-                    .unwrap_or("provider")
+                "{target_label} 的 API Key 不可用"
             )));
         }
     }
     if !model.is_empty() && model != engine.app.config.provider.model {
         app::apply_model_choice(&mut engine.app, model.to_owned()).map_err(api_error)?;
     }
-    // Model switches and preset switches are both metadata fetch triggers.
+    // Model switches and provider switches are both metadata fetch triggers.
     spawn_model_metadata_refresh(engine);
     push_context_updated(engine, &engine.app.current.session_id);
     Ok(())
@@ -1248,24 +1263,42 @@ fn set_provider_config(
     engine: &mut Engine,
     mut provider: crate::config::ProviderConfig,
 ) -> Result<(), ApiError> {
+    provider.ensure_id();
     let preset = provider.preset;
-    let model = provider.model.clone();
+    let provider_id = provider.id().to_owned();
     provider
         .validate()
         .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+    // New custom providers must carry a non-empty, unique name; built-ins and
+    // legacy unnamed custom profiles may keep an empty name (label fallback).
+    if preset == crate::config::ProviderPreset::Custom && provider.name.trim().is_empty() {
+        return Err(ApiError::bad_request("自定义供应商名称不能为空"));
+    }
+    if engine
+        .app
+        .config
+        .provider_name_taken(&provider.name, Some(&provider_id))
+    {
+        return Err(ApiError::bad_request(format!(
+            "供应商名称 \"{}\" 已被占用",
+            provider.name.trim()
+        )));
+    }
+    let label = provider.display_label().to_owned();
+    let model = provider.model.clone();
     provider.normalize_thinking();
     // Refresh the active secret whenever it does not match the incoming
-    // preset - a preset switch, or the first key arriving for the current
-    // preset - so the rebuilt runner never pairs one preset's key with
-    // another preset's base URL, and a newly stored key takes effect without
-    // a restart. `api_key_cached` resolves environment variables first and
-    // reads the keyring at most once per process and preset.
-    if engine.app.config.provider.preset != preset
-        || !matches!(&engine.app.active_secret, Some((active, _)) if *active == preset)
+    // provider id - a provider switch, or the first key arriving for the
+    // current provider - so the rebuilt runner never pairs one provider's key
+    // with another provider's base URL, and a newly stored key takes effect
+    // without a restart. `api_key_cached` resolves environment variables first
+    // (by family) and reads the keyring at most once per process and id.
+    if engine.app.config.provider.id() != provider_id
+        || !matches!(&engine.app.active_secret, Some((active, _)) if *active == provider_id)
     {
-        engine.app.active_secret = crate::secrets::api_key_cached(preset)
+        engine.app.active_secret = crate::secrets::api_key_cached(preset, &provider_id)
             .ok()
-            .map(|key| (preset, key));
+            .map(|key| (provider_id.clone(), key));
     }
     let has_key = engine.app.active_secret.is_some();
     engine.app.config.provider = provider.clone();
@@ -1285,7 +1318,7 @@ fn set_provider_config(
         .map_err(|error| api_error(error.into()))?;
     app::rebuild_runner(&mut engine.app).map_err(api_error)?;
     let status = match engine.app.config.save() {
-        Ok(()) if has_key => format!("就绪 | {} | {}", preset.label(), model),
+        Ok(()) if has_key => format!("就绪 | {label} | {model}"),
         Ok(()) => "需要配置提供商".into(),
         Err(error) => {
             let suffix = crate::secrets::redact(&error.to_string());
@@ -1306,29 +1339,56 @@ fn set_provider_config(
 
 /// Applies a settings-screen provider edit: merges the model and the optional
 /// base URL / protocol / explicit context window onto the base profile for
-/// `preset` - the current profile when it is already active (keeping
+/// `provider_id` - the current profile when it is already active (keeping
 /// thinking, retry and context customizations), otherwise the saved profile
-/// or a fresh preset template - then commits it via [`set_provider_config`].
-/// A provided window is clamped to the same bounds `Config::load` enforces,
-/// so the settings screen can never install an out-of-bounds window.
+/// or a fresh template - then commits it via [`set_provider_config`].
+/// `template` supplies the family defaults for a brand-new profile. A provided
+/// window is clamped to the same bounds `Config::load` enforces, so the
+/// settings screen can never install an out-of-bounds window.
+#[allow(clippy::too_many_arguments)]
 fn set_provider_profile(
     engine: &mut Engine,
-    preset: crate::config::ProviderPreset,
+    provider_id: &str,
+    template: crate::config::ProviderPreset,
+    name: Option<String>,
     model: &str,
     base_url: Option<String>,
     kind: Option<crate::config::ProviderKind>,
     context_window_tokens: Option<u64>,
+    enabled_models: Option<Vec<String>>,
 ) -> Result<(), ApiError> {
-    let mut profile = if engine.app.config.provider.preset == preset {
+    // Empty id + the `custom` template is the create path: mint a fresh id so
+    // several custom providers can coexist. Built-ins keep their preset key.
+    let creating = provider_id.trim().is_empty();
+    let mut profile = if creating {
+        template.defaults()
+    } else if engine.app.config.provider.id() == provider_id {
         engine.app.config.provider.clone()
     } else {
         engine
             .app
             .config
-            .provider_for(preset)
-            .unwrap_or_else(|| preset.defaults())
+            .provider_for_id(provider_id)
+            .unwrap_or_else(|| template.defaults())
     };
-    profile.preset = preset;
+    if creating {
+        profile.id = if template == crate::config::ProviderPreset::Custom {
+            crate::config::ProviderConfig::new_custom_id()
+        } else {
+            template.key_id().to_owned()
+        };
+    } else {
+        profile.id = provider_id.to_owned();
+    }
+    profile.preset = template;
+    // `name` is only meaningful for named custom providers; built-ins fall back
+    // to the preset label and must not overwrite it with a stale name.
+    if let Some(name) = name {
+        profile.name = name;
+    }
+    if let Some(models) = enabled_models {
+        profile.enabled_models = models;
+    }
     profile.model = model.trim().to_owned();
     if let Some(base_url) = base_url {
         if !base_url.trim().is_empty() {
@@ -1348,19 +1408,20 @@ fn set_provider_profile(
 }
 
 /// Builds the provider settings view. `connected` uses cache-only key lookups
-/// (startup unlock, environment preload, keys stored this run) so answering a
-/// settings read never touches the OS keyring.
+/// by provider id (startup unlock, environment preload, keys stored this run)
+/// so answering a settings read never touches the OS keyring.
 fn provider_settings(engine: &Engine) -> crate::protocol::ProviderSettingsDto {
     let app = &engine.app;
-    let mut presets: Vec<crate::config::ProviderPreset> =
-        app.config.providers.iter().map(|p| p.preset).collect();
-    if !presets.contains(&app.config.provider.preset) {
-        presets.push(app.config.provider.preset);
+    let mut profiles: Vec<&crate::config::ProviderConfig> = app.config.providers.iter().collect();
+    if !profiles.iter().any(|p| p.id() == app.config.provider.id()) {
+        profiles.push(&app.config.provider);
     }
-    let connected = presets
+    let connected = profiles
         .iter()
-        .filter(|preset| crate::secrets::api_key_cached_only(**preset).is_ok())
-        .map(|preset| preset.key_id().to_owned())
+        .filter(|provider| {
+            crate::secrets::api_key_cached_only(provider.preset, provider.id()).is_ok()
+        })
+        .map(|provider| provider.id().to_owned())
         .collect::<Vec<_>>();
     crate::protocol::ProviderSettingsDto {
         active: provider_profile_dto(&app.config.provider),
@@ -1379,10 +1440,13 @@ fn provider_profile_dto(
     provider: &crate::config::ProviderConfig,
 ) -> crate::protocol::ProviderProfileDto {
     crate::protocol::ProviderProfileDto {
+        id: provider.id().to_owned(),
         preset: provider.preset.key_id().to_owned(),
+        name: provider.name.clone(),
         kind: provider.kind.wire_tag().to_owned(),
         model: provider.model.clone(),
         base_url: provider.base_url.clone(),
+        enabled_models: provider.enabled_models.clone(),
     }
 }
 
@@ -1597,14 +1661,12 @@ fn model_metadata_refreshed(engine: &mut Engine) {
     push_context_updated(engine, &engine.app.current.session_id);
 }
 
-/// Removes a saved provider profile, switching the active provider (and its
-/// runner) when it was the one removed. The API key stays in the OS keyring.
-fn remove_provider(
-    engine: &mut Engine,
-    preset: crate::config::ProviderPreset,
-) -> Result<(), ApiError> {
-    engine.app.config.remove_provider(preset);
-    if engine.app.config.provider.preset == preset {
+/// Removes a saved provider profile by id, switching the active provider (and
+/// its runner) when it was the one removed. The API key stays in the OS
+/// keyring.
+fn remove_provider(engine: &mut Engine, provider_id: &str) -> Result<(), ApiError> {
+    engine.app.config.remove_provider_by_id(provider_id);
+    if engine.app.config.provider.id() == provider_id {
         engine.app.config.provider = engine
             .app
             .config
@@ -1612,13 +1674,20 @@ fn remove_provider(
             .first()
             .cloned()
             .unwrap_or_else(|| crate::config::ProviderPreset::OpenAi.defaults());
+        let fallback_id = engine.app.config.provider.id().to_owned();
         engine.app.active_secret =
-            crate::secrets::api_key_cached(engine.app.config.provider.preset)
+            crate::secrets::api_key_cached(engine.app.config.provider.preset, &fallback_id)
                 .ok()
-                .map(|key| (engine.app.config.provider.preset, key));
+                .map(|key| (fallback_id, key));
         app::rebuild_runner(&mut engine.app).map_err(api_error)?;
     }
-    engine.app.config.save().map_err(api_error)?;
+    // The in-memory removal (and any switch) has already taken effect, so a
+    // failed persist degrades to a status warning instead of undoing the
+    // user's action, mirroring the provider-apply path.
+    if let Err(error) = engine.app.config.save() {
+        let suffix = crate::secrets::redact(&error.to_string());
+        engine.app.current.status = format!("供应商已删除，但保存失败：{suffix}");
+    }
     push_context_updated(engine, &engine.app.current.session_id);
     Ok(())
 }

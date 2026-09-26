@@ -3,9 +3,9 @@ import type { ProviderProfileDto } from "./ProviderProfileDto";
 
 /**
  * Provider settings for `GET /api/v2/config/provider`: the active profile,
- * the saved per-preset profiles, and which presets currently have a usable
- * API key (cache-only lookup: startup unlock, environment preload, and keys
- * stored during this run). Absence from `connected` means "no key resolved
- * yet", not a definitive "never configured".
+ * the saved profiles, and which provider ids currently have a usable API key
+ * (cache-only lookup: startup unlock, environment preload, and keys stored
+ * during this run). Absence from `connected` means "no key resolved yet", not
+ * a definitive "never configured".
  */
 export type ProviderSettingsDto = { active: ProviderProfileDto, saved: Array<ProviderProfileDto>, connected: Array<string>, };

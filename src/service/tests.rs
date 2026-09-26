@@ -7,6 +7,9 @@ async fn test_handle() -> (TempDir, AppHandle) {
     let workspace = temp.path().to_path_buf();
     let mut config = Config::default();
     config.data_dir = temp.path().join("data");
+    // Give the handle a writable config path so provider create/remove paths
+    // exercise the same persist behavior as production.
+    config.set_config_path_for_test(temp.path().join("config.toml"));
     // Deterministic runner: without a seeded key, whether the shared key
     // cache holds one depends on test scheduling, making submit-based tests
     // flaky.
@@ -107,8 +110,11 @@ async fn set_provider_profile_switches_to_an_unsaved_preset_from_template() {
     crate::secrets::test_seed_key(crate::config::ProviderPreset::DeepSeek, "deepseek-test-key");
     handle
         .set_provider_profile(
+            "deepseek",
             crate::config::ProviderPreset::DeepSeek,
+            None,
             "deepseek-v4-flash",
+            None,
             None,
             None,
             None,
@@ -138,10 +144,13 @@ async fn set_provider_profile_applies_overrides_and_keeps_the_active_base() {
     let (_temp, handle) = test_handle().await;
     handle
         .set_provider_profile(
+            "openai",
             crate::config::ProviderPreset::OpenAi,
+            None,
             "gpt-5",
             Some("https://proxy.example.com/v1"),
             Some(crate::config::ProviderKind::ChatCompletions),
+            None,
             None,
         )
         .await
@@ -160,13 +169,16 @@ async fn set_provider_profile_overrides_the_explicit_window_with_clamping() {
     handle.submit(None, "hello").await.unwrap();
     handle
         .set_provider_profile(
+            "openai",
             crate::config::ProviderPreset::OpenAi,
+            None,
             "gateway-unknown-model",
             None,
             None,
             // Out-of-bounds windows are clamped to the Config::load bounds,
             // never installed verbatim.
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -185,8 +197,11 @@ async fn set_provider_profile_overrides_the_explicit_window_with_clamping() {
     // Omitting the window keeps the merged profile's explicit value.
     handle
         .set_provider_profile(
+            "openai",
             crate::config::ProviderPreset::OpenAi,
+            None,
             "gateway-unknown-model",
+            None,
             None,
             None,
             None,
@@ -211,11 +226,15 @@ async fn set_provider_profile_without_a_key_marks_missing_provider() {
     // guaranteed: another test may have seeded one. Assert the missing-key
     // behavior only when Volcano was unresolvable when the test started.
     let volcano_unconnected =
-        crate::secrets::api_key_cached_only(crate::config::ProviderPreset::Volcano).is_err();
+        crate::secrets::api_key_cached_only(crate::config::ProviderPreset::Volcano, "volcano")
+            .is_err();
     handle
         .set_provider_profile(
+            "volcano",
             crate::config::ProviderPreset::Volcano,
+            None,
             "doubao-seed-2-1-pro-260628",
+            None,
             None,
             None,
             None,
@@ -231,13 +250,188 @@ async fn set_provider_profile_without_a_key_marks_missing_provider() {
 }
 
 #[tokio::test]
+async fn custom_providers_can_be_added_renamed_and_removed() {
+    let (_temp, handle) = test_handle().await;
+    crate::secrets::test_seed_key_for_id("custom-aaaa", "key-a");
+    crate::secrets::test_seed_key_for_id("custom-bbbb", "key-b");
+
+    // Create two named custom providers from the custom template.
+    handle
+        .set_provider_profile(
+            "",
+            crate::config::ProviderPreset::Custom,
+            Some("Gateway A"),
+            "model-a",
+            Some("https://a.example/v1"),
+            Some(crate::config::ProviderKind::ChatCompletions),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let first_id = handle.provider_settings().await.unwrap().active.id.clone();
+    assert!(first_id.starts_with("custom-"), "{first_id}");
+    assert_eq!(
+        handle.provider_settings().await.unwrap().active.name,
+        "Gateway A"
+    );
+
+    handle
+        .set_provider_profile(
+            "",
+            crate::config::ProviderPreset::Custom,
+            Some("Gateway B"),
+            "model-b",
+            Some("https://b.example/v1"),
+            Some(crate::config::ProviderKind::ChatCompletions),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let second_id = handle.provider_settings().await.unwrap().active.id.clone();
+    assert_ne!(first_id, second_id);
+    let settings = handle.provider_settings().await.unwrap();
+    let names = settings
+        .saved
+        .iter()
+        .map(|profile| profile.name.clone())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"Gateway A".to_owned()), "{names:?}");
+    assert!(names.contains(&"Gateway B".to_owned()), "{names:?}");
+
+    // Rename the first provider and switch to it.
+    handle
+        .set_provider_profile(
+            &first_id,
+            crate::config::ProviderPreset::Custom,
+            Some("Gateway A2"),
+            "model-a2",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let settings = handle.provider_settings().await.unwrap();
+    assert_eq!(settings.active.id, first_id);
+    assert_eq!(settings.active.name, "Gateway A2");
+    assert_eq!(settings.active.model, "model-a2");
+
+    // Deleting the active provider falls back to the remaining saved profile.
+    handle.remove_provider(&first_id).await.unwrap();
+    let settings = handle.provider_settings().await.unwrap();
+    assert_eq!(settings.active.id, second_id);
+    assert!(!settings.saved.iter().any(|profile| profile.id == first_id));
+}
+
+#[tokio::test]
+async fn duplicate_and_empty_custom_names_are_rejected() {
+    let (_temp, handle) = test_handle().await;
+    handle
+        .set_provider_profile(
+            "",
+            crate::config::ProviderPreset::Custom,
+            Some("Gateway"),
+            "model-a",
+            Some("https://a.example/v1"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // A second custom provider with the same name (any casing) is refused.
+    let duplicate = handle
+        .set_provider_profile(
+            "",
+            crate::config::ProviderPreset::Custom,
+            Some("gateway"),
+            "model-b",
+            Some("https://b.example/v1"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.kind, ApiErrorKind::BadRequest);
+    assert!(
+        duplicate.message.contains("已被占用"),
+        "{}",
+        duplicate.message
+    );
+
+    // A blank name is refused for a new custom provider.
+    let blank = handle
+        .set_provider_profile(
+            "",
+            crate::config::ProviderPreset::Custom,
+            Some("   "),
+            "model-c",
+            Some("https://c.example/v1"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(blank.kind, ApiErrorKind::BadRequest);
+    assert!(blank.message.contains("不能为空"), "{}", blank.message);
+
+    // A built-in preset label is reserved as well.
+    let builtin = handle
+        .set_provider_profile(
+            "",
+            crate::config::ProviderPreset::Custom,
+            Some("DeepSeek"),
+            "model-d",
+            Some("https://d.example/v1"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(builtin.kind, ApiErrorKind::BadRequest);
+}
+
+#[tokio::test]
+async fn enabled_models_round_trip_through_settings() {
+    let (_temp, handle) = test_handle().await;
+    handle
+        .set_provider_profile(
+            "",
+            crate::config::ProviderPreset::Custom,
+            Some("Gateway"),
+            "model-a",
+            Some("https://a.example/v1"),
+            None,
+            None,
+            Some(vec!["model-a".to_owned(), "model-b".to_owned()]),
+        )
+        .await
+        .unwrap();
+    let settings = handle.provider_settings().await.unwrap();
+    assert_eq!(
+        settings.active.enabled_models,
+        vec!["model-a".to_owned(), "model-b".to_owned()]
+    );
+}
+
+#[tokio::test]
 async fn set_provider_profile_rejects_an_invalid_base_url() {
     let (_temp, handle) = test_handle().await;
     let error = handle
         .set_provider_profile(
+            "openai",
             crate::config::ProviderPreset::OpenAi,
+            None,
             "gpt-5-mini",
             Some("not a url"),
+            None,
             None,
             None,
         )

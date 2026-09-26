@@ -95,10 +95,19 @@ impl AppService {
         let storage = Storage::open(&config.data_dir.join("agent.db"))?;
         storage.mark_running_children_interrupted()?;
         secrets::preload_environment_keys();
+        // Warm environment-backed keys for every saved provider id (including
+        // generated custom ids) without touching the keyring.
+        let saved_providers = config
+            .config
+            .providers
+            .iter()
+            .map(|provider| (provider.preset, provider.id().to_owned()))
+            .collect::<Vec<_>>();
+        secrets::preload_environment_keys_for_providers(&saved_providers);
         // Startup loads the default provider's key once (environment first,
         // then the system keychain) so the restored session owns a usable
-        // runner without a settings round trip. Cached per provider.
-        let _ = secrets::api_key_cached(config.config.provider.preset);
+        // runner without a settings round trip. Cached per provider id.
+        let _ = secrets::api_key_cached(config.config.provider.preset, config.config.provider.id());
 
         let bridge = Arc::new(crate::bridge::EventBridge::new(
             config.event_capacity,

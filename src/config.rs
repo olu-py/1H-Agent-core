@@ -299,6 +299,13 @@ impl Config {
         Ok(config)
     }
 
+    /// Test-only hook so service tests can exercise the persist path without
+    /// depending on the host's real configuration directory.
+    #[cfg(test)]
+    pub(crate) fn set_config_path_for_test(&mut self, path: PathBuf) {
+        self.config_path = Some(path);
+    }
+
     pub fn save(&self) -> Result<()> {
         let path = self
             .config_path
@@ -313,23 +320,35 @@ impl Config {
         fs::write(path, value).with_context(|| format!("failed to save config {}", path.display()))
     }
 
-    /// Returns a saved connection profile, falling back to the active profile
-    /// for compatibility with callers during the old-config migration.
-    pub fn provider_for(&self, preset: ProviderPreset) -> Option<ProviderConfig> {
+    /// Returns a saved connection profile by provider id, falling back to the
+    /// active profile for compatibility with callers during the old-config
+    /// migration. Ids are the profile identity; `preset` is only the template.
+    pub fn provider_for_id(&self, id: &str) -> Option<ProviderConfig> {
         self.providers
             .iter()
-            .find(|provider| provider.preset == preset)
+            .find(|provider| provider.id() == id)
             .cloned()
-            .or_else(|| (self.provider.preset == preset).then(|| self.provider.clone()))
+            .or_else(|| (self.provider.id() == id).then(|| self.provider.clone()))
     }
 
-    /// Inserts or replaces a profile by preset. Keeping this centralized also
-    /// prevents duplicate template additions from reaching the config file.
-    pub fn upsert_provider(&mut self, provider: ProviderConfig) {
+    /// Returns a saved connection profile by preset template. Built-in presets
+    /// map one-to-one onto ids, so this is the legacy form of
+    /// [`Self::provider_for_id`] retained for template-driven callers.
+    pub fn provider_for(&self, preset: ProviderPreset) -> Option<ProviderConfig> {
+        self.provider_for_id(preset.key_id())
+    }
+
+    /// Inserts or replaces a profile by its stable id. Keeping this centralized
+    /// also prevents duplicate additions from reaching the config file. An
+    /// empty id is stamped from the preset first, so template defaults always
+    /// land on a stable identity.
+    pub fn upsert_provider(&mut self, mut provider: ProviderConfig) {
+        provider.ensure_id();
+        let id = provider.id().to_owned();
         if let Some(existing) = self
             .providers
             .iter_mut()
-            .find(|existing| existing.preset == provider.preset)
+            .find(|existing| existing.id() == id)
         {
             *existing = provider;
         } else {
@@ -337,20 +356,53 @@ impl Config {
         }
     }
 
-    pub fn remove_provider(&mut self, preset: ProviderPreset) -> Option<ProviderConfig> {
+    /// Removes a profile by id. Callers that only have a preset template should
+    /// pass `preset.key_id()`.
+    pub fn remove_provider_by_id(&mut self, id: &str) -> Option<ProviderConfig> {
         let index = self
             .providers
             .iter()
-            .position(|provider| provider.preset == preset)?;
+            .position(|provider| provider.id() == id)?;
         Some(self.providers.remove(index))
     }
 
+    /// Whether `name` is already taken by a different saved profile or by a
+    /// built-in preset label. Comparison is trimmed and case-insensitive so the
+    /// provider picker can never show two indistinguishable rows. `exclude_id`
+    /// lets an existing profile keep its own name while being edited.
+    pub fn provider_name_taken(&self, name: &str, exclude_id: Option<&str>) -> bool {
+        let wanted = name.trim().to_lowercase();
+        if wanted.is_empty() {
+            return false;
+        }
+        if ProviderPreset::ALL
+            .iter()
+            .any(|preset| preset.label().to_lowercase() == wanted)
+        {
+            return true;
+        }
+        self.providers.iter().any(|provider| {
+            provider.id() != exclude_id.unwrap_or("")
+                && provider.name.trim().to_lowercase() == wanted
+        }) || (self.provider.id() != exclude_id.unwrap_or("")
+            && self.provider.name.trim().to_lowercase() == wanted)
+    }
+
+    pub fn remove_provider(&mut self, preset: ProviderPreset) -> Option<ProviderConfig> {
+        self.remove_provider_by_id(preset.key_id())
+    }
+
     fn ensure_provider_profiles(&mut self) {
+        // Stamp ids before de-duplicating so profiles written by older versions
+        // (no id) keep their preset key and cannot collide.
+        self.provider.ensure_id();
         let mut unique = Vec::with_capacity(self.providers.len() + 1);
-        for provider in std::mem::take(&mut self.providers) {
+        for mut provider in std::mem::take(&mut self.providers) {
+            provider.ensure_id();
+            let id = provider.id().to_owned();
             if let Some(existing) = unique
                 .iter_mut()
-                .find(|existing: &&mut ProviderConfig| existing.preset == provider.preset)
+                .find(|existing: &&mut ProviderConfig| existing.id() == id)
             {
                 *existing = provider;
             } else {

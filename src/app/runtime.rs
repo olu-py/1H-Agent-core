@@ -1,22 +1,45 @@
 use super::*;
 
+/// Resolves a saved provider profile for a cross-provider child agent by
+/// provider id. Built-in ids still fall back to their preset template so an
+/// unconfigured built-in remains usable; an unknown id (for example a deleted
+/// custom provider) is rejected rather than silently mapped elsewhere.
 pub(super) fn provider_config_resolver(
     config: &Config,
 ) -> Arc<crate::agent::ChildProviderResolver> {
     let providers = config.providers.clone();
     let default_provider = config.provider.clone();
     Arc::new(
-        move |preset: ProviderPreset| -> Result<crate::config::ProviderConfig, String> {
+        move |id: &str| -> Result<crate::config::ProviderConfig, String> {
             if let Some(provider) = providers
                 .iter()
-                .find(|provider| provider.preset == preset)
+                .find(|provider| provider.id() == id)
                 .cloned()
             {
                 return Ok(provider);
             }
-            if preset == default_provider.preset {
+            if default_provider.id() == id {
                 return Ok(default_provider.clone());
             }
+            // `agent_spawn` may name a saved custom provider instead of its
+            // opaque id; names are unique (case-insensitive) by construction.
+            if let Some(provider) = providers
+                .iter()
+                .find(|provider| {
+                    !provider.name.trim().is_empty()
+                        && provider.name.trim().eq_ignore_ascii_case(id)
+                })
+                .cloned()
+            {
+                return Ok(provider);
+            }
+            if !default_provider.name.trim().is_empty()
+                && default_provider.name.trim().eq_ignore_ascii_case(id)
+            {
+                return Ok(default_provider.clone());
+            }
+            let preset = ProviderPreset::parse(id)
+                .ok_or_else(|| format!("unknown provider id \"{id}\" for agent_spawn"))?;
             let mut provider_config = preset.defaults();
             provider_config
                 .validate()
@@ -28,8 +51,11 @@ pub(super) fn provider_config_resolver(
 
 /// Resolves a stored provider id/model pair for a session. Child sessions may
 /// reference a different provider than the current global setting; in that case
-/// the preset defaults are used (and must be valid, e.g. Qwen needs a real
-/// workspace URL configured via env or config).
+/// the saved profile (or the preset template when only the built-in id is
+/// known) is used, and must be valid (e.g. Qwen needs a real workspace URL
+/// configured via env or config). Legacy session rows that stored a bare preset
+/// name keep working because built-in ids equal their preset key and the
+/// fallback also parses the value as a preset.
 pub(super) fn session_provider_config(
     config: &Config,
     provider_id: &str,
@@ -39,10 +65,14 @@ pub(super) fn session_provider_config(
     if model.is_empty() {
         return None;
     }
-    let preset = ProviderPreset::parse(provider_id)?;
-    let mut provider_config = config
-        .provider_for(preset)
-        .unwrap_or_else(|| preset.defaults());
+    let mut provider_config = config.provider_for_id(provider_id).or_else(|| {
+        ProviderPreset::parse(provider_id).map(|preset| {
+            config
+                .provider_for(preset)
+                .unwrap_or_else(|| preset.defaults())
+        })
+    })?;
+    provider_config.ensure_id();
     provider_config.validate().ok()?;
     provider_config.model = model.to_owned();
     provider_config.normalize_thinking();
@@ -58,7 +88,7 @@ pub(super) fn build_runtime(
     registry: &Arc<ToolRegistry>,
     router_tx: &mpsc::Sender<RoutedEvent>,
     approval_lock: &Arc<Mutex<()>>,
-    active_secret: Option<&(ProviderPreset, String)>,
+    active_secret: Option<&(String, String)>,
     session_id: &str,
 ) -> SessionRuntime {
     let mut conversation = storage
@@ -105,9 +135,11 @@ pub(super) fn build_runtime(
     let child_allowed_tools = child_allowed_tools.unwrap_or_default();
     let child_provider_resolver = provider_config_resolver(config);
     let runtime_key = active_secret
-        .filter(|(preset, _)| *preset == provider_config.preset)
+        .filter(|(id, _)| id == provider_config.id())
         .map(|(_, api_key)| api_key.clone())
-        .or_else(|| secrets::api_key_cached_only(provider_config.preset).ok());
+        .or_else(|| {
+            secrets::api_key_cached_only(provider_config.preset, provider_config.id()).ok()
+        });
     let runner = runtime_key.as_ref().and_then(|api_key| {
         OpenAiClient::new_with_retry(
             provider_config.base_url.clone(),
@@ -292,7 +324,7 @@ pub(crate) fn activate_session(app: &mut App, session_id: String) -> Result<()> 
         .ok()
         .and_then(|(provider_id, model)| session_provider_config(&app.config, &provider_id, &model))
     {
-        let _ = secrets::api_key_cached(provider_config.preset);
+        let _ = secrets::api_key_cached(provider_config.preset, provider_config.id());
     }
     // Pulling a fresh target adds the current runtime to the parked set. Make
     // room before changing active state: unload one idle runtime, but never

@@ -9,6 +9,11 @@ use crate::{
 
 /// The provider popup is a small state machine: connected-profile list,
 /// template picker, then the existing field editor.
+///
+/// `Form` owns a whole `ProviderConfig` and is strictly transient (one popup at
+/// a time), so the variant size difference is not worth an indirection that
+/// every adapter would have to unwrap.
+#[allow(clippy::large_enum_variant)]
 pub enum SettingsState {
     List(ProviderList),
     Templates(TemplateList),
@@ -33,7 +38,7 @@ impl SettingsState {
         let connected = providers
             .iter()
             .filter_map(|provider| {
-                secrets::api_key_cached_only(provider.preset)
+                secrets::api_key_cached_only(provider.preset, provider.id())
                     .ok()
                     .map(|_| provider.preset)
             })
@@ -175,35 +180,36 @@ pub const FIELDS: &[FieldSpec] = &[
 pub struct SettingsForm {
     pub provider: ProviderConfig,
     pub api_key: String,
-    existing_key_preset: Option<ProviderPreset>,
-    available_key_presets: HashSet<ProviderPreset>,
+    existing_key_id: Option<String>,
+    available_key_ids: HashSet<String>,
     pub selected: usize,
 }
 
 impl SettingsForm {
-    pub fn new(provider: ProviderConfig, existing_key_preset: Option<ProviderPreset>) -> Self {
+    pub fn new(provider: ProviderConfig, existing_key_id: Option<String>) -> Self {
         Self {
             provider,
             api_key: String::new(),
-            existing_key_preset,
-            available_key_presets: HashSet::new(),
+            existing_key_id,
+            available_key_ids: HashSet::new(),
             selected: 0,
         }
     }
 
-    pub fn set_available_key_presets(&mut self, presets: HashSet<ProviderPreset>) {
-        self.available_key_presets = presets;
+    pub fn set_available_key_ids(&mut self, ids: HashSet<String>) {
+        self.available_key_ids = ids;
     }
 
     pub fn field(&self) -> SettingsField {
         FIELDS[self.selected].field
     }
 
-    /// Whether a key already exists for the currently selected preset (in the
-    /// running process, not the keyring). Drives the "********" placeholder.
+    /// Whether a key already exists for the currently edited provider (in the
+    /// running process, not the keyring). Keyed by provider id so distinct
+    /// custom providers never share the placeholder. Drives "********".
     pub fn has_existing_key(&self) -> bool {
-        self.existing_key_preset == Some(self.provider.preset)
-            || self.available_key_presets.contains(&self.provider.preset)
+        let id = self.provider.id();
+        self.existing_key_id.as_deref() == Some(id) || self.available_key_ids.contains(id)
     }
 
     pub fn move_selection(&mut self, direction: i32) {
@@ -313,14 +319,17 @@ impl SettingsForm {
         Ok(provider)
     }
 
-    pub fn resolve_api_key(&self, active: Option<&(ProviderPreset, String)>) -> Result<String> {
+    pub fn resolve_api_key(&self, active: Option<&(String, String)>) -> Result<String> {
         let entered = self.api_key.trim();
         if !entered.is_empty() {
             return Ok(entered.to_owned());
         }
         match active {
-            Some((preset, key)) if *preset == self.provider.preset => Ok(key.clone()),
-            _ => Ok(secrets::api_key_cached_only(self.provider.preset)?),
+            Some((id, key)) if id == self.provider.id() => Ok(key.clone()),
+            _ => Ok(secrets::api_key_cached_only(
+                self.provider.preset,
+                self.provider.id(),
+            )?),
         }
     }
 }
@@ -404,11 +413,24 @@ mod tests {
         let mut form = SettingsForm::new(ProviderPreset::DeepSeek.defaults(), None);
         assert!(!form.has_existing_key());
 
-        form.set_available_key_presets(HashSet::from([ProviderPreset::DeepSeek]));
+        form.set_available_key_ids(HashSet::from(["deepseek".to_owned()]));
         assert!(form.has_existing_key());
         assert_eq!(form.value(SettingsField::ApiKey), "********");
 
         form.provider = ProviderPreset::Qwen.defaults();
+        assert!(!form.has_existing_key());
+    }
+
+    #[test]
+    fn custom_profiles_with_distinct_ids_do_not_share_key_state() {
+        let mut first = ProviderPreset::Custom.defaults();
+        first.id = "custom-aaaa".into();
+        let mut form = SettingsForm::new(first, Some("custom-aaaa".to_owned()));
+        assert!(form.has_existing_key());
+
+        let mut second = ProviderPreset::Custom.defaults();
+        second.id = "custom-bbbb".into();
+        form.provider = second;
         assert!(!form.has_existing_key());
     }
 

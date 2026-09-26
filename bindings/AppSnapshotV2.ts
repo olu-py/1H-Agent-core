@@ -17,7 +17,15 @@ export type AppSnapshotV2 = { protocol_version: number,
 /**
  * Current process-global event cursor; subscribe from here.
  */
-event_cursor: bigint, active_session: string | null, sessions: Array<SessionStateDto>, provider: string, model: string, mode: string, 
+event_cursor: bigint, active_session: string | null, sessions: Array<SessionStateDto>, 
+/**
+ * Human-facing active provider label (preset label or custom name).
+ */
+provider: string, 
+/**
+ * Stable active provider id, for consumers that need to address it.
+ */
+provider_id: string, model: string, mode: string, 
 /**
  * Serialized pending approval of the oldest waiting session, if any.
  */

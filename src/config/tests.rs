@@ -265,6 +265,143 @@ fn initialized_empty_profile_list_is_not_repopulated() {
 }
 
 #[test]
+fn legacy_config_without_ids_gets_preset_keys() {
+    // A config written before ids existed has neither `id` nor `name`.
+    let toml = r#"
+[provider]
+preset = "deep_seek"
+kind = "responses"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+
+[[providers]]
+preset = "custom"
+kind = "chat_completions"
+base_url = "https://gateway.example/v1"
+model = "gateway-model"
+
+[[providers]]
+preset = "custom"
+kind = "chat_completions"
+base_url = "https://other.example/v1"
+model = "other-model"
+"#;
+    let mut config: Config = toml::from_str(toml).unwrap();
+    config.ensure_provider_profiles();
+
+    // The active `[provider]` profile is stamped from its parsed preset.
+    assert_eq!(config.provider.id(), "deepseek");
+    assert_eq!(config.provider.preset, ProviderPreset::DeepSeek);
+    // Both legacy custom rows derive the same id "custom", so the list stays
+    // de-duplicated (last-wins) and single-custom setups keep their key.
+    let custom = config.provider_for_id("custom").unwrap();
+    assert_eq!(custom.base_url, "https://other.example/v1");
+    assert_eq!(custom.model, "other-model");
+    assert_eq!(
+        config
+            .providers
+            .iter()
+            .filter(|provider| provider.id() == "custom")
+            .count(),
+        1
+    );
+    // The active DeepSeek profile was migrated into the saved list as well.
+    assert!(
+        config
+            .providers
+            .iter()
+            .any(|provider| provider.id() == "deepseek")
+    );
+}
+
+#[test]
+fn custom_profiles_with_distinct_ids_coexist() {
+    let mut config = Config::default();
+    let mut first = ProviderPreset::Custom.defaults();
+    first.id = "custom-aaaa".into();
+    first.name = "Gateway A".into();
+    first.model = "model-a".into();
+    let mut second = ProviderPreset::Custom.defaults();
+    second.id = "custom-bbbb".into();
+    second.name = "Gateway B".into();
+    second.model = "model-b".into();
+    config.upsert_provider(first);
+    config.upsert_provider(second);
+
+    assert_eq!(config.providers.len(), 2);
+    assert_eq!(
+        config.provider_for_id("custom-aaaa").unwrap().name,
+        "Gateway A"
+    );
+    assert_eq!(
+        config.provider_for_id("custom-bbbb").unwrap().name,
+        "Gateway B"
+    );
+}
+
+#[test]
+fn provider_name_taken_is_case_insensitive_and_ignores_self() {
+    let mut config = Config::default();
+    let mut gateway = ProviderPreset::Custom.defaults();
+    gateway.id = "custom-aaaa".into();
+    gateway.name = "My Gateway".into();
+    config.upsert_provider(gateway);
+
+    assert!(config.provider_name_taken("my gateway", None));
+    assert!(config.provider_name_taken("MY GATEWAY", Some("custom-bbbb")));
+    // The profile may keep its own name while being edited.
+    assert!(!config.provider_name_taken("My Gateway", Some("custom-aaaa")));
+    // Built-in labels are reserved too.
+    assert!(config.provider_name_taken("DeepSeek", None));
+    // Empty/whitespace names are never considered taken.
+    assert!(!config.provider_name_taken("   ", None));
+}
+
+#[test]
+fn provider_name_bounds_are_validated_and_trimmed() {
+    let mut provider = ProviderPreset::Custom.defaults();
+    provider.name = "  Padded  ".into();
+    provider.validate().unwrap();
+    assert_eq!(provider.name, "Padded");
+
+    provider.name = "x".repeat(crate::config::provider::MAX_PROVIDER_NAME_CHARS + 1);
+    assert!(provider.validate().is_err());
+
+    provider.name = "line\nbreak".into();
+    assert!(provider.validate().is_err());
+}
+
+#[test]
+fn enabled_models_round_trip_through_toml() {
+    let mut config = Config::default();
+    let mut provider = ProviderPreset::Custom.defaults();
+    provider.id = "custom-aaaa".into();
+    provider.name = "Gateway".into();
+    provider.enabled_models = vec!["model-a".into(), "model-b".into()];
+    config.upsert_provider(provider);
+
+    let encoded = toml::to_string(&config).unwrap();
+    let decoded: Config = toml::from_str(&encoded).unwrap();
+    assert_eq!(
+        decoded
+            .provider_for_id("custom-aaaa")
+            .unwrap()
+            .enabled_models,
+        vec!["model-a".to_owned(), "model-b".to_owned()]
+    );
+}
+
+#[test]
+fn new_custom_id_is_well_formed_and_unique() {
+    let first = ProviderConfig::new_custom_id();
+    let second = ProviderConfig::new_custom_id();
+    assert!(first.starts_with("custom-"));
+    assert_eq!(first.len(), "custom-".len() + 32);
+    assert!(first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    assert_ne!(first, second);
+}
+
+#[test]
 fn deprecated_main_agent_turn_limit_is_ignored() {
     // RuntimeConfig intentionally accepts and ignores this removed key so
     // existing user configuration continues to load.
