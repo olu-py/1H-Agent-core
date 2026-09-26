@@ -54,6 +54,24 @@ async fn provider_settings_reports_active_and_saved_profiles() {
 }
 
 #[tokio::test]
+async fn set_provider_accepts_an_unsaved_legacy_preset_name() {
+    let (_temp, handle) = test_handle().await;
+    // Phase-one compatibility: `set_provider("deepseek")` must resolve the
+    // legacy preset name to its template even before a saved profile exists,
+    // because old clients and pre-migration session rows still speak presets.
+    let error = handle
+        .set_provider("deepseek", "deepseek-v4-flash")
+        .await
+        .unwrap_err();
+    // The legacy preset name is recognized (not "unknown provider") and the
+    // error uses the family label, exactly as the pre-id implementation did.
+    assert_eq!(error.kind, ApiErrorKind::BadRequest);
+    assert!(error.message.contains("DeepSeek"), "{}", error.message);
+    let snapshot = handle.snapshot().await.unwrap();
+    assert_eq!(snapshot.provider_id, "openai");
+}
+
+#[tokio::test]
 async fn provider_models_merges_community_metadata_for_unreported_models() {
     let (temp, handle) = test_handle().await;
     // Seed the cache the way a refresh would: a provider list payload

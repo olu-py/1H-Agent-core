@@ -1228,8 +1228,13 @@ fn set_provider(engine: &mut Engine, provider_id: &str, model: &str) -> Result<(
         .config
         .provider_for_id(provider_id)
         .or_else(|| {
-            crate::config::ProviderPreset::parse(provider_id)
-                .and_then(|preset| engine.app.config.provider_for(preset))
+            crate::config::ProviderPreset::parse(provider_id).map(|preset| {
+                engine
+                    .app
+                    .config
+                    .provider_for(preset)
+                    .unwrap_or_else(|| preset.defaults())
+            })
         })
         .ok_or_else(|| ApiError::bad_request(format!("unknown provider {provider_id}")))?;
     let target_id = target.id().to_owned();
