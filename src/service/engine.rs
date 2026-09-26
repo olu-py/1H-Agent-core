@@ -1228,8 +1228,13 @@ fn set_provider(engine: &mut Engine, provider_id: &str, model: &str) -> Result<(
         .config
         .provider_for_id(provider_id)
         .or_else(|| {
-            crate::config::ProviderPreset::parse(provider_id)
-                .and_then(|preset| engine.app.config.provider_for(preset))
+            crate::config::ProviderPreset::parse(provider_id).map(|preset| {
+                engine
+                    .app
+                    .config
+                    .provider_for(preset)
+                    .unwrap_or_else(|| preset.defaults())
+            })
         })
         .ok_or_else(|| ApiError::bad_request(format!("unknown provider {provider_id}")))?;
     let target_id = target.id().to_owned();
@@ -1269,11 +1274,10 @@ fn set_provider_config(
     provider
         .validate()
         .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
-    // New custom providers must carry a non-empty, unique name; built-ins and
-    // legacy unnamed custom profiles may keep an empty name (label fallback).
-    if preset == crate::config::ProviderPreset::Custom && provider.name.trim().is_empty() {
-        return Err(ApiError::bad_request("自定义供应商名称不能为空"));
-    }
+    // Uniqueness is enforced for any non-empty name; empty names are allowed
+    // here so legacy unnamed custom profiles stay editable (they display their
+    // preset label). The *create* path refuses an empty custom name in
+    // `set_provider_profile`, where "new" is actually known.
     if engine
         .app
         .config
@@ -1385,6 +1389,17 @@ fn set_provider_profile(
     // to the preset label and must not overwrite it with a stale name.
     if let Some(name) = name {
         profile.name = name;
+    }
+    if creating {
+        // A brand-new custom provider must be named up front. The name is also
+        // uniqueness-checked in `set_provider_config`.
+        if template == crate::config::ProviderPreset::Custom && profile.name.trim().is_empty() {
+            return Err(ApiError::bad_request("自定义供应商名称不能为空"));
+        }
+        // The id did not exist when the client stored the key, so it can only
+        // be cached under the family id; adopt it so the first run works and
+        // the key is re-found after a restart.
+        crate::secrets::promote_cached_family_key(template, &profile.id);
     }
     if let Some(models) = enabled_models {
         profile.enabled_models = models;

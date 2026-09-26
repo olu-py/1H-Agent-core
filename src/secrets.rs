@@ -158,6 +158,25 @@ pub fn redact(input: &str) -> String {
         .join(" ")
 }
 
+/// Adopts a key the caller cached under the template's family id onto a
+/// freshly minted provider id. A new custom provider is created inside the core,
+/// so the client can only have stored its key before the id existed (under the
+/// family key, e.g. `"custom"`). Copying it to the real id - keyring included -
+/// keeps the first activation working and the key discoverable after restart.
+/// Cache-only on the source: environment-provided keys are already resolved by
+/// family at request time and must not be written into the keyring.
+pub fn promote_cached_family_key(preset: ProviderPreset, to_id: &str) -> bool {
+    let from_id = preset.key_id();
+    if from_id == to_id || cached_key(to_id).is_some() {
+        return false;
+    }
+    let Some(Ok(key)) = cached_key(from_id) else {
+        return false;
+    };
+    let _ = store_api_key_cached(preset, to_id, &key);
+    true
+}
+
 /// Seeds the process key cache with a fake key for a built-in preset id.
 /// Test-only: makes `build_app` create a runner without touching the OS
 /// keyring, so core tests are deterministic regardless of what other tests
