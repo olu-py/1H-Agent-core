@@ -399,6 +399,107 @@ async fn duplicate_and_empty_custom_names_are_rejected() {
 }
 
 #[tokio::test]
+async fn legacy_unnamed_custom_profile_stays_editable() {
+    // A profile written before custom names existed must not be force-renamed
+    // or rejected: only *creating* a new custom provider requires a name.
+    let (_temp, handle) = test_handle().await;
+    let mut legacy = crate::config::ProviderPreset::Custom.defaults();
+    legacy.id = "custom".to_owned();
+    legacy.name = String::new();
+    handle.set_provider_config(legacy).await.unwrap();
+
+    handle
+        .set_provider_profile(
+            "custom",
+            crate::config::ProviderPreset::Custom,
+            None,
+            "model-legacy",
+            Some("https://legacy.example/v1"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let settings = handle.provider_settings().await.unwrap();
+    assert_eq!(settings.active.id, "custom");
+    assert_eq!(settings.active.model, "model-legacy");
+}
+
+#[tokio::test]
+async fn renaming_a_custom_provider_to_its_own_name_is_allowed() {
+    let (_temp, handle) = test_handle().await;
+    handle
+        .set_provider_profile(
+            "",
+            crate::config::ProviderPreset::Custom,
+            Some("Gateway"),
+            "model-a",
+            Some("https://a.example/v1"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let id = handle.provider_settings().await.unwrap().active.id.clone();
+
+    // Editing the same profile keeps its own name (case-insensitive self-match
+    // must not count as a duplicate).
+    handle
+        .set_provider_profile(
+            &id,
+            crate::config::ProviderPreset::Custom,
+            Some("GATEWAY"),
+            "model-a2",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        handle.provider_settings().await.unwrap().active.name,
+        "GATEWAY"
+    );
+}
+
+#[tokio::test]
+async fn a_key_cached_under_the_family_id_is_promoted_to_the_new_custom_id() {
+    // The client stores the key before the core has minted the custom id, so it
+    // can only be cached under the family id. Creating the provider must adopt
+    // it, otherwise the freshly created profile would be reported disconnected.
+    let (_temp, handle) = test_handle().await;
+    crate::secrets::test_seed_key(crate::config::ProviderPreset::Custom, "family-key");
+    handle
+        .set_provider_profile(
+            "",
+            crate::config::ProviderPreset::Custom,
+            Some("Gateway"),
+            "model-a",
+            Some("https://a.example/v1"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let settings = handle.provider_settings().await.unwrap();
+    let id = settings.active.id.clone();
+    assert!(id.starts_with("custom-"), "{id}");
+    assert!(
+        settings.connected.contains(&id),
+        "the promoted key makes the new provider connected: {:?}",
+        settings.connected
+    );
+    assert_eq!(
+        crate::secrets::api_key_cached_only(crate::config::ProviderPreset::Custom, &id).unwrap(),
+        "family-key"
+    );
+}
+
+#[tokio::test]
 async fn enabled_models_round_trip_through_settings() {
     let (_temp, handle) = test_handle().await;
     handle
