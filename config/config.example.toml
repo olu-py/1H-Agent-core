@@ -1,4 +1,12 @@
 [provider]
+# Stable identity for this connection profile (used by session rows, the OS
+# keyring entry, and cross-provider child agents). Built-ins default to their
+# preset key when omitted; a custom provider gets a generated `custom-<uuid>`.
+# id = "openai"
+# Optional display name. Built-ins and legacy profiles leave it empty and fall
+# back to the preset label; a new custom provider requires a non-empty, unique
+# name (<= 64 chars).
+# name = ""
 preset = "open_ai"
 kind = "responses"
 base_url = "https://api.openai.com/v1"
@@ -22,9 +30,12 @@ retry_initial_backoff_ms = 500
 retry_max_backoff_ms = 8000
 
 # Saved provider connections are managed by the Provider settings screen.
-# Each preset may appear once; API keys remain in the OS keyring and are never
-# written here. Older configs with only `[provider]` are migrated on save.
+# Each built-in preset may appear once; custom providers may be added
+# repeatedly, each with its own `id` and unique `name`. API keys remain in the
+# OS keyring (keyed by `id`) and are never written here. Older configs with only
+# `[provider]` are migrated on save.
 # [[providers]]
+# id = "deepseek"
 # preset = "deep_seek"
 # kind = "responses"
 # base_url = "https://api.deepseek.com"
@@ -32,6 +43,18 @@ retry_max_backoff_ms = 8000
 # thinking_level = "high"
 # use_previous_response_id = false
 # native_web_search = "auto"
+#
+# A named custom provider (repeatable). `enabled_models` is reserved for a
+# future selectable-model picker; empty means "unrestricted" and it is not yet
+# enforced when building requests.
+# [[providers]]
+# id = "custom-0123456789abcdef0123456789abcdef"
+# name = "Gateway A"
+# preset = "custom"
+# kind = "chat_completions"
+# base_url = "https://gateway.example/v1"
+# model = "my-model"
+# enabled_models = []
 
 [ui]
 context_meter = true

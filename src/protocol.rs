@@ -311,7 +311,10 @@ pub struct AppSnapshotV2 {
     pub event_cursor: u64,
     pub active_session: Option<String>,
     pub sessions: Vec<SessionStateDto>,
+    /// Human-facing active provider label (preset label or custom name).
     pub provider: String,
+    /// Stable active provider id, for consumers that need to address it.
+    pub provider_id: String,
     pub model: String,
     pub mode: String,
     /// Serialized pending approval of the oldest waiting session, if any.
@@ -334,24 +337,34 @@ pub struct PartialDto {
     pub created_at: String,
 }
 
-/// A non-secret provider connection profile for settings screens. `preset` is
-/// the `ProviderPreset` key id (`"deepseek"`) - the same identifier the
-/// set-provider endpoint accepts - and `kind` is the `ProviderKind` wire tag
-/// (`"responses"` / `"chat_completions"`). API keys are never part of any DTO.
+/// A non-secret provider connection profile for settings screens. `id` is the
+/// stable provider identity the set-provider endpoint accepts (a built-in preset
+/// key such as `"deepseek"`, or a generated `"custom-<uuid>"`); `preset` is the
+/// template/family key (`"deepseek"`, `"custom"`, …) and `kind` is the
+/// `ProviderKind` wire tag (`"responses"` / `"chat_completions"`). `name` and
+/// `enabled_models` are reserved for named custom providers and a future
+/// selectable model list. API keys are never part of any DTO.
 #[derive(Clone, Debug, Serialize, TS)]
 #[ts(export)]
 pub struct ProviderProfileDto {
+    pub id: String,
     pub preset: String,
+    /// Display name for a named provider; empty for built-ins (the UI falls
+    /// back to the preset label).
+    pub name: String,
     pub kind: String,
     pub model: String,
     pub base_url: String,
+    /// Models the user selected for this provider. Empty means "unrestricted";
+    /// reserved for a future model-picker and not yet enforced at request time.
+    pub enabled_models: Vec<String>,
 }
 
 /// Provider settings for `GET /api/v2/config/provider`: the active profile,
-/// the saved per-preset profiles, and which presets currently have a usable
-/// API key (cache-only lookup: startup unlock, environment preload, and keys
-/// stored during this run). Absence from `connected` means "no key resolved
-/// yet", not a definitive "never configured".
+/// the saved profiles, and which provider ids currently have a usable API key
+/// (cache-only lookup: startup unlock, environment preload, and keys stored
+/// during this run). Absence from `connected` means "no key resolved yet", not
+/// a definitive "never configured".
 #[derive(Clone, Debug, Serialize, TS)]
 #[ts(export)]
 pub struct ProviderSettingsDto {

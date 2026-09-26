@@ -765,7 +765,7 @@ fn submit_while_busy_is_rejected_without_overwriting_task() {
     let temp = TempDir::new().unwrap();
     let mut app = test_app(&temp);
     crate::secrets::test_seed_key(app.config.provider.preset, "test-key");
-    app.active_secret = Some((app.config.provider.preset, "test-key".into()));
+    app.active_secret = Some((app.config.provider.id().to_owned(), "test-key".into()));
     rebuild_runner(&mut app).unwrap();
     assert!(app.current.runner.is_some());
 

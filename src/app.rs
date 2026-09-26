@@ -59,7 +59,9 @@ pub struct App {
     pub(crate) config: Config,
     pub(crate) registry: Arc<ToolRegistry>,
     pub(crate) approval_lock: Arc<Mutex<()>>,
-    pub(crate) active_secret: Option<(ProviderPreset, String)>,
+    /// The active provider's resolved key, tagged by provider id (not preset:
+    /// several custom providers share the `custom` template).
+    pub(crate) active_secret: Option<(String, String)>,
     pub(crate) active_session: String,
     pub current: SessionRuntime,
     pub(crate) background: HashMap<String, SessionRuntime>,
@@ -103,28 +105,29 @@ pub(crate) async fn build_app(
         .ok()
         .and_then(|(provider_id, model)| session_provider_config(&config, &provider_id, &model))
     {
-        if provider_config.preset != config.provider.preset {
-            let _ = secrets::api_key_cached(provider_config.preset);
+        if provider_config.id() != config.provider.id() {
+            let _ = secrets::api_key_cached(provider_config.preset, provider_config.id());
         }
     }
-    let (active_secret, initial_status) = match secrets::api_key_cached(config.provider.preset) {
-        Ok(api_key) => (
-            Some((config.provider.preset, api_key)),
-            format!(
-                "Ready | {} | {}",
-                config.provider.preset.label(),
-                config.provider.model
+    let (active_secret, initial_status) =
+        match secrets::api_key_cached(config.provider.preset, config.provider.id()) {
+            Ok(api_key) => (
+                Some((config.provider.id().to_owned(), api_key)),
+                format!(
+                    "Ready | {} | {}",
+                    config.provider.preset.label(),
+                    config.provider.model
+                ),
             ),
-        ),
-        Err(secrets::SecretError::Missing(_)) => (None, "需要配置提供商".into()),
-        Err(error) => (
-            None,
-            format!(
-                "系统密钥环读取失败：{}",
-                secrets::redact(&error.to_string())
+            Err(secrets::SecretError::Missing(_)) => (None, "需要配置提供商".into()),
+            Err(error) => (
+                None,
+                format!(
+                    "系统密钥环读取失败：{}",
+                    secrets::redact(&error.to_string())
+                ),
             ),
-        ),
-    };
+        };
     let initial_mode = storage
         .session_mode(&session_id)
         .ok()
@@ -208,37 +211,38 @@ pub(crate) fn stamp_discovered_meta(
     discovered
 }
 
-pub(crate) fn apply_provider_choice(app: &mut App, preset: ProviderPreset) -> Result<()> {
-    if preset == app.config.provider.preset {
+/// Switches the active provider to the saved profile with `id`. Legacy callers
+/// that only hold a preset template should pass `preset.key_id()`.
+pub(crate) fn apply_provider_choice_by_id(app: &mut App, id: &str) -> Result<()> {
+    if id == app.config.provider.id() {
         return Ok(());
     }
-    let Some(provider) = app.config.provider_for(preset) else {
+    let Some(provider) = app.config.provider_for_id(id) else {
         app.current.status = "供应商连接不存在".into();
         return Ok(());
     };
+    let provider_id = provider.id().to_owned();
+    let preset = provider.preset;
+    let label = provider.display_label().to_owned();
     let api_key = app
         .active_secret
         .as_ref()
-        .filter(|(active, _)| *active == preset)
+        .filter(|(active, _)| active == &provider_id)
         .map(|(_, key)| key.clone())
-        .or_else(|| secrets::api_key_cached(preset).ok());
+        .or_else(|| secrets::api_key_cached(preset, &provider_id).ok());
     let Some(api_key) = api_key else {
-        app.current.status = format!("{} 的 API Key 不可用，请在供应商设置中补充", preset.label());
+        app.current.status = format!("{label} 的 API Key 不可用，请在供应商设置中补充");
         return Ok(());
     };
 
     app.storage.clear_response_id(&app.current.session_id)?;
     app.config.provider = provider;
-    app.active_secret = Some((preset, api_key));
+    app.active_secret = Some((provider_id, api_key));
     stamp_discovered_meta(&mut app.config, &app.storage);
     app.current.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
     rebuild_runner(app)?;
     app.current.status = match app.config.save() {
-        Ok(()) => format!(
-            "已切换到 {} · {}",
-            preset.label(),
-            app.config.provider.model
-        ),
+        Ok(()) => format!("已切换到 {label} · {}", app.config.provider.model),
         Err(error) => format!(
             "供应商已切换；配置保存失败：{}",
             secrets::redact(&error.to_string())

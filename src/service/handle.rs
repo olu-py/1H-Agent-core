@@ -245,12 +245,13 @@ impl AppHandle {
             .map_err(|_| ApiError::internal("command dropped"))?
     }
 
-    /// Applies non-secret provider settings (preset + model). API keys stay in
-    /// the OS keyring.
-    pub async fn set_provider(&self, preset: &str, model: &str) -> Result<(), ApiError> {
+    /// Applies non-secret provider settings (provider id + model). Built-in
+    /// presets pass their preset key; a custom provider passes its generated id.
+    /// API keys stay in the OS keyring.
+    pub async fn set_provider(&self, provider_id: &str, model: &str) -> Result<(), ApiError> {
         let (tx, rx) = oneshot::channel();
         self.send(CoreCommand::SetProvider {
-            preset: preset.to_owned(),
+            provider_id: provider_id.to_owned(),
             model: model.to_owned(),
             reply: tx,
         })
@@ -278,28 +279,36 @@ impl AppHandle {
     }
 
     /// Applies a settings-screen provider edit: `model` plus optional
-    /// `base_url` and protocol onto the current or saved profile of `preset`
-    /// (a fresh preset template when nothing is saved). `context_window_tokens`
-    /// optionally overrides the merged profile's explicit window (clamped to
-    /// the same bounds as `Config::load`); `None` keeps the merged value.
-    /// The caller stores any new API key in the OS keyring (e.g.
-    /// `secrets::store_api_key_cached`) *before* calling this so the rebuilt
-    /// runner picks it up.
+    /// `name`, `base_url`, protocol and `enabled_models` onto the profile
+    /// addressed by `provider_id`. An empty `provider_id` creates a new profile
+    /// from `template` (a generated `custom-<uuid>` id for the custom template);
+    /// `context_window_tokens` optionally overrides the merged profile's
+    /// explicit window (clamped to the same bounds as `Config::load`); `None`
+    /// keeps the merged value. The caller stores any new API key in the OS
+    /// keyring (e.g. `secrets::store_api_key_cached`) *before* calling this so
+    /// the rebuilt runner picks it up.
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_provider_profile(
         &self,
-        preset: crate::config::ProviderPreset,
+        provider_id: &str,
+        template: crate::config::ProviderPreset,
+        name: Option<&str>,
         model: &str,
         base_url: Option<&str>,
         kind: Option<crate::config::ProviderKind>,
         context_window_tokens: Option<u64>,
+        enabled_models: Option<Vec<String>>,
     ) -> Result<(), ApiError> {
         let (tx, rx) = oneshot::channel();
         self.send(CoreCommand::SetProviderProfile {
-            preset,
+            provider_id: provider_id.to_owned(),
+            template,
+            name: name.map(str::to_owned),
             model: model.to_owned(),
             base_url: base_url.map(str::to_owned),
             kind,
             context_window_tokens,
+            enabled_models,
             reply: tx,
         })
         .await?;
@@ -334,15 +343,15 @@ impl AppHandle {
             .map_err(|_| ApiError::internal("command dropped"))?
     }
 
-    /// Removes a saved provider profile, switching the active provider when it
-    /// was the one removed. The API key stays in the OS keyring.
-    pub async fn remove_provider(
-        &self,
-        preset: crate::config::ProviderPreset,
-    ) -> Result<(), ApiError> {
+    /// Removes a saved provider profile by id, switching the active provider
+    /// when it was the one removed. The API key stays in the OS keyring.
+    pub async fn remove_provider(&self, provider_id: &str) -> Result<(), ApiError> {
         let (tx, rx) = oneshot::channel();
-        self.send(CoreCommand::RemoveProvider { preset, reply: tx })
-            .await?;
+        self.send(CoreCommand::RemoveProvider {
+            provider_id: provider_id.to_owned(),
+            reply: tx,
+        })
+        .await?;
         rx.await
             .map_err(|_| ApiError::internal("command dropped"))?
     }

@@ -38,8 +38,10 @@ use child::{
     ChildArgs, ChildCancellationGuard, child_title, infer_child_provider, validate_child_model,
 };
 
+/// Resolves a saved provider profile for a cross-provider child agent from its
+/// stable provider id (built-in preset key or a generated custom id).
 pub(crate) type ChildProviderResolver =
-    dyn Fn(ProviderPreset) -> Result<ProviderConfig, String> + Send + Sync;
+    dyn Fn(&str) -> Result<ProviderConfig, String> + Send + Sync;
 
 /// Upper bound for a single persisted thinking summary. Matches the UI's live
 /// thinking buffer limit so the stored summary and the displayed summary stay

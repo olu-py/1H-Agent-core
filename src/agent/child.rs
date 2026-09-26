@@ -345,23 +345,31 @@ impl AgentRunner {
             .cloned()
     }
 
+    /// Resolves the child agent's provider. `requested_provider` is the
+    /// `agent_spawn` value (a provider id, or a legacy preset name) after
+    /// trimming; `None` lets the model/current provider decide. The resolved
+    /// profile always carries a stable id, and the returned client uses that
+    /// id's key.
     fn resolve_child_provider(
         &self,
-        requested_preset: Option<ProviderPreset>,
+        requested_provider: Option<String>,
         requested_model: Option<&str>,
     ) -> Result<(OpenAiClient, ProviderConfig), String> {
         let model = requested_model
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(str::to_owned);
-        let preset = match requested_preset {
-            Some(preset) => preset,
+        let current_id = self.provider_config.id().to_owned();
+        let provider_id = match requested_provider {
+            Some(id) => id,
             None => match &model {
-                Some(model) => infer_child_provider(model, self.provider_config.preset),
-                None => self.provider_config.preset,
+                Some(model) => infer_child_provider(model, self.provider_config.preset)
+                    .key_id()
+                    .to_owned(),
+                None => current_id.clone(),
             },
         };
-        let (provider, mut provider_config) = if preset == self.provider_config.preset {
+        let (provider, mut provider_config) = if provider_id == current_id {
             (self.provider.clone(), self.provider_config.clone())
         } else {
             let resolver = self.child_provider_resolver.as_ref().ok_or_else(|| {
@@ -370,13 +378,15 @@ impl AgentRunner {
                     self.provider_config.preset.label()
                 )
             })?;
-            let mut provider_config = resolver(preset)?;
+            let mut provider_config = resolver(&provider_id)?;
+            provider_config.ensure_id();
             provider_config
                 .validate()
                 .map_err(|error| format!("invalid child provider configuration: {error}"))?;
             provider_config.normalize_thinking();
             let api_key =
-                secrets::api_key_cached_only(preset).map_err(|error| error.to_string())?;
+                secrets::api_key_cached_only(provider_config.preset, provider_config.id())
+                    .map_err(|error| error.to_string())?;
             let provider = OpenAiClient::new_with_retry(
                 provider_config.base_url.clone(),
                 api_key,
@@ -582,15 +592,15 @@ impl AgentRunner {
             .or_else(|| configured_agent.as_ref().map(|agent| agent.max_turns))
             .unwrap_or(0);
 
-        let requested_preset = match arguments.provider.as_deref().map(str::trim) {
+        // `provider` accepts a saved provider id (built-in preset key such as
+        // "deepseek", or a custom id such as "custom-<uuid>") as well as a
+        // legacy preset name; the resolver validates the value.
+        let requested_provider = match arguments.provider.as_deref().map(str::trim) {
             Some("") | None => None,
-            Some(name) => Some(
-                ProviderPreset::parse(name)
-                    .ok_or_else(|| format!("unknown provider preset \"{name}\" for agent_spawn"))?,
-            ),
+            Some(name) => Some(name.to_owned()),
         };
         let (provider, provider_config) =
-            self.resolve_child_provider(requested_preset, arguments.model.as_deref())?;
+            self.resolve_child_provider(requested_provider, arguments.model.as_deref())?;
 
         // Create a nested session so the child's work is inspectable from the
         // session panel, using its own provider/model when one was requested.
@@ -614,7 +624,7 @@ impl AgentRunner {
             .create_child_session(
                 Path::new(&workspace),
                 &self.session_id,
-                provider_config.preset.key_id(),
+                provider_config.id(),
                 &provider_config.model,
                 &title,
                 child_mode,
