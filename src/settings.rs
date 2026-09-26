@@ -85,13 +85,17 @@ impl SettingsState {
         let Self::List(list) = self else {
             return;
         };
+        // Built-ins are one-profile-per-template, so an already-saved family
+        // is hidden. The `custom` template is multi-instance: it stays
+        // selectable forever so the user can keep adding named providers.
         let presets = ProviderPreset::ALL
             .into_iter()
             .filter(|preset| {
-                !list
-                    .providers
-                    .iter()
-                    .any(|provider| provider.preset == *preset)
+                *preset == ProviderPreset::Custom
+                    || !list
+                        .providers
+                        .iter()
+                        .any(|provider| provider.preset == *preset)
             })
             .collect();
         *self = Self::Templates(TemplateList {
@@ -375,6 +379,9 @@ mod tests {
         assert!(!templates.presets.contains(&ProviderPreset::OpenAi));
         assert!(!templates.presets.contains(&ProviderPreset::DeepSeek));
         assert!(templates.presets.contains(&ProviderPreset::Qwen));
+        // The custom template is multi-instance and must stay offered even
+        // after one custom profile has been saved.
+        assert!(templates.presets.contains(&ProviderPreset::Custom));
     }
 
     #[test]
