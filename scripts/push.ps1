@@ -108,4 +108,4 @@ Write-Host "[push] remote sha : $remoteSha"
 if ($remoteSha -ne $localSha) {
     throw "remote $Branch ($remoteSha) does not match local ($localSha) after push."
 }
-Write-Host '[push] verified remote branch matches the local commit.'
+Write-Host '[push] verified remote branch matches the local commit.'# guard probe (will be reverted)
