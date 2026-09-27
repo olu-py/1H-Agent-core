@@ -105,6 +105,15 @@ Squash 或 rebase 合并可能产生不同于 head 分支的合并 SHA；验收�
 
 涉及 core 和 TUI/WebUI 的变更必须按仓库分别完成、分别验证：先合并并同步 core，再在消费端更新 Git 依赖和 `Cargo.lock`，协议变更还要从锁定的 core checkout 同步 bindings/fixtures，最后验证并单独提交消费端 PR。Cargo path patch 仅供本地联调；交付前移除 patch，确认锁文件来源是 Git，并以 `--locked` 验证。完整约束见 [Core 发布与消费端更新指南](guides/release.md)。
 
+## 直推 main 的例外
+
+默认仍走功能分支 + PR。仅当用户在当前任务中明确要求直推，且 diff 的每个文件都是文档级改动（仅 `*.md`、纯注释行、纯格式/行尾）时，才允许直接 push `main`：
+
+```bash
+pwsh -File scripts/push.ps1 -Branch main -AllowMain
+```
+
+推送前先 `git fetch` 并要求本地 `main` 等于 `origin/main`；推送后必须确认新 head 的 CI 结论，失败时用新的 revert 提交回滚（绝不 force），并在报告中给出旧 SHA、新 SHA 与 CI 结果。脚本、workflow、`Cargo.toml`/`Cargo.lock`、`src/**` 等即使只改一行也必须走 PR。本地可用 `pwsh -File scripts/install-hooks.ps1` 启用 `.githooks/pre-push` 兜底，CI 由 `.github/workflows/main-guard.yml` 复核。
 ## 异常处理与暂停条件
 
 | 情况 | 处理 |
@@ -115,6 +124,7 @@ Squash 或 rebase 合并可能产生不同于 head 分支的合并 SHA；验收�
 | PR 已关闭但合并状态不明 | 读取 PR 的 merged 状态和 merge SHA；未确认前不报告已完成。 |
 | 合并成功但本地未对齐 | fetch、切换默认分支并尝试 `--ff-only`；失败时保留本地提交，查明分歧后再选方案。 |
 | 需要强制覆盖、删除独有提交或绕过保护规则 | 停止并提供影响明确的选项，取得用户决定后再继续。 |
+| 直推 main 被 hook 或 CI 拒绝 | 说明改动不是纯文档；改为功能分支 + PR，或先 revert 再交付。 |
 
 ## 最终报告
 
