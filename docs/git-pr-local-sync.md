@@ -129,5 +129,3 @@ pwsh -File scripts/push.ps1 -Branch main -AllowMain
 ## 最终报告
 
 简要列出仓库、功能分支与提交 SHA、PR 链接和合并状态、合并 SHA、本地默认分支与远端 SHA 是否一致、工作区是否干净、验证结果及未执行项。若任一完成条件未满足，明确标记为未完成及具体阻碍。
-
-本文件同时受 .githooks/pre-push 与 .github/workflows/main-guard.yml 保护。
