@@ -1,0 +1,3 @@
+bindings/** text eol=lf
+conformance/** text eol=lf
+.githooks/** text eol=lf
