@@ -54,3 +54,5 @@ excluded: TUI/WebUI/Desktop 源码、HTTP/SSE 服务器、内置浏览器、远�
 | 发布给消费端 | 完整验证后先提交并 push core；再由 TUI/WebUI 各自更新锁文件与适配 |
 
 保持改动聚焦，复用现有 helper，不清理无法证明无用的文件。事件/协议/持久化类型改动必须覆盖所有构造点、match、序列化与恢复测试。本仓库自 1H-Agent 提取（消费端项目各自持有前端源码）；未运行的检查必须在最终回复说明。
+
+构建产物只落在仓库默认 `target/`：不得用 `CARGO_TARGET_DIR` 为工具链或用途另开目录（同一目录内 rustc 版本与 SourceId 的产物各按指纹共存、互不驱逐，分开只会重复编译）；中间产物由 `$CARGO_HOME/config.toml` 的 `build.build-dir` 在仓库间共享，因此**不要运行 `cargo clean`**——它会清空共享缓存、让三个仓库一起冷启，需要回收空间时直接删除缓存目录，单包清理用 `cargo clean -p <包名>`。本仓库的 MSRV 档位（CI 的 `minimum-rust`）与 stable 产物同目录共存。
