@@ -60,4 +60,60 @@ grep -Fq 'patch."https://github.com/olu-py/1H-Agent-core.git"' "$repo_root/READM
 grep -Fq '本地 path patch' "$root_doc" \
     || fail "AGENTS.md does not require the local core integration workflow"
 
+# --- 事实闸门 1：MSRV 声明必须与 ci.yml 的 minimum-rust 档位一致 -----------------
+# 体积闸门管不住"写下即错的版本号"（姊妹仓库 webUI 曾声明 1.85 而依赖要求 1.88，
+# 且没有任何 job 覆盖）。两处必须一致，改一个忘一个就会被拦下。
+norm_version() {
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "${1#v}"
+    printf '%s.%s.%s' "${major:-0}" "${minor:-0}" "${patch:-0}"
+}
+workflow="$repo_root/.github/workflows/ci.yml"
+declared_msrv="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$repo_root/Cargo.toml" | sort -u)"
+test -n "$declared_msrv" || fail "Cargo.toml does not declare rust-version"
+test "$(printf '%s\n' "$declared_msrv" | wc -l | tr -d ' ')" -eq 1 \
+    || fail "Cargo.toml declares conflicting rust-version values: $(printf '%s' "$declared_msrv" | tr '\n' ' ')"
+ci_msrv="$(sed -n '/^  minimum-rust:/,/^  [a-z][a-z0-9-]*:/p' "$workflow" \
+    | sed -n 's/^[[:space:]]*toolchain:[[:space:]]*"\{0,1\}\([0-9][^"]*\)"\{0,1\}[[:space:]]*$/\1/p' \
+    | head -n1)"
+test -n "$ci_msrv" || fail "ci.yml has no minimum-rust job toolchain"
+test "$(norm_version "$declared_msrv")" = "$(norm_version "$ci_msrv")" \
+    || fail "Cargo.toml rust-version ($declared_msrv) does not match ci.yml minimum-rust ($ci_msrv)"
+
+# --- 事实闸门 2：ci.yml 的 check 名必须与 release 指南的 required checks 清单一致 --
+# 新增 job 忘改文档（或文档承诺了不存在的 check）都会被拦下；matrix 模板按
+# check-name 取值展开后再比对。
+release_guide="$repo_root/docs/guides/release.md"
+jobs_block="$(sed -n '/^jobs:/,$p' "$workflow")"
+ci_names="$(printf '%s\n' "$jobs_block" | awk '
+    /^  [a-z][a-z0-9-]*:[[:space:]]*$/ { injob = 1; next }
+    injob && /^    name:[[:space:]]/ { sub(/^    name:[[:space:]]*/, ""); print; injob = 0 }
+')"
+matrix_values="$(printf '%s\n' "$jobs_block" | sed -n 's/^[[:space:]]*-[[:space:]]*check-name:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p')"
+expanded_names=""
+while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    case "$name" in
+        *'${{ matrix.check-name }}'*)
+            while IFS= read -r value; do
+                [ -n "$value" ] || continue
+                expanded_names="${expanded_names}${name//'${{ matrix.check-name }}'/$value}"$'\n'
+            done <<< "$matrix_values"
+            ;;
+        *) expanded_names="${expanded_names}${name}"$'\n' ;;
+    esac
+done <<< "$ci_names"
+# 取该行第一段"以顿号分隔的连续反引号串"——check 清单就是这种写法；行内别处的
+# 反引号（本仓库行首有 `main`、行尾有 `core-upgrade.yml`）不会被卷进来。
+doc_names="$(grep -F 'required checks' "$release_guide" \
+    | grep -oE '(`[^`]+`、)+`[^`]+`' | head -n1 | grep -oE '`[^`]+`' | tr -d '`' | sort -u)"
+test -n "$doc_names" || fail "release guide does not list required checks"
+ci_sorted="$(printf '%s' "$expanded_names" | sed '/^$/d' | sort -u)"
+missing_in_doc="$(comm -23 <(printf '%s\n' "$ci_sorted") <(printf '%s\n' "$doc_names"))"
+missing_in_ci="$(comm -13 <(printf '%s\n' "$ci_sorted") <(printf '%s\n' "$doc_names"))"
+[ -z "$missing_in_doc" ] \
+    || fail "ci.yml checks missing from the release guide: $(printf '%s' "$missing_in_doc" | tr '\n' ' ')"
+[ -z "$missing_in_ci" ] \
+    || fail "release guide lists unknown checks: $(printf '%s' "$missing_in_ci" | tr '\n' ' ')"
+
 echo "agent docs check passed"
