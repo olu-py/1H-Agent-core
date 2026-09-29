@@ -37,7 +37,7 @@ excluded: TUI/WebUI/Desktop 源码、HTTP/SSE 服务器、内置浏览器、远�
 | 配置上限、容量归一化、新增配置键 | `src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | Provider 专题（容量预算）；同步 `defaults_are_bounded` 类测试 |
 | 版本、GitHub PR、提交推送与本地同步 | `Cargo.toml`、`Cargo.lock`、`bindings/`、`conformance/` | [Release](docs/guides/release.md)、[Git 交付流程](docs/git-pr-local-sync.md)；可用项目 Skill [`git-pr-local-sync`](.agents/skills/git-pr-local-sync/SKILL.md) |
 
-指南与源码不一致时以源码为准，并在同一改动中更新该指南；一个事实只归属根文档或一个专题。根文档 ≤85 行；docs/guides/ 下的专题指南 ≤50 行且须含「适用范围/入口/不变量/诊断/验证」五节，由 scripts/check-agent-docs.sh 强校验；流程长文（如 docs/git-pr-local-sync.md）不受这些行数与结构限制。
+指南与源码不一致时以源码为准，并在同一改动中更新该指南；一个事实只归属根文档或一个专题。根文档 ≤85 行；docs/guides/ 下的专题指南 ≤50 行且须含「适用范围/入口/不变量/诊断/验证」五节；被根文档路由的其他文档（如 docs/git-pr-local-sync.md、项目 Skill）各有行数预算，全部由 scripts/check-agent-docs.sh 强校验。
 
 ## 消费端接入约束（摘要）
 
