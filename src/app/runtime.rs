@@ -219,6 +219,8 @@ pub(super) fn build_runtime(
         runner,
         agent_tx,
         active_task: None,
+        #[cfg(test)]
+        agent_task_started: Default::default(),
         request_seq: 0,
         parked_at: Instant::now(),
     }

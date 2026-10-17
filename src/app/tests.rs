@@ -583,6 +583,7 @@ fn test_app(temp: &TempDir) -> App {
         runner: None,
         agent_tx,
         active_task: None,
+        agent_task_started: Default::default(),
         request_seq: 0,
         parked_at: Instant::now(),
     };

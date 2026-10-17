@@ -16,7 +16,7 @@ core `Engine`/`AppHandle` 生命周期主体：当前/后台 runtime 停放与�
 
 - 所有消费端共享同一核心状态机；前端退出/断连不等于取消 agent，adapter 重连后走 snapshot + replay 恢复。
 - 事件链：agent task -> `Engine` -> `EventBridge` -> adapter；`AppHandle` 是唯一变更入口，命令经 `CoreCommand` 串行。
-- drop `JoinHandle` 不取消 tokio 任务；只有显式 `abort()` 才终止。子 Agent 跑在父任务同一棵 future 树里，abort 父任务即级联终止。
+- drop `JoinHandle` 不取消 tokio 任务；须显式 `abort()`。Provider 流与事件消费、子 Agent 属于父任务同一棵 future 树，abort 父任务级联 drop 网络流；AppHandle cancel/shutdown 在应答前 await 已 abort 的 Agent 任务结束。
 - `shutdown()` 必须先拒绝未决审批（oneshot `send(false)`）再 abort：abort 会 drop agent 持有的 receiver，后发必失败。
 - `Completed`/`Failed`/`Cancelled`/`LocalCommandFinished` 终态复位 `busy`/`active_task`；非终态事件不得复位。`Esc` 仅作用于当前会话。
 - `submit` 返回请求序号（`request_seq`，会话内单调递增）；`cancel(session, request_seq)` 只有序号仍匹配当前请求才生效，陈旧取消静默忽略、绝不误杀新请求。会话 busy/有未决审批/无 runner 时提交返回结构化 `Conflict`，消费端保留输入文本由用户重试。

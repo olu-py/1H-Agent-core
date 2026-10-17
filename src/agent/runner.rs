@@ -272,9 +272,7 @@ impl AgentRunner {
         )
         .await
         .map_err(|failure| match failure {
-            StreamFailure::Handler(error)
-            | StreamFailure::Join(error)
-            | StreamFailure::Limit(error) => error,
+            StreamFailure::Handler(error) | StreamFailure::Limit(error) => error,
             StreamFailure::Provider(error) => error.to_string(),
             StreamFailure::EndedWithoutCompletion => {
                 "compaction stream ended without completion".into()
@@ -658,9 +656,7 @@ impl AgentRunner {
                     self.save_partial(&collector.assistant_text);
                     return Err(error.to_string());
                 }
-                Err(StreamFailure::Handler(error))
-                | Err(StreamFailure::Join(error))
-                | Err(StreamFailure::Limit(error)) => {
+                Err(StreamFailure::Handler(error)) | Err(StreamFailure::Limit(error)) => {
                     self.save_partial(&collector.assistant_text);
                     return Err(error);
                 }

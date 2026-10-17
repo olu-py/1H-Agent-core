@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
 use crate::{
@@ -14,20 +14,47 @@ use super::{
     conversation_item_bytes, decode_conversation_item, parse_todo_status, validate_todo_tasks,
 };
 
+pub(super) fn set_session_head(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    previous: Option<&str>,
+    next: &str,
+    deactivate_previous: bool,
+    now: &str,
+) -> Result<(), StorageError> {
+    if deactivate_previous && let Some(previous) = previous {
+        tx.execute(
+            "UPDATE turns SET on_active_path = 0 WHERE id = ?1 AND session_id = ?2",
+            params![previous, session_id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE turns SET on_active_path = 1 WHERE id = ?1 AND session_id = ?2",
+        params![next, session_id],
+    )?;
+    tx.execute(
+        "UPDATE sessions SET head_turn_id = ?2, updated_at = ?3 WHERE id = ?1",
+        params![session_id, next, now],
+    )?;
+    Ok(())
+}
+
 impl Storage {
     pub fn create_session(&self, workspace: &Path) -> Result<String, StorageError> {
         let id = Uuid::new_v4().to_string();
         let turn_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
-        connection.execute(
+        let tx = connection.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, head_turn_id) VALUES (?1, ?2, ?3, ?4, ?4, 'build', 'openai', '', ?5)",
             params![id, workspace.display().to_string(), "New session", now, turn_id],
         )?;
-        connection.execute(
-            "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+        tx.execute(
+            "INSERT INTO turns(id, session_id, parent_id, created_at, on_active_path) VALUES (?1, ?2, NULL, ?3, 1)",
             params![turn_id, id, now],
         )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -52,14 +79,16 @@ impl Storage {
         let turn_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
-        connection.execute(
+        let tx = connection.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, parent_id, head_turn_id, child_role, child_status) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running')",
             params![id, workspace.display().to_string(), title, now, mode, provider, model, parent_id, turn_id, child_role],
         )?;
-        connection.execute(
-            "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+        tx.execute(
+            "INSERT INTO turns(id, session_id, parent_id, created_at, on_active_path) VALUES (?1, ?2, NULL, ?3, 1)",
             params![turn_id, id, now],
         )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -224,7 +253,8 @@ impl Storage {
         content: &str,
     ) -> Result<(), StorageError> {
         let connection = self.lock()?;
-        let current_turn: Option<String> = connection
+        let tx = connection.unchecked_transaction()?;
+        let current_turn: Option<String> = tx
             .query_row(
                 "SELECT head_turn_id FROM sessions WHERE id = ?1",
                 [session_id],
@@ -237,29 +267,26 @@ impl Storage {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         if current_turn.is_none() {
             let now = Utc::now().to_rfc3339();
-            connection.execute(
-                "INSERT OR IGNORE INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+            tx.execute(
+                "INSERT OR IGNORE INTO turns(id, session_id, parent_id, created_at, on_active_path) VALUES (?1, ?2, NULL, ?3, 1)",
                 params![turn_id, session_id, now],
             )?;
-            connection.execute(
-                "UPDATE sessions SET head_turn_id = ?2 WHERE id = ?1",
-                params![session_id, turn_id],
-            )?;
+            set_session_head(&tx, session_id, None, &turn_id, false, &now)?;
         }
         if role == Role::User {
             let child = Uuid::new_v4().to_string();
             let now = Utc::now().to_rfc3339();
-            connection.execute(
-                "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+            tx.execute(
+                "INSERT INTO turns(id, session_id, parent_id, created_at, on_active_path) VALUES (?1, ?2, ?3, ?4, 1)",
                 params![child, session_id, turn_id, now],
             )?;
-            connection.execute(
-                "UPDATE sessions SET head_turn_id = ?2 WHERE id = ?1",
-                params![session_id, child],
-            )?;
-            return append_message_on_turn(&connection, session_id, &child, role, content);
+            set_session_head(&tx, session_id, Some(&turn_id), &child, false, &now)?;
+            append_message_on_turn(&tx, session_id, &child, role, content)?;
+        } else {
+            append_message_on_turn(&tx, session_id, &turn_id, role, content)?;
         }
-        append_message_on_turn(&connection, session_id, &turn_id, role, content)
+        tx.commit()?;
+        Ok(())
     }
 
     /// Persists the incomplete assistant answer for a session, replacing any
@@ -328,7 +355,8 @@ impl Storage {
         content: &str,
     ) -> Result<(), StorageError> {
         let connection = self.lock()?;
-        let turn_id: Option<String> = connection
+        let tx = connection.unchecked_transaction()?;
+        let turn_id: Option<String> = tx
             .query_row(
                 "SELECT head_turn_id FROM sessions WHERE id = ?1",
                 [session_id],
@@ -340,14 +368,15 @@ impl Storage {
             return Ok(());
         };
         let now = Utc::now().to_rfc3339();
-        connection.execute(
+        tx.execute(
             "INSERT INTO messages(session_id, role, content, created_at, turn_id, kind, hidden, metadata) VALUES (?1, 'context', ?2, ?3, ?4, 'context', 0, ?5)",
             params![session_id, content, now, turn_id, label],
         )?;
-        connection.execute(
+        tx.execute(
             "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
             params![session_id, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -469,7 +498,8 @@ impl Storage {
         metadata: Option<&str>,
     ) -> Result<(), StorageError> {
         let connection = self.lock()?;
-        let turn_id: Option<String> = connection
+        let tx = connection.unchecked_transaction()?;
+        let turn_id: Option<String> = tx
             .query_row(
                 "SELECT head_turn_id FROM sessions WHERE id = ?1",
                 [session_id],
@@ -481,14 +511,15 @@ impl Storage {
             return Ok(());
         };
         let now = Utc::now().to_rfc3339();
-        connection.execute(
+        tx.execute(
             "INSERT INTO messages(session_id, role, content, created_at, turn_id, kind, hidden, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![session_id, role, content, now, turn_id, kind, metadata],
         )?;
-        connection.execute(
+        tx.execute(
             "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
             params![session_id, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -537,8 +568,9 @@ impl Storage {
 
     pub fn fork_session(&self, session_id: &str) -> Result<String, StorageError> {
         let connection = self.lock()?;
+        let tx = connection.unchecked_transaction()?;
         let (workspace, title, mode, provider, model): (String, String, String, String, String) =
-            connection.query_row(
+            tx.query_row(
                 "SELECT workspace, title, mode, provider, model FROM sessions WHERE id = ?1",
                 [session_id],
                 |row| {
@@ -554,16 +586,16 @@ impl Storage {
         let new_id = Uuid::new_v4().to_string();
         let root_turn = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        connection.execute(
+        tx.execute(
             "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, parent_id, head_turn_id) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![new_id, workspace, format!("{title} (fork)"), now, mode, provider, model, session_id, root_turn],
         )?;
-        connection.execute(
-            "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+        tx.execute(
+            "INSERT INTO turns(id, session_id, parent_id, created_at, on_active_path) VALUES (?1, ?2, NULL, ?3, 1)",
             params![root_turn, new_id, now],
         )?;
         let rows = {
-            let mut statement = connection.prepare(
+            let mut statement = tx.prepare(
                 "SELECT role, content, kind, hidden, metadata FROM messages WHERE session_id = ?1 ORDER BY id ASC",
             )?;
             statement
@@ -579,13 +611,13 @@ impl Storage {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for (role, content, kind, hidden, metadata) in rows {
-            connection.execute(
+            tx.execute(
                 "INSERT INTO messages(session_id, role, content, created_at, turn_id, kind, hidden, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![new_id, role, content, now, root_turn, kind, hidden, metadata],
             )?;
         }
         let tasks = {
-            let mut statement = connection.prepare(
+            let mut statement = tx.prepare(
                 "SELECT title, status, created_at, updated_at FROM session_tasks WHERE session_id = ?1 ORDER BY position ASC",
             )?;
             statement
@@ -600,7 +632,7 @@ impl Storage {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for (position, (title, status, created_at, updated_at)) in tasks.into_iter().enumerate() {
-            connection.execute(
+            tx.execute(
                 "INSERT INTO session_tasks(id, session_id, position, title, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     Uuid::new_v4().to_string(),
@@ -613,6 +645,7 @@ impl Storage {
                 ],
             )?;
         }
+        tx.commit()?;
         Ok(new_id)
     }
 
@@ -670,8 +703,9 @@ impl Storage {
 
     pub fn compact_session(&self, session_id: &str, keep: usize) -> Result<usize, StorageError> {
         let connection = self.lock()?;
+        let tx = connection.unchecked_transaction()?;
         let ids = {
-            let mut statement = connection.prepare(
+            let mut statement = tx.prepare(
                 "SELECT id FROM messages WHERE session_id = ?1 AND hidden = 0 ORDER BY id DESC",
             )?;
             statement
@@ -680,8 +714,9 @@ impl Storage {
         };
         let hidden = ids.into_iter().skip(keep).collect::<Vec<_>>();
         for id in &hidden {
-            connection.execute("UPDATE messages SET hidden = 1 WHERE id = ?1", [id])?;
+            tx.execute("UPDATE messages SET hidden = 1 WHERE id = ?1", [id])?;
         }
+        tx.commit()?;
         Ok(hidden.len())
     }
 
@@ -842,42 +877,75 @@ impl Storage {
     ///
     /// `before` is an opaque cursor (a message `id`): only rows strictly older
     /// than it are returned. Pass `limit + 1` to detect `has_more` without a
-    /// separate count query. The `session_id + hidden + id` index makes this
-    /// index-only.
+    /// separate count query. The persisted visible_history projection makes
+    /// both newest and cursor pages bounded by the requested message range.
     pub fn load_message_page(
         &self,
         session_id: &str,
         before: Option<i64>,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StorageError> {
+        self.load_message_page_with_cancellation(session_id, before, limit, None)
+    }
+
+    pub(crate) fn load_message_page_with_cancellation(
+        &self,
+        session_id: &str,
+        before: Option<i64>,
+        limit: usize,
+        cancellation: Option<&crate::service::RequestCancellation>,
+    ) -> Result<Vec<StoredMessage>, StorageError> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare(
-            "WITH RECURSIVE chain(id) AS (
-                 SELECT head_turn_id FROM sessions WHERE id = ?1
-                 UNION ALL
-                 SELECT turns.parent_id FROM turns JOIN chain ON turns.id = chain.id
-                 WHERE turns.parent_id IS NOT NULL
-             )
-             SELECT id, role, content, kind, metadata, created_at FROM messages
-             WHERE session_id = ?1 AND hidden = 0 AND partial = 0
-               AND (turn_id IN (SELECT id FROM chain) OR turn_id IS NULL)
-               AND (?2 IS NULL OR id < ?2)
-             ORDER BY id DESC
-             LIMIT ?3",
-        )?;
-        let rows = statement
-            .query_map(params![session_id, before, limit as i64], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    kind: row.get(3)?,
-                    metadata: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        if cancellation.is_some_and(crate::service::RequestCancellation::is_cancelled) {
+            return Err(StorageError::Cancelled);
+        }
+        let _progress = cancellation.map(|token| super::ReadProgress::install(&connection, token));
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (sql, values) = if let Some(cursor) = before {
+            (
+                "SELECT m.id, m.role, m.content, m.kind, m.metadata, m.created_at
+                 FROM visible_history AS v JOIN messages AS m ON m.id = v.message_id
+                 WHERE v.session_id = ?1 AND v.message_id < ?2
+                 ORDER BY v.message_id DESC LIMIT ?3",
+                vec![
+                    rusqlite::types::Value::from(session_id.to_owned()),
+                    rusqlite::types::Value::from(cursor),
+                    rusqlite::types::Value::from(limit as i64),
+                ],
+            )
+        } else {
+            (
+                "SELECT m.id, m.role, m.content, m.kind, m.metadata, m.created_at
+                 FROM visible_history AS v JOIN messages AS m ON m.id = v.message_id
+                 WHERE v.session_id = ?1
+                 ORDER BY v.message_id DESC LIMIT ?2",
+                vec![
+                    rusqlite::types::Value::from(session_id.to_owned()),
+                    rusqlite::types::Value::from(limit as i64),
+                ],
+            )
+        };
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            if cancellation.is_some_and(crate::service::RequestCancellation::is_cancelled) {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                    None,
+                ));
+            }
+            Ok(StoredMessage {
+                id: row.get(0)?,
+                role: row.get(1)?,
+                content: row.get(2)?,
+                kind: row.get(3)?,
+                metadata: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     pub fn begin_tool(

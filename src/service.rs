@@ -35,6 +35,14 @@ use engine::{CoreCommand, Engine, run_engine};
 
 mod handle;
 pub use handle::AppHandle;
+mod cancellation;
+pub use cancellation::RequestCancellation;
+
+#[derive(Debug, serde::Serialize)]
+pub struct SubmitReceipt {
+    pub session_id: String,
+    pub request_seq: u64,
+}
 
 use crate::{
     agent::AgentEvent,

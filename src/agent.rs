@@ -443,8 +443,6 @@ enum StreamFailure {
     /// round produced no output). The structured error lets the agent layer
     /// recognize context overflows for the compact→retry recovery.
     Provider(ProviderError),
-    /// The spawned provider task failed to join (fatal).
-    Join(String),
     /// The local hard limit stopped the provider round. The collector retains
     /// the bounded partial answer, but incomplete tool arguments are never
     /// passed to execution.
@@ -465,52 +463,64 @@ async fn stream_once(
     mut forward: impl FnMut(ModelEvent) -> Result<Forwarded, String>,
 ) -> Result<(), StreamFailure> {
     let (model_tx, mut model_rx) = mpsc::channel(channel_capacity);
-    let provider = provider.clone();
-    let provider_task = tokio::spawn(async move { provider.stream(request, model_tx).await });
-    while let Some(event) = model_rx.recv().await {
-        let forwarded = match collector.on_event(event) {
-            Ok(forwarded) => forwarded,
-            Err(error) => {
-                // Dropping a JoinHandle does not cancel the provider task. An
-                // explicit abort is required here or a rejected oversized
-                // stream would keep reading the network in the background.
-                provider_task.abort();
-                let _ = provider_task.await;
-                return Err(StreamFailure::Limit(error));
-            }
-        };
-        if let Some(event) = forwarded {
-            match forward(event).map_err(StreamFailure::Handler)? {
-                Forwarded::Send(agent_event) => {
-                    send_agent_event_bounded(ui_events, agent_event, max_agent_event_bytes)
-                        .await
-                        .map_err(|_| {
-                            StreamFailure::Handler("UI event receiver closed".to_owned())
-                        })?
+    let provider_stream = provider.stream(request, model_tx);
+    tokio::pin!(provider_stream);
+    let consumer = async {
+        while let Some(event) = model_rx.recv().await {
+            let forwarded = match collector.on_event(event) {
+                Ok(forwarded) => forwarded,
+                Err(error) => {
+                    return Err(StreamFailure::Limit(error));
                 }
-                Forwarded::SendMany(agent_events) => {
-                    for agent_event in agent_events {
+            };
+            if let Some(event) = forwarded {
+                match forward(event).map_err(StreamFailure::Handler)? {
+                    Forwarded::Send(agent_event) => {
                         send_agent_event_bounded(ui_events, agent_event, max_agent_event_bytes)
                             .await
                             .map_err(|_| {
                                 StreamFailure::Handler("UI event receiver closed".to_owned())
-                            })?;
+                            })?
                     }
+                    Forwarded::SendMany(agent_events) => {
+                        for agent_event in agent_events {
+                            send_agent_event_bounded(ui_events, agent_event, max_agent_event_bytes)
+                                .await
+                                .map_err(|_| {
+                                    StreamFailure::Handler("UI event receiver closed".to_owned())
+                                })?;
+                        }
+                    }
+                    Forwarded::SendIgnore(agent_event) => {
+                        let _ =
+                            send_agent_event_bounded(ui_events, agent_event, max_agent_event_bytes)
+                                .await;
+                    }
+                    Forwarded::Ignore => {}
                 }
-                Forwarded::SendIgnore(agent_event) => {
-                    let _ = send_agent_event_bounded(ui_events, agent_event, max_agent_event_bytes)
-                        .await;
-                }
-                Forwarded::Ignore => {}
+            }
+            if collector.saw_done {
+                break;
             }
         }
-        if collector.saw_done {
-            break;
+        Ok(())
+    };
+    // Both futures belong to the Agent task. Dropping/cancelling that task
+    // synchronously drops the actual network stream, including while waiting
+    // on UI backpressure. No detached provider task survives its parent.
+    let provider_result = {
+        tokio::pin!(consumer);
+        tokio::select! {
+          result = &mut consumer => {
+            result?;
+            provider_stream.await
+          }
+          result = &mut provider_stream => {
+            consumer.await?;
+            result
+          }
         }
-    }
-    let provider_result = provider_task
-        .await
-        .map_err(|error| StreamFailure::Join(error.to_string()))?;
+    };
     if let Err(error) = provider_result {
         return Err(StreamFailure::Provider(error));
     }

@@ -10,7 +10,7 @@ Provider 配置、密钥、请求协议、reasoning、`response_id`、上下文�
 - 元数据链：`src/model_meta.rs`（四层解析、models.dev 快照与解析、`GET /models` 解析、防投毒边界）、`OpenAiClient::list_models`（单次尝试、per-request 超时、1 MiB 体积上限）、`storage.rs` 的 `model_metadata` 缓存表、`AppHandle::provider_models(refresh)`（列表条目缺失字段按社区行精确键回填，不覆盖接口已报值）。
 - 密钥：`api_key_cached*`、`store_api_key_cached`（core `secrets` facade），仅存在性/解锁入口暴露给消费端。
 - 切换/编辑：消费端只经 `AppHandle::set_provider_profile`（provider id/空 id=新建 + 模板 + 可选 name + 模型 + 可选 base_url/kind/显式窗口/enabled_models，档案合并语义；窗口 clamp 到 Config 同界）/`set_provider`/`set_provider_config`/`remove_provider` 提交，不直接改配置；设置视图 `AppHandle::provider_settings()`（active/saved/connected，密钥永不入 DTO，connected 按 provider id 且为缓存级解析）；首页选择 `HomeSelection`/`apply_home_selection` 是 TUI 侧入口。
-- 请求/恢复：`replay_safe_items`、请求游标、`src/provider/openai.rs`、`storage.rs` 的 Provider 状态。
+- 请求/恢复：`replay_safe_items`、请求游标、`src/provider/openai.rs`、`storage.rs` 的 Provider 状态；`agent::stream_once` 同时驱动 Provider 与消费 future，不独立 spawn Provider，取消、限额和接收者关闭均释放实际流。
 
 ## 不变量
 

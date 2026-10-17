@@ -41,7 +41,7 @@ excluded: TUI/WebUI/Desktop 源码、HTTP/SSE 服务器、内置浏览器、远�
 
 ## 消费端接入约束（摘要）
 
-消费端只允许 `AppService::start(CoreConfig)`、`AppHandle` 的 snapshot/messages/submit/execute_command/approve/cancel/activate_session/set_provider/subscribe/shutdown 接口，以及 `protocol.rs` DTO 与 `bridge.rs` 原子订阅（`subscribe_from`/`ResyncRequired`）。启动先取 snapshot，再 `subscribe_from(event_cursor)` 原子订阅并按 cursor 去重；`submit` 返回请求序号、`cancel` 携带之防陈旧取消；协议只做加法演进，未知事件静默忽略。完整契约见 UI Contract 专题，接口示例见 `examples/minimal.rs`。
+消费端只允许 `AppService::start(CoreConfig)`、`AppHandle` 的 snapshot/messages/submit/request_sequence/execute_command/approve/cancel/activate_session/set_provider/subscribe/shutdown 接口，以及 `protocol.rs` DTO 与 `bridge.rs` 原子订阅（`subscribe_from`/`ResyncRequired`）。启动先取 snapshot，再 `subscribe_from(event_cursor)` 原子订阅并按 cursor 去重；`submit` 返回请求序号、`cancel` 携带之防陈旧取消；协议只做加法演进，未知事件静默忽略。完整契约见 UI Contract 专题，接口示例见 `examples/minimal.rs`。
 
 ## 实施与验证
 

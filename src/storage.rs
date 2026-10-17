@@ -85,6 +85,27 @@ pub enum StorageError {
     InvalidTodo(String),
     #[error("memory limit: {0}")]
     MemoryLimit(String),
+    #[error("read request cancelled")]
+    Cancelled,
+}
+
+/// Connection lock outlives this guard. Always remove the progress callback,
+/// including query errors, so cancellation cannot interrupt a later request.
+struct ReadProgress<'a>(&'a Connection);
+impl<'a> ReadProgress<'a> {
+    fn install(
+        connection: &'a Connection,
+        cancellation: &crate::service::RequestCancellation,
+    ) -> Self {
+        let token = cancellation.clone();
+        connection.progress_handler(1000, Some(move || token.sql_cancelled()));
+        Self(connection)
+    }
+}
+impl Drop for ReadProgress<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
 }
 
 impl Storage {
