@@ -1,12 +1,13 @@
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
 
-use super::{FileSnapshot, Storage, StorageError};
+use super::{FileSnapshot, Storage, StorageError, session::set_session_head};
 
 impl Storage {
     pub fn undo(&self, session_id: &str) -> Result<bool, StorageError> {
         let connection = self.lock()?;
-        let head: Option<String> = connection
+        let tx = connection.unchecked_transaction()?;
+        let head: Option<String> = tx
             .query_row(
                 "SELECT head_turn_id FROM sessions WHERE id = ?1",
                 [session_id],
@@ -15,7 +16,7 @@ impl Storage {
             .optional()?
             .flatten();
         let Some(head) = head else { return Ok(false) };
-        let parent: Option<String> = connection.query_row(
+        let parent: Option<String> = tx.query_row(
             "SELECT parent_id FROM turns WHERE id = ?1",
             [&head],
             |row| row.get(0),
@@ -23,16 +24,22 @@ impl Storage {
         let Some(parent) = parent else {
             return Ok(false);
         };
-        connection.execute(
-            "UPDATE sessions SET head_turn_id = ?2, updated_at = ?3 WHERE id = ?1",
-            params![session_id, parent, Utc::now().to_rfc3339()],
+        set_session_head(
+            &tx,
+            session_id,
+            Some(&head),
+            &parent,
+            true,
+            &Utc::now().to_rfc3339(),
         )?;
+        tx.commit()?;
         Ok(true)
     }
 
     pub fn redo(&self, session_id: &str) -> Result<bool, StorageError> {
         let connection = self.lock()?;
-        let head: Option<String> = connection
+        let tx = connection.unchecked_transaction()?;
+        let head: Option<String> = tx
             .query_row(
                 "SELECT head_turn_id FROM sessions WHERE id = ?1",
                 [session_id],
@@ -41,7 +48,7 @@ impl Storage {
             .optional()?
             .flatten();
         let Some(head) = head else { return Ok(false) };
-        let child: Option<String> = connection
+        let child: Option<String> = tx
             .query_row(
                 "SELECT id FROM turns WHERE session_id = ?1 AND parent_id = ?2 ORDER BY created_at DESC LIMIT 1",
                 params![session_id, head],
@@ -49,10 +56,15 @@ impl Storage {
             )
             .optional()?;
         let Some(child) = child else { return Ok(false) };
-        connection.execute(
-            "UPDATE sessions SET head_turn_id = ?2, updated_at = ?3 WHERE id = ?1",
-            params![session_id, child, Utc::now().to_rfc3339()],
+        set_session_head(
+            &tx,
+            session_id,
+            Some(&head),
+            &child,
+            false,
+            &Utc::now().to_rfc3339(),
         )?;
+        tx.commit()?;
         Ok(true)
     }
 

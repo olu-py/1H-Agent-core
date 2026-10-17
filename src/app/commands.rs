@@ -83,7 +83,14 @@ pub(crate) fn submit_input(app: &mut App) -> Result<()> {
     // Stamp the session's current anchor onto this run's runner snapshot so
     // in-run compaction thresholds compare the anchored estimate.
     let runner = runner.with_usage_anchor(app.current.usage_anchor.clone());
+    #[cfg(test)]
+    let task_started = {
+        app.current.agent_task_started = Default::default();
+        app.current.agent_task_started.clone()
+    };
     app.current.active_task = Some(tokio::spawn(async move {
+        #[cfg(test)]
+        task_started.store(true, std::sync::atomic::Ordering::SeqCst);
         runner.run(items, events).await;
     }));
     app.current.trim_entries();

@@ -4,6 +4,49 @@ use uuid::Uuid;
 
 use super::StorageError;
 
+const VISIBLE_HISTORY_TRIGGERS: &str = r#"
+CREATE TRIGGER IF NOT EXISTS messages_visible_history_insert
+AFTER INSERT ON messages
+WHEN NEW.hidden = 0 AND NEW.partial = 0
+     AND (NEW.turn_id IS NULL OR EXISTS (
+         SELECT 1 FROM turns WHERE id = NEW.turn_id AND on_active_path = 1
+     ))
+BEGIN
+    INSERT OR IGNORE INTO visible_history(session_id, message_id)
+    VALUES (NEW.session_id, NEW.id);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_visible_history_update
+AFTER UPDATE OF session_id, turn_id, hidden, partial ON messages
+BEGIN
+    DELETE FROM visible_history WHERE message_id = OLD.id;
+    INSERT OR IGNORE INTO visible_history(session_id, message_id)
+    SELECT NEW.session_id, NEW.id
+    WHERE NEW.hidden = 0 AND NEW.partial = 0
+      AND (NEW.turn_id IS NULL OR EXISTS (
+          SELECT 1 FROM turns WHERE id = NEW.turn_id AND on_active_path = 1
+      ));
+END;
+CREATE TRIGGER IF NOT EXISTS messages_visible_history_delete
+AFTER DELETE ON messages
+BEGIN
+    DELETE FROM visible_history WHERE message_id = OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS turns_visible_history_path
+AFTER UPDATE OF on_active_path ON turns
+WHEN OLD.on_active_path != NEW.on_active_path
+BEGIN
+    DELETE FROM visible_history WHERE message_id IN (
+        SELECT id FROM messages
+        WHERE session_id = NEW.session_id AND turn_id = NEW.id
+    );
+    INSERT OR IGNORE INTO visible_history(session_id, message_id)
+    SELECT session_id, id FROM messages
+    WHERE session_id = NEW.session_id AND turn_id = NEW.id
+      AND hidden = 0 AND partial = 0
+      AND NEW.on_active_path = 1;
+END;
+"#;
+
 pub(super) fn initialize(connection: Connection) -> Result<Connection, StorageError> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -30,7 +73,8 @@ pub(super) fn initialize(connection: Connection) -> Result<Connection, StorageEr
             id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
             parent_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            on_active_path INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +170,15 @@ pub(super) fn initialize(connection: Connection) -> Result<Connection, StorageEr
         -- chain; the session_id+hidden+id index keeps that query index-only.
         CREATE INDEX IF NOT EXISTS idx_messages_session_hidden_id
             ON messages(session_id, hidden, id);
+        CREATE TABLE IF NOT EXISTS visible_history (
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            PRIMARY KEY (session_id, message_id)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_messages_session_turn_id
+            ON messages(session_id, turn_id, id);
+        CREATE INDEX IF NOT EXISTS idx_turns_session_parent_created
+            ON turns(session_id, parent_id, created_at DESC);
         INSERT OR IGNORE INTO schema_migrations(version, applied_at)
         VALUES (1, CURRENT_TIMESTAMP);
         INSERT OR IGNORE INTO schema_migrations(version, applied_at)
@@ -162,6 +215,12 @@ pub(super) fn initialize(connection: Connection) -> Result<Connection, StorageEr
     ensure_column(&connection, "sessions", "parent_id", "TEXT")?;
     ensure_column(&connection, "sessions", "deleted_at", "TEXT")?;
     ensure_column(&connection, "sessions", "head_turn_id", "TEXT")?;
+    ensure_column(
+        &connection,
+        "turns",
+        "on_active_path",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(&connection, "sessions", "child_role", "TEXT")?;
     ensure_column(&connection, "sessions", "child_status", "TEXT")?;
     ensure_column(&connection, "sessions", "child_allowed_tools", "TEXT")?;
@@ -189,12 +248,78 @@ pub(super) fn initialize(connection: Connection) -> Result<Connection, StorageEr
         "partial",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    backfill_turns(&connection)?;
+    // Snapshots read the partial answer even when it is absent. Restrict the
+    // lookup to partial rows instead of scanning a session's entire history.
+    let tx = connection.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messages_partial_session_id
+         ON messages(session_id, id DESC) WHERE partial = 1;",
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (10, CURRENT_TIMESTAMP)",
+        [],
+    )?;
+    tx.commit()?;
+    migrate_visible_history(&connection)?;
+    connection.execute_batch(VISIBLE_HISTORY_TRIGGERS)?;
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, CURRENT_TIMESTAMP)",
         [],
     )?;
     Ok(connection)
+}
+
+fn migrate_visible_history(connection: &Connection) -> Result<(), StorageError> {
+    let applied: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 9)",
+        [],
+        |row| row.get(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+
+    let tx = connection.unchecked_transaction()?;
+    // Backfill state set-wise: running the live path trigger once per turn
+    // would rewrite every visible message several times during migration.
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS messages_visible_history_insert;
+         DROP TRIGGER IF EXISTS messages_visible_history_update;
+         DROP TRIGGER IF EXISTS messages_visible_history_delete;
+         DROP TRIGGER IF EXISTS turns_visible_history_path;",
+    )?;
+    // Version 9 also absorbs the old per-open turn backfill so both legacy
+    // repair and the new projection are committed exactly once.
+    backfill_turns(&tx)?;
+    tx.execute("UPDATE turns SET on_active_path = 0", [])?;
+    tx.execute(
+        "WITH RECURSIVE active(session_id, id) AS (
+             SELECT id, head_turn_id FROM sessions WHERE head_turn_id IS NOT NULL
+             UNION ALL
+             SELECT active.session_id, turns.parent_id
+             FROM turns JOIN active ON turns.id = active.id
+             WHERE turns.parent_id IS NOT NULL
+         )
+         UPDATE turns SET on_active_path = 1
+         WHERE id IN (SELECT id FROM active)",
+        [],
+    )?;
+    tx.execute("DELETE FROM visible_history", [])?;
+    tx.execute(
+        "INSERT INTO visible_history(session_id, message_id)
+         SELECT messages.session_id, messages.id FROM messages
+         LEFT JOIN turns ON turns.id = messages.turn_id
+         WHERE messages.hidden = 0 AND messages.partial = 0
+           AND (messages.turn_id IS NULL OR turns.on_active_path = 1)",
+        [],
+    )?;
+    tx.execute_batch(VISIBLE_HISTORY_TRIGGERS)?;
+    tx.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn ensure_column(

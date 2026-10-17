@@ -8,15 +8,16 @@
 
 - `src/service.rs`：`AppService::start`、`AppHandle` 全部类型化接口。
 - `src/protocol.rs`：v2 DTO 权威定义（`Event`/`AppSnapshotV2`/`MessageDto`/`MessagePage`/`Envelope`/`ContextBudgetDto`/`ProviderSettingsDto`/`ProviderModelsDto`/`PartialDto`）。
-- `src/bridge.rs`：`EventBridge` 原子订阅（`subscribe_from`/`Subscription`/`ResyncRequired`）。
+- `src/bridge.rs`：`EventBridge` cursor 消费（`subscribe_cursor_from`/`events_after`）及兼容订阅（`subscribe_from`/`Subscription`/`ResyncRequired`）。
 - `src/conformance.rs`（仅 `test-util` feature）：共享一致性场景集与流不变量检查器；fixtures 以 JSON 导出在 `conformance/`（测试做无漂移校验），消费端在 dev-dependencies 启用同一 feature 重放同一语料。
 - 各消费端 adapter 的 transport/projection/render 层。
 
 ## 不变量
 
-- 所有变更经 `AppHandle` 的 `CoreCommand` 队列串行进入 Engine；消费端不得触碰 `SessionRuntime`/`AgentRunner`/Storage/Provider/审批 oneshot。`submit` 返回请求序号、`cancel` 须携带之（序号不匹配则静默忽略），防陈旧取消误杀新请求。
+- 所有变更经 `AppHandle` 的 `CoreCommand` 队列串行进入 Engine；消费端不得触碰 `SessionRuntime`/`AgentRunner`/Storage/Provider/审批 oneshot。`submit` 返回请求序号，`submit_with_receipt` 原子返回实际 session_id + request_seq；重连用 `request_sequence` 读取实际 busy runtime 序号，idle 为 None；`cancel` 携带序号（不匹配则静默忽略）。`messages_cancellable` 使用 RequestCancellation 中断实际读取，返回前等待读取结束，不能仅丢弃 waiter。
 - 消费端只消费 `Envelope/Event`，不解析 `AgentEvent` 或 Provider 私有 JSON；Provider 事件先规范化为 `ModelEvent` 再映射进 protocol。
-- 启动先取 snapshot，再 `subscribe_from(event_cursor)` 原子订阅（先订 live 再快照 ring，replay∩live 重叠按 cursor 去重，跳过 `cursor <= 已处理` 的 live 事件）；`ResyncRequired`（游标逐出）或消费者滞后时重取 snapshot + 消息页并重新订阅。普通 snapshot 刷新不得推进未消费 cursor，只有首次连接、滞后或 `ResyncRequired` 才建立新基线。
+- 启动先取 snapshot，再调用 `subscribe_cursor_from(event_cursor)`；watch 通知只提示回放环可能前进，消费端以 `events_after(cursor, limit)` 读取有界批次并按 cursor 去重。游标逐出时重取 snapshot + 消息页并重新订阅。旧 `subscribe_from`/`subscribe` 接口保留兼容，但固定 broadcast 容量不作为高负载消费路径。普通 snapshot 刷新不得推进未消费 cursor，只有首次连接或 `ResyncRequired` 才建立新基线。
+- Cursor 0 表示空流基线，首个事件 cursor 为 1；snapshot cursor 始终是最新已分配 cursor。消费端不能把通知版本直接当成已处理 cursor。
 - 消息经 `MessagePage` 游标（`next_before`/`has_more`）分页；Approval 只传 `approval_id`，不得跨接口暴露 oneshot sender。消费端收到 live `Approval` 必须立即展示，收到 `ApprovalResolved` 必须关闭匹配项并从 snapshot 收敛全局下一个审批，不得等待其他事件或服务端超时。
 - 思考/正文阶段序：同一模型轮次内事件顺序保证为 `ReasoningDelta* -> ReasoningCompleted -> TextDelta* -> ToolCallStreaming* -> Approval/ToolStarted`。`ToolCallStreaming`（工具参数流式进度：`name` 可选、`received_bytes` 单调、事件有序且有界，约 1 KiB 阈值合并为核心实现细节——消费端只可依赖单调/有序/有界，不可依赖具体阈值或事件数）紧跟最后 `TextDelta`、先于审批/工具开始，供消费端显示"生成工具调用"动画行而避免静默冻结；旧客户端忽略它后收到的仍是同样的 delta 序列。`ReasoningCompleted` 无负载，只在产生思考时恰好发一次（无思考的轮次不发），且是该轮思考视图到正文视图的渲染屏障：消费端必须在收到它时提交/刷新思考摘要并结束 live 思考行，再接受后续正文 delta。新客户端借此把"只有思考摘要"与"摘要+正文"分成两帧展示。
 - v2 之后协议只做加法演进：新变体/字段必须被旧 UI 忽略，不得改名、重排或复用旧 tag。Provider 身份同理：`ProviderProfileDto` 新增 `id`（稳定身份）、`name`/`enabled_models`（命名自定义与预留模型列表），`AppSnapshotV2` 新增 `provider_id`，`GET .../config/provider` 的 `connected` 元素语义改为 provider id；`preset` 字段值与语义保持不变（模板/家族 key），旧客户端按 `preset` 读取仍可用。

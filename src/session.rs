@@ -120,6 +120,8 @@ pub struct SessionRuntime {
     pub runner: Option<AgentRunner>,
     pub agent_tx: mpsc::Sender<AgentEvent>,
     pub active_task: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    pub(crate) agent_task_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Monotonic per-session request sequence. Each `submit` that starts a task
     /// bumps it; `cancel` carries the expected sequence so a stale cancel (for a
     /// superseded request) is ignored instead of aborting a newer request.
@@ -1083,6 +1085,8 @@ mod tests {
             runner: None,
             agent_tx,
             active_task: None,
+            #[cfg(test)]
+            agent_task_started: Default::default(),
             request_seq: 0,
             parked_at: Instant::now(),
         };

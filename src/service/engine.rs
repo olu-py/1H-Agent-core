@@ -5,7 +5,12 @@ pub(super) enum CoreCommand {
     GetState {
         reply: oneshot::Sender<Result<AppSnapshotV2, ApiError>>,
     },
+    GetRequestSequence {
+        session_id: String,
+        reply: oneshot::Sender<Result<Option<u64>, ApiError>>,
+    },
     GetMessages {
+        cancellation: Option<RequestCancellation>,
         session_id: String,
         before: Option<i64>,
         limit: usize,
@@ -41,7 +46,7 @@ pub(super) enum CoreCommand {
         text: String,
         /// Replies with the request sequence assigned to the new request
         /// (or the current sequence when the input was a command/approval).
-        reply: oneshot::Sender<Result<u64, ApiError>>,
+        reply: oneshot::Sender<Result<SubmitReceipt, ApiError>>,
     },
     ExecuteCommand {
         session_id: Option<String>,
@@ -387,7 +392,12 @@ impl Engine {
 
     /// Fully stops every runtime (rejecting approvals and aborting agent tasks),
     /// then resolves any leftover pending approvals.
-    fn shutdown(&mut self) {
+    async fn shutdown(&mut self) {
+        let mut stopped = Vec::new();
+        let pending = self.pending.keys().cloned().collect::<Vec<_>>();
+        for approval_id in pending {
+            let _ = self.resolve_approval(&approval_id, false, false);
+        }
         let ids = self
             .app
             .sessions
@@ -396,14 +406,17 @@ impl Engine {
             .collect::<Vec<_>>();
         for session_id in ids {
             if let Some(runtime) = self.app.runtime_mut(&session_id) {
+                if let Some(task) = runtime.active_task.take() {
+                    task.abort();
+                    stopped.push(task);
+                }
                 runtime.shutdown();
             }
         }
-        let pending = self.pending.keys().cloned().collect::<Vec<_>>();
-        for approval_id in pending {
-            let _ = self.resolve_approval(&approval_id, false, false);
-        }
         self.app.should_quit = true;
+        for task in stopped {
+            let _ = task.await;
+        }
     }
 }
 
@@ -424,12 +437,12 @@ pub(super) async fn run_engine(mut engine: Engine, mut command_rx: mpsc::Receive
                 let Some(command) = command else {
                     // All handles were dropped without an explicit shutdown:
                     // clean up so no approvals or agents are left dangling.
-                    engine.shutdown();
+                    engine.shutdown().await;
                     break;
                 };
                 match command {
                     CoreCommand::Shutdown => {
-                        engine.shutdown();
+                        engine.shutdown().await;
                         break;
                     }
                     command => handle_command(&mut engine, command).await,
@@ -445,13 +458,30 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
         CoreCommand::GetState { reply } => {
             let _ = reply.send(state_snapshot(engine));
         }
+        CoreCommand::GetRequestSequence { session_id, reply } => {
+            let result = engine
+                .app
+                .runtime(&session_id)
+                .map(|runtime| runtime.busy.then_some(runtime.request_seq))
+                .ok_or_else(|| ApiError::not_found("session runtime not found"));
+            let _ = reply.send(result);
+        }
         CoreCommand::GetMessages {
+            cancellation,
             session_id,
             before,
             limit,
             reply,
         } => {
-            let _ = reply.send(message_page(engine, &session_id, before, limit));
+            if !reply.is_closed() {
+                let _ = reply.send(message_page(
+                    engine,
+                    &session_id,
+                    before,
+                    limit,
+                    cancellation.as_ref(),
+                ));
+            }
         }
         CoreCommand::GetMemories {
             query,
@@ -518,7 +548,12 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             text,
             reply,
         } => {
-            let result = submit_input(engine, session_id.as_deref(), &text);
+            let result = submit_input(engine, session_id.as_deref(), &text).map(|request_seq| {
+                SubmitReceipt {
+                    session_id: engine.app.active_session.clone(),
+                    request_seq,
+                }
+            });
             let _ = reply.send(result);
         }
         CoreCommand::ExecuteCommand {
@@ -543,7 +578,7 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             request_seq,
             reply,
         } => {
-            let result = cancel_session(engine, &session_id, request_seq);
+            let result = cancel_session(engine, &session_id, request_seq).await;
             let _ = reply.send(result);
         }
         CoreCommand::SetProvider {
@@ -742,7 +777,16 @@ fn message_page(
     session_id: &str,
     before: Option<i64>,
     limit: usize,
+    cancellation: Option<&RequestCancellation>,
 ) -> Result<MessagePage, ApiError> {
+    let check = || {
+        if cancellation.is_some_and(RequestCancellation::is_cancelled) {
+            Err(ApiError::internal("message request cancelled"))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     if engine.app.runtime(session_id).is_none()
         && !engine
             .app
@@ -755,7 +799,7 @@ fn message_page(
     let rows = engine
         .app
         .storage
-        .load_message_page(session_id, before, limit + 1)
+        .load_message_page_with_cancellation(session_id, before, limit + 1, cancellation)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let has_more = rows.len() > limit;
     let rows = rows.into_iter().take(limit).collect::<Vec<_>>();
@@ -765,8 +809,12 @@ fn message_page(
     let messages = rows
         .iter()
         .rev()
-        .map(stored_to_message_dto)
-        .collect::<Vec<_>>();
+        .map(|row| {
+            check()?;
+            Ok(stored_to_message_dto(row))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    check()?;
     let next_before = rows.last().map(|row| row.id);
     Ok(MessagePage {
         messages,
@@ -1184,7 +1232,7 @@ fn activate_session(engine: &mut Engine, session_id: &str) -> Result<(), ApiErro
     Ok(())
 }
 
-fn cancel_session(
+async fn cancel_session(
     engine: &mut Engine,
     session_id: &str,
     request_seq: Option<u64>,
@@ -1204,7 +1252,14 @@ fn cancel_session(
             return Ok(());
         }
     }
+    let task = engine.app.current.active_task.take();
+    if let Some(task) = &task {
+        task.abort();
+    }
     app::cancel_active_request(&mut engine.app);
+    if let Some(task) = task {
+        let _ = task.await;
+    }
     engine.clear_session_approvals(session_id);
     // `cancel_active_request` mutates the runtime in place without an
     // `AgentEvent` round trip, so broadcast the terminal event ourselves.
@@ -1802,6 +1857,65 @@ fn save_memory(
 #[cfg(test)]
 mod approval_routing_tests {
     use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_agent_cancel_before_first_task_poll_is_not_ipc_precancel() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().to_path_buf();
+        let mut config = Config::default();
+        config.data_dir = temp.path().join("data");
+        config.model_metadata.fetch = false;
+        crate::secrets::test_seed_key(config.provider.preset, "test-key");
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let storage = Storage::open(&config.data_dir.join("agent.db")).unwrap();
+        let session = storage.create_session(&workspace).unwrap();
+        let app = app::build_app(workspace, config, storage, session.clone())
+            .await
+            .unwrap();
+        let (command_tx, _rx) = mpsc::channel(64);
+        let mut engine = Engine {
+            app,
+            bridge: Arc::new(crate::bridge::EventBridge::new(64, 1024 * 1024)),
+            pending: HashMap::new(),
+            approval_timeout: Duration::from_secs(300),
+            command_tx,
+        };
+        // Submit is accepted, persisted and owns a real scheduled Tokio task.
+        // On this single-thread executor no task can run before the next yield.
+        let seq = submit_input(&mut engine, Some(&session), "accepted before task start").unwrap();
+        let started = engine.app.current.agent_task_started.clone();
+        assert!(seq > 0 && engine.app.current.busy && engine.app.current.active_task.is_some());
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        let (reply, receipt) = oneshot::channel();
+        handle_command(
+            &mut engine,
+            CoreCommand::GetRequestSequence {
+                session_id: session.clone(),
+                reply,
+            },
+        )
+        .await;
+        assert_eq!(receipt.await.unwrap().unwrap(), Some(seq));
+        // A stale sequence does not abort the accepted task.
+        cancel_session(&mut engine, &session, Some(seq + 1))
+            .await
+            .unwrap();
+        assert!(engine.app.current.busy && engine.app.current.active_task.is_some());
+        cancel_session(&mut engine, &session, Some(seq))
+            .await
+            .unwrap();
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!engine.app.current.busy && engine.app.current.active_task.is_none());
+        assert!(engine.pending.is_empty());
+        assert!(
+            engine
+                .bridge
+                .events_after(0, 64)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, Event::Cancelled { .. }))
+        );
+        engine.shutdown().await;
+    }
     use crate::{
         app::{ApprovalAction, PendingApproval},
         provider::ToolCall,
@@ -1894,6 +2008,6 @@ mod approval_routing_tests {
         assert!(engine.pending.is_empty());
         assert!(engine.app.background[&first].pending_approval.is_none());
         assert!(engine.app.current.pending_approval.is_none());
-        engine.shutdown();
+        engine.shutdown().await;
     }
 }

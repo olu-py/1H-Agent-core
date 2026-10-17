@@ -2,6 +2,22 @@ use super::*;
 use crate::protocol::{ApiErrorKind, MessageDto, PROTOCOL_VERSION};
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn cancelled_message_read_is_acknowledged_and_does_not_poison_next_read() {
+    let (_temp, handle) = test_handle().await;
+    handle.execute_command(None, "/new").await.unwrap();
+    let session = handle.snapshot().await.unwrap().active_session.unwrap();
+    let cancellation = RequestCancellation::default();
+    cancellation.cancel();
+    let error = handle
+        .messages_cancellable(&session, None, Some(100), cancellation)
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("cancelled"));
+    assert!(handle.messages(&session, None, Some(100)).await.is_ok());
+    handle.shutdown().await.unwrap();
+}
+
 async fn test_handle() -> (TempDir, AppHandle) {
     let temp = TempDir::new().unwrap();
     let workspace = temp.path().to_path_buf();

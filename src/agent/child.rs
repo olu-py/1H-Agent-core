@@ -799,9 +799,7 @@ impl AgentRunner {
                         failure = Some(error.to_string());
                         break;
                     }
-                    Err(StreamFailure::Handler(error))
-                    | Err(StreamFailure::Join(error))
-                    | Err(StreamFailure::Limit(error)) => {
+                    Err(StreamFailure::Handler(error)) | Err(StreamFailure::Limit(error)) => {
                         return Err(error);
                     }
                     Err(StreamFailure::EndedWithoutCompletion) => {

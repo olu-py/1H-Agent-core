@@ -38,6 +38,9 @@ pub struct AppHandle {
 }
 
 impl AppHandle {
+    pub fn cursor_subscriber_count(&self) -> usize {
+        self.inner.bridge.cursor_subscriber_count()
+    }
     pub(super) fn new(
         command_tx: mpsc::Sender<CoreCommand>,
         bridge: Arc<crate::bridge::EventBridge>,
@@ -78,8 +81,31 @@ impl AppHandle {
         before: Option<i64>,
         limit: Option<usize>,
     ) -> Result<MessagePage, ApiError> {
+        self.message_request(session_id, before, limit, None).await
+    }
+
+    /// Cancelable read; completion acknowledges that backend work stopped.
+    pub async fn messages_cancellable(
+        &self,
+        session_id: &str,
+        before: Option<i64>,
+        limit: Option<usize>,
+        cancellation: super::RequestCancellation,
+    ) -> Result<MessagePage, ApiError> {
+        self.message_request(session_id, before, limit, Some(cancellation))
+            .await
+    }
+
+    async fn message_request(
+        &self,
+        session_id: &str,
+        before: Option<i64>,
+        limit: Option<usize>,
+        cancellation: Option<super::RequestCancellation>,
+    ) -> Result<MessagePage, ApiError> {
         let (tx, rx) = oneshot::channel();
         self.send(CoreCommand::GetMessages {
+            cancellation,
             session_id: session_id.to_owned(),
             before,
             limit: limit
@@ -168,6 +194,18 @@ impl AppHandle {
     /// request sequence assigned to the new request; pass it to [`Self::cancel`]
     /// so a stale cancel never aborts a newer request.
     pub async fn submit(&self, session_id: Option<String>, text: &str) -> Result<u64, ApiError> {
+        Ok(self
+            .submit_with_receipt(session_id, text)
+            .await?
+            .request_seq)
+    }
+
+    /// Session identity and sequence captured in the same serialized command.
+    pub async fn submit_with_receipt(
+        &self,
+        session_id: Option<String>,
+        text: &str,
+    ) -> Result<super::SubmitReceipt, ApiError> {
         let (tx, rx) = oneshot::channel();
         self.send(CoreCommand::SubmitInput {
             session_id,
@@ -231,6 +269,19 @@ impl AppHandle {
         .await?;
         rx.await
             .map_err(|_| ApiError::internal("command dropped"))?
+    }
+
+    /// Reconnecting adapters obtain the active sequence from the serialized
+    /// engine, never a local submit counter. Idle runtimes return `None`.
+    pub async fn request_sequence(&self, session_id: &str) -> Result<Option<u64>, ApiError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(CoreCommand::GetRequestSequence {
+            session_id: session_id.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| ApiError::internal("request sequence unavailable"))?
     }
 
     /// Switches the server-side active session.
@@ -381,6 +432,27 @@ impl AppHandle {
         after: u64,
     ) -> Result<crate::bridge::Subscription, crate::bridge::ResyncRequired> {
         self.inner.bridge.subscribe_from(after)
+    }
+
+    /// Subscribes from a cursor with a coalescing wakeup. Consumers retrieve
+    /// work from the bounded event ring using `events_after`; notifications do
+    /// not accumulate when a consumer is slower than the producer.
+    pub fn subscribe_cursor_from(
+        &self,
+        after: u64,
+    ) -> Result<crate::bridge::CursorSubscription, crate::bridge::ResyncRequired> {
+        self.inner.bridge.subscribe_cursor_from(after)
+    }
+
+    /// Retrieves at most `limit` events after a cursor. `None` indicates that
+    /// the requested history left the replay window and a snapshot resync is
+    /// required.
+    pub fn events_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Option<Vec<Arc<crate::protocol::Envelope>>> {
+        self.inner.bridge.events_after(after, limit)
     }
 
     /// The current process-global cursor (matches the latest snapshot).

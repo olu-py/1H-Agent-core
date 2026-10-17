@@ -1077,6 +1077,7 @@ pub struct SseEvent {
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
+    scan_pos: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1112,15 +1113,27 @@ impl SseDecoder {
         }
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some((position, delimiter_len)) = find_event_boundary(&self.buffer) {
-            if position > max_frame_bytes {
+        let mut consumed = 0;
+        while let Some((position, delimiter_len)) = find_event_boundary(&self.buffer, self.scan_pos)
+        {
+            if position - consumed > max_frame_bytes {
                 return Err(SseDecodeError::FrameTooLarge.to_string());
             }
-            let frame = self.buffer.drain(..position).collect::<Vec<_>>();
-            self.buffer.drain(..delimiter_len);
-            if let Some(event) = parse_sse_frame(&frame) {
+            if let Some(event) = parse_sse_frame(&self.buffer[consumed..position]) {
                 events.push(event);
             }
+            consumed = position + delimiter_len;
+            self.scan_pos = consumed;
+        }
+        if consumed > 0 {
+            self.scan_pos = self.scan_pos.max(self.buffer.len().saturating_sub(3));
+            self.buffer.drain(..consumed);
+            self.scan_pos -= consumed;
+        } else {
+            // A delimiter can straddle the next network chunk. Keep only the
+            // final three bytes in the scan window so each byte is inspected
+            // at most once across pushes (apart from this fixed overlap).
+            self.scan_pos = self.buffer.len().saturating_sub(3);
         }
         if self.buffer.len() > max_buffer_bytes {
             return Err(SseDecodeError::BufferTooLarge.to_string());
@@ -1137,17 +1150,18 @@ impl SseDecoder {
     }
 }
 
-fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| (position, 4))
-        .or_else(|| {
-            buffer
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|position| (position, 2))
-        })
+fn find_event_boundary(buffer: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut position = start;
+    while position < buffer.len() {
+        if buffer.get(position..position + 4) == Some(b"\r\n\r\n") {
+            return Some((position, 4));
+        }
+        if buffer.get(position..position + 2) == Some(b"\n\n") {
+            return Some((position, 2));
+        }
+        position += 1;
+    }
+    None
 }
 
 fn parse_sse_frame(frame: &[u8]) -> Option<SseEvent> {
@@ -1229,6 +1243,42 @@ mod tests {
         let events = decoder.push(&Bytes::from("1}\n\n"));
         assert_eq!(events[0].event.as_deref(), Some("x"));
         assert_eq!(events[0].data, "{\"a\":1}");
+    }
+
+    #[test]
+    fn decodes_sse_boundaries_in_input_order_for_lf_crlf_and_mixed_frames() {
+        let input = Bytes::from("data: first\n\ndata: second\r\n\r\ndata: third\n\n");
+        let mut decoder = SseDecoder::default();
+        let events = decoder.try_push(&input, 1024, 2048).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.data.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+        assert!(decoder.buffer.is_empty());
+    }
+
+    #[test]
+    fn retains_partial_crlf_boundary_between_chunks() {
+        let mut decoder = SseDecoder::default();
+        assert!(
+            decoder
+                .try_push(&Bytes::from_static(b"data: one\r\n\r"), 1024, 2048)
+                .unwrap()
+                .is_empty()
+        );
+        let events = decoder
+            .try_push(&Bytes::from_static(b"\ndata: two\n\n"), 1024, 2048)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.data.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
     }
 
     #[test]
