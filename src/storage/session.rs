@@ -22,7 +22,7 @@ pub(super) fn set_session_head(
     deactivate_previous: bool,
     now: &str,
 ) -> Result<(), StorageError> {
-    if deactivate_previous && let Some(previous) = previous {
+    if let Some(previous) = previous.filter(|_| deactivate_previous) {
         tx.execute(
             "UPDATE turns SET on_active_path = 0 WHERE id = ?1 AND session_id = ?2",
             params![previous, session_id],
