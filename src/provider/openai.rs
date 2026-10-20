@@ -105,6 +105,18 @@ impl OpenAiClient {
         Ok(client)
     }
 
+    #[cfg(test)]
+    pub(crate) fn scripted_events_then_failure(
+        events: Vec<ModelEvent>,
+        error: ProviderError,
+    ) -> Result<Self, ProviderError> {
+        let mut client = Self::new("http://127.0.0.1".into(), "test".into())?;
+        client.scripted_steps = Some(std::sync::Arc::new(Mutex::new(
+            [ScriptedStep::EventsThenFail(events, error)].into(),
+        )));
+        Ok(client)
+    }
+
     pub async fn stream(
         &self,
         request: ModelRequest,

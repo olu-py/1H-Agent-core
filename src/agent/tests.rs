@@ -1110,6 +1110,57 @@ async fn child_agent_creates_nested_session_with_model_and_result() {
 }
 
 #[tokio::test]
+async fn child_provider_failure_preserves_already_streamed_partial_answer() {
+    let temp = TempDir::new().unwrap();
+    let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+    let parent = storage.create_session(temp.path()).unwrap();
+    let tools = Arc::new(ToolRegistry::new(
+        Workspace::new(temp.path()).unwrap(),
+        RuntimeConfig::default(),
+        false,
+    ));
+    let provider = OpenAiClient::scripted_events_then_failure(
+        vec![ModelEvent::TextDelta("partial child answer".into())],
+        ProviderError::Status {
+            status: 503,
+            message: "fixture stream failure".into(),
+            retry_after_ms: None,
+        },
+    )
+    .unwrap();
+    let runner = AgentRunner::new(
+        provider,
+        ProviderPreset::OpenAi.defaults(),
+        tools,
+        storage.clone(),
+        parent,
+    );
+    let call = ToolCall {
+        id: "child-stream-failure".into(),
+        name: "agent_spawn".into(),
+        arguments: serde_json::json!({"prompt":"inspect failure","role":"plan"}),
+    };
+    let (events, _receiver) = mpsc::channel(16);
+
+    let outcome = runner.run_child(&call, &events).await.unwrap();
+    let payload: Value = serde_json::from_str(&outcome).unwrap();
+
+    assert_eq!(payload["status"], "failed");
+    assert!(
+        payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("partial child answer")
+    );
+    assert!(
+        payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("fixture stream failure")
+    );
+}
+
+#[tokio::test]
 async fn child_concurrency_slots_enforce_the_configured_limit() {
     let temp = TempDir::new().unwrap();
     let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
