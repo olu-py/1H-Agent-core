@@ -129,10 +129,10 @@ impl OpenAiClient {
                         None
                     };
                     let Some(delay) = delay else {
-                        return Err(error);
+                        return Err(self.sanitize_provider_error(error));
                     };
                     let delay_ms = delay.as_millis() as u64;
-                    let reason = retry_reason(&error);
+                    let reason = self.redact_provider_message(&retry_reason(&error));
                     tracing::warn!(
                         status = %reason,
                         attempt,
@@ -183,7 +183,7 @@ impl OpenAiClient {
             .timeout(Duration::from_millis(timeout_ms.max(1)))
             .send()
             .await
-            .map_err(ProviderError::Http)?;
+            .map_err(|error| self.sanitize_provider_error(ProviderError::Http(error)))?;
         let status = response.status();
         if !status.is_success() {
             let retry_after_ms = response
@@ -191,21 +191,26 @@ impl OpenAiClient {
                 .get(RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_retry_after);
-            let bytes = response.bytes().await.map_err(ProviderError::Http)?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| self.sanitize_provider_error(ProviderError::Http(error)))?;
             let message =
                 String::from_utf8_lossy(&bytes[..bytes.len().min(16 * 1024)]).into_owned();
             return Err(ProviderError::Status {
                 status: status.as_u16(),
-                message,
+                message: self.redact_provider_message(&message),
                 retry_after_ms,
             });
         }
         let body =
             crate::model_meta::read_capped(response, crate::model_meta::PROVIDER_MODELS_BODY_CAP)
                 .await
-                .map_err(ProviderError::Protocol)?;
+                .map_err(|error| self.sanitize_provider_error(ProviderError::Protocol(error)))?;
         let value: Value = serde_json::from_slice(&body).map_err(|error| {
-            ProviderError::Protocol(format!("invalid models response: {error}"))
+            self.sanitize_provider_error(ProviderError::Protocol(format!(
+                "invalid models response: {error}"
+            )))
         })?;
         Ok(crate::model_meta::parse_provider_models(&value))
     }
@@ -234,7 +239,12 @@ impl OpenAiClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| (false, ProviderError::Http(error)))?;
+            .map_err(|error| {
+                (
+                    false,
+                    self.sanitize_provider_error(ProviderError::Http(error)),
+                )
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -253,7 +263,7 @@ impl OpenAiClient {
                 false,
                 ProviderError::Status {
                     status: status.as_u16(),
-                    message,
+                    message: self.redact_provider_message(&message),
                     retry_after_ms,
                 },
             ));
@@ -307,6 +317,36 @@ impl OpenAiClient {
                 .map_err(|_| (true, ProviderError::ReceiverClosed))?;
         }
         Ok(())
+    }
+
+    fn redact_provider_message(&self, message: &str) -> String {
+        let message = if self.api_key.is_empty() {
+            message.to_owned()
+        } else {
+            message.replace(&self.api_key, "[REDACTED]")
+        };
+        crate::secrets::redact(&message)
+    }
+
+    fn sanitize_provider_error(&self, error: ProviderError) -> ProviderError {
+        match error {
+            ProviderError::Http(error) => ProviderError::Protocol(
+                self.redact_provider_message(&format!("request failed: {error}")),
+            ),
+            ProviderError::Status {
+                status,
+                message,
+                retry_after_ms,
+            } => ProviderError::Status {
+                status,
+                message: self.redact_provider_message(&message),
+                retry_after_ms,
+            },
+            ProviderError::Protocol(message) => {
+                ProviderError::Protocol(self.redact_provider_message(&message))
+            }
+            ProviderError::ReceiverClosed => ProviderError::ReceiverClosed,
+        }
     }
 
     #[cfg(test)]
@@ -1189,6 +1229,21 @@ mod tests {
         let mut client = OpenAiClient::new("http://127.0.0.1".into(), "test".into())?;
         client.scripted_steps = Some(std::sync::Arc::new(Mutex::new(steps.into())));
         Ok(client)
+    }
+
+    #[test]
+    fn provider_error_redaction_covers_exact_custom_key_with_punctuation() {
+        let client = OpenAiClient::new(
+            "http://127.0.0.1".into(),
+            "custom/key.with.punctuation".into(),
+        )
+        .unwrap();
+        let message = client.redact_provider_message(
+            "gateway echoed credential=custom/key.with.punctuation; retry later",
+        );
+
+        assert!(!message.contains("custom/key.with.punctuation"));
+        assert_eq!(message, "gateway echoed credential=[REDACTED]; retry later");
     }
 
     #[tokio::test]
