@@ -1,49 +1,25 @@
 # protium-core
 
-`1H` 指氕（protium，氢-1 同位素）。protium-core 是 1H-Agent 的 UI 无关后端核心库：会话状态机、模型/工具循环、权限与审批、SQLite 持久化，以及供所有前端适配器使用的 v2 UI 协议。
+`1H` 指氕（protium，氢-1 同位素）。protium-core 是 1H-Agent 的 UI 无关后端核心库：会话状态机、模型/工具循环、权限与审批、SQLite 持久化，以及供所有前端使用的 v2 UI 协议。
 
-本仓库只发布 Rust 库、协议 TypeScript bindings 和一致性夹具，**不含可直接给终端用户运行的程序**。想直接用 Agent，请安装下面的消费端；想把核心接进自己的前端，请从「作为库接入」开始。
+本仓库只发布 Rust 库、协议 TypeScript bindings 和一致性夹具，不含可直接给终端用户运行的程序。
 
-## 想直接用？安装消费端
+## 安装消费端
 
 | 消费端 | 形态 | 安装 |
 | --- | --- | --- |
 | [1H-Agent](https://github.com/olu-py/1H-Agent) | Ratatui/Crossterm 终端界面 | `cargo install --git https://github.com/olu-py/1H-Agent.git --locked --bin 1h-agent` |
 | [1H-Agent-webUI](https://github.com/olu-py/1H-Agent-webUI) | 单二进制内嵌 HTTP/SSE 与 React 页面 | `cargo install --git https://github.com/olu-py/1H-Agent-webUI.git --locked --bin 1h-agent-web` |
 
-两个消费端都是独立仓库，各自拥有源码、`Cargo.lock`、版本、Release 和提交历史；本仓库不使用 submodule，也不与它们共享 push 范围。安装完成后按各仓库 README 配置 Provider 与 API Key 即可开始对话。
-
-## 版本与兼容性
-
-| 项 | 当前值 |
-| --- | --- |
-| crate 版本 | `0.5.0` |
-| UI 协议版本 | `protocol::PROTOCOL_VERSION = 2` |
-| Edition / MSRV | 2024 / Rust 1.85 |
-| 平台 | Linux、macOS、Windows |
-
-协议只做加法演进：新增事件变体或字段必须能被旧消费端忽略，未知事件静默忽略；不重命名、不重排、不复用旧 tag。
-
-## 能力总览
-
-- **会话状态机**：多会话与树形子会话、切换、fork、软删、undo/redo（含文件快照回滚）；所有变更经单一命令队列串行进入核心状态机。
-- **模型与工具循环**：流式思考与正文字段、工具调用参数流式进度、上下文压缩与溢出恢复；Provider 事件先归一化为公共事件再映射进协议。
-- **四种模式**：`build`、`plan`、`explore`、`cluster`。集群模式下主 Agent 通过 `agent_spawn` 调度有界子 Agent，子会话以树形展示。
-- **权限与审批**：工作区路径限定、SSRF 校验、默认 Deny + 变更操作需审批 + 只读模式拦截 + `permissions.tools` 覆盖；审批按 `approval_id` 决策，可本会话放行。
-- **持久化**：SQLite/WAL 单连接；消息、工具调用、Provider 状态、文件快照与中断的未完成回答全部落盘。
-- **上下文计量**：模型窗口按「显式配置 > 运行时发现（`GET /models`）> models.dev 社区快照 > 内置注册表」四层解析，核心是容量的唯一权威。
-- **扩展能力**：OpenAI Responses 与 Chat Completions 兼容协议、本地 stdio MCP 子集、可选外部浏览器桥、自定义斜杠命令与 Agent 模板。
-- **密钥**：API Key 只来自环境变量或系统钥匙串，不写入 TOML、SQLite、日志、导出或模型上下文。
+两仓各自拥有源码、`Cargo.lock`、版本、Release 和提交历史；本仓库不使用 submodule，也不与它们共享 push 范围。安装后按各仓 README 配置 Provider 与 API Key。
 
 ## 作为库接入
-
-在消费端的 `Cargo.toml` 中声明 Git 依赖：
 
 ```toml
 protium-core = { git = "https://github.com/olu-py/1H-Agent-core.git", branch = "main" }
 ```
 
-下面是接入骨架（可运行完整版本见 [`examples/minimal.rs`](examples/minimal.rs)，用 `cargo run --example minimal -- /path/to/workspace` 运行）：
+启动骨架（可运行完整版见 [`examples/minimal.rs`](examples/minimal.rs)，用 `cargo run --example minimal -- /path/to/workspace` 运行）：
 
 ```rust
 use std::{path::PathBuf, time::Duration};
@@ -80,45 +56,30 @@ handle.approve(&approval_id, true, false).await?; // accept / allow_session
 handle.shutdown().await?;
 ```
 
-`AppService::start` 会用独占锁锁定工作区：第二个进程打开同一工作区会立即失败。
+`AppService::start` 会以独占锁锁定工作区：第二个进程打开同一工作区会立即失败。
 
-## 接口速查
+接口语义、事件顺序与游标规则以 [Core UI Contract](../.agents/guides/core/ui-contract.md) 为准；这里只列启动五步：`AppService::start` → `snapshot()` → `subscribe_from(cursor)` → `submit(session_id, text)` → `shutdown()`。
 
-消费端只经 `AppHandle` 驱动核心，不得触碰 `SessionRuntime`、`AgentRunner`、`Storage`、Provider 或审批 oneshot。
+## 版本与兼容性
 
-| 分类 | 入口 |
+| 项 | 当前值 |
 | --- | --- |
-| 启动 / 关停 | `AppService::start(CoreConfig)` -> `AppHandle`；`AppHandle::shutdown` |
-| 状态快照 | `AppHandle::snapshot()` -> `AppSnapshotV2` |
-| 消息分页 | `AppHandle::messages(session_id, before, limit)` -> `MessagePage`（游标分页，limit 归一化到 20..=200） |
-| 提交 / 命令 | `AppHandle::submit(session_id, text)`（返回 `request_seq`）；`AppHandle::execute_command` |
-| 取消 | `AppHandle::cancel(session_id, request_seq)`（序号不匹配则静默忽略，防陈旧取消误杀新请求） |
-| 会话切换 | `AppHandle::activate_session(session_id)` |
-| 审批 | `AppHandle::approve(approval_id, accept, allow_session)`；本会话放行只驻留内存 |
-| Provider 切换 | `set_provider` / `set_provider_config` / `set_provider_profile` / `remove_provider` |
-| Provider 视图 | `provider_settings()` -> `ProviderSettingsDto`；`provider_models(refresh)` -> `ProviderModelsDto`（均为非密钥字段） |
-| 密钥 | `secrets::store_api_key_cached` / `secrets::api_key_cached`（只暴露存在性与解锁入口） |
-| 事件流 | `AppHandle::subscribe_from(cursor)` 原子订阅（replay + live）；或 `replay_after(cursor)` + `subscribe()` |
-| 游标与容量 | `AppHandle::current_cursor()` / `event_capacity()` / `event_max_bytes()` |
+| crate 版本 | `0.5.0` |
+| UI 协议版本 | `protocol::PROTOCOL_VERSION = 2` |
+| Edition / MSRV | 2024 / Rust 1.85 |
+| 平台 | Linux、macOS、Windows |
 
-### 事件流时序
+协议只做加法演进：新增事件变体或字段必须能被旧消费端忽略，未知事件静默忽略；不重命名、不重排、不复用旧 tag。
 
-1. `snapshot()` 取当前状态，记下 `event_cursor`。
-2. `subscribe_from(event_cursor)` 原子返回 replay + live；replay 与 live 的重叠按 cursor 去重（跳过 `<=` 已处理游标的 live 事件）。
-3. 消费滞后或游标被逐出时核心发送 `ResyncRequired`：重取快照与消息页，再从新游标重新订阅，不要猜缺失状态。
-4. `Approval` 到达必须立即展示；`ApprovalResolved` 到达则关闭匹配项，并从快照收敛全局下一个审批。
+## 能力
 
-完整契约、事件顺序（`ReasoningDelta* -> ReasoningCompleted -> TextDelta* -> ToolCallStreaming* -> Approval/ToolStarted`）与诊断表见本地共享指南 `../.agents/guides/core/ui-contract.md`（需要另行取得工作区资料）。
+会话树与 fork/软删/undo（含文件快照回滚）；流式思考与工具调用；上下文压缩与溢出恢复；四种模式 `build`/`plan`/`explore`/`cluster`；权限审批、SSRF 校验与只读拦截；SQLite/WAL 持久化，消息、工具调用、Provider 状态与中断回答全部落盘；上下文窗口按「显式配置 > 运行时发现 > models.dev 快照 > 内置注册表」四层解析；OpenAI Responses/Chat 兼容、stdio MCP 子集、自定义斜杠命令与 Agent 模板。
 
-## 协议产物
+安全边界：文件工具限制在 `CoreConfig::workspace` 内，拒绝 `..`、绝对路径与符号链接逃逸；写入、删除、命令和浏览器交互按策略审批，`permissions.tools` 的 `deny` 优先于本会话放行。API Key 只来自环境变量或系统钥匙串，不写入 TOML、SQLite、日志、导出或模型上下文。
 
-- [`bindings/`](bindings) 中的 `.ts` 由 `#[ts(export)]` 生成的 `export_bindings_*` 测试在 `cargo test` 时写出并校验，以无漂移为准（ts-rs 默认配置、`bigint`），供 Web 前端直接消费。
-- [`conformance/`](conformance) 是 19 个可重放场景夹具，由 `src/conformance.rs` 在 `test-util` feature 下导出并做无漂移校验；消费端在 dev-dependencies 启用同一 feature 即可重放同一语料。
-- `protium-tsgen` 二进制（`with_large_int("number")`）输出仅供参考，不参与无漂移校验。
+## 配置
 
-## 配置与密钥
-
-`Config::load(explicit_path, workspace)` 依次读取显式路径与平台配置目录下的 `1h-agent/config.toml`；全部配置键与默认值见 [`config/config.example.toml`](config/config.example.toml)。常用环境变量：
+`Config::load(explicit_path, workspace)` 依次读取显式路径与平台配置目录下的 `1h-agent/config.toml`；全部键与默认值见 [`config/config.example.toml`](config/config.example.toml)。常用环境变量：
 
 | 变量 | 作用 |
 | --- | --- |
@@ -126,14 +87,11 @@ handle.shutdown().await?;
 | `AGENT_DATA_DIR` | 会话数据库与工作区锁目录（默认平台数据目录下的 `1h-agent`） |
 | `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` / `DASHSCOPE_API_KEY` / `ARK_API_KEY` / `AGENT_API_KEY` | 各 Provider 的 API Key（环境变量优先于系统钥匙串） |
 
-配置节涵盖 `[provider]`、`[[providers]]`、`[runtime]`、`[compaction]`、`[model_metadata]`、`[cluster]`、`[security]`、`[permissions.tools]`、`[browser]`、`[[commands]]`、`[[mcp_servers]]`、`[[agents]]`；`[ui]` 与 `[server]` 由消费端使用，核心忽略。所有数值上限都会在加载时归一化到安全区间。API Key 只来自环境变量或系统钥匙串，不进入 TOML、SQLite、日志、导出或模型上下文。
+## 协议产物
 
-## 安全边界
-
-- 文件工具只能访问 `CoreConfig::workspace` 内的路径，拒绝 `..`、绝对路径逃逸与符号链接逃逸。
-- 写入、删除、命令、变更型 Git 操作与浏览器交互按策略要求审批；`permissions.tools` 可设 `allow` / `ask` / `deny`，`deny` 始终优先于本会话放行。
-- 外部进程工具带超时、输出截断、取消与进程树清理；网络工具校验 HTTP/HTTPS 与公网地址（`security.allow_private_networks` 可放行私网）。
-- Provider 的私有 JSON/SSE 只在下游归一化为公共事件，消费端拿不到原始模型协议载荷。
+- [`bindings/`](bindings)：`.ts` 由 `#[ts(export)]` 在 `cargo test` 时写出并校验无漂移（ts-rs 默认配置、`bigint`），供 Web 前端直接消费。
+- [`conformance/`](conformance)：19 个可重放场景，由 `src/conformance.rs` 在 `test-util` feature 下导出并做无漂移校验；消费端在 dev-dependencies 启用同一 feature 即可重放。
+- `protium-tsgen`（`with_large_int("number")`）输出仅供参考，不参与无漂移校验。
 
 ## 构建与验证
 
@@ -156,17 +114,17 @@ cargo --config \
   test --all-features --locked
 ```
 
-该覆盖不修改受跟踪的 `Cargo.toml`，但 Cargo 可能临时改写消费端 `Cargo.lock`；本地 patch 与临时锁文件不得提交。完整的跨仓库交付顺序见下表。
+该覆盖不修改受跟踪的 `Cargo.toml`，但 Cargo 可能临时改写消费端 `Cargo.lock`；本地 patch 与临时锁文件不得提交。
 
-## 文档导航
+## 文档
 
 | 文档 | 内容 |
 | --- | --- |
 | [AGENTS.md](AGENTS.md) | Core 模块维护入口 |
-| [本地共享 Core 专题指南](../.agents/guides/core/) | Runtime、Provider、Cluster、Tools、Storage、UI Contract 与 Release |
-| [本地共享 Git 工作流 Skill](../.agents/skills/git-pr-local-sync/SKILL.md) | commit、push、PR 检查/合并与本地同步 |
+| [本地共享 Core 指南](../.agents/guides/core/) | Runtime、Provider、Cluster、Tools、Storage、UI Contract 与 Release |
+| [Git 工作流 Skill](../.agents/skills/git-pr-local-sync/SKILL.md) | commit、push、PR 检查/合并与本地同步 |
 
-共享指南保存在同级 `1HAgent/` 工作区，不随此仓库单独 clone 或 push。需要在独立 clone 中维护时，另行取得工作区资料。
+共享指南保存在同级 `1HAgent/` 工作区，不随此仓库单独 clone 或 push。
 
 ## License
 
