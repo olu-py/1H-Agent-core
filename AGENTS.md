@@ -1,58 +1,7 @@
-# protium-core AI 维护协议
+# Core 模块入口
 
-> 先读本文件，再按任务路由只读一个相关专题及目标源码；跨领域任务才组合读取，禁止为背景扫描整个仓库。
+共同维护规则见[工作区 AGENTS.md](../AGENTS.md)。本仓库负责 Rust 核心、运行时、Provider、工具和持久化；Git 历史、CI 与发布保持独立。
 
-## 稳定上下文
+按任务阅读[Core 专题指南](../.agents/guides/core/)，再核对其中指向的源码和测试。面向用户的产品文档继续由本仓库 `docs/` 管理。
 
-```text
-project: protium-core（1H = 氕/protium；1H-Agent 的 UI 无关后端核心库）
-goal: 极致轻量、高性能、权限感知的 Agent 核心；核心独立演进，TUI/WebUI/Desktop 为外部消费端项目
-runtime: Rust/Tokio 单库（SQLite/WAL）；消费端只经通用接口连接核心
-authority: 源码 > config/config.example.toml > 本文件 > 专题指南
-scope: 核心状态机、通用 UI 协议、模型流、受控工具、多会话、AI 集群
-excluded: TUI/WebUI/Desktop 源码、HTTP/SSE 服务器、内置浏览器、远程 MCP、动态插件、图片语音能力
-```
-
-核心独占 SessionRuntime/AgentRunner/Provider 与密钥/ToolRegistry 与 Security/Storage(SQLite)/审批 oneshot，以及命令串行队列与取消、关停逻辑；消费端不得触碰以上任何一项。不引入 Node.js、Python、Chromium、动态插件 ABI 或后台轮询。所有路径、网络、工具、进程、缓存、channel 和输出必须有边界、取消与释放路径。
-
-## 一分钟工作流
-
-1. 先运行 `git status --short --branch`，识别并保护用户已有改动。
-2. 用 `rg` 定位定义、直接调用者、事件变体和相邻测试；只读任务命中的专题。
-3. 核心状态机在 `src/service.rs`（`AppService`/`Engine`/`AppHandle`），单会话在 `src/session.rs`（`SessionRuntime`），模型/工具循环在 `src/agent.rs`（`AgentRunner`）；消费端契约在 `src/protocol.rs`/`src/bridge.rs`。
-4. 修改事件、配置或持久化类型时，覆盖所有构造点、match、序列化、恢复和测试。
-5. 先跑最小目标测试；跨模块行为才升级到完整 Clippy 和测试。
-6. core/消费端联调先用命令行本地 path patch 指向独立 core clone；交付前必须移除 patch、先完成并 push core，再由消费端定向更新 Git 锁文件和 `--locked` 复测；禁止修改 Cargo checkout。
-
-## 任务路由
-
-| 领域 | 首读入口 | 专题 |
-| --- | --- | --- |
-| 通用 UI 契约、事件游标/回放、resync | `src/protocol.rs`、`src/bridge.rs`、`src/service.rs` | [UI Contract](docs/guides/ui-contract.md) |
-| 启动、全局状态、会话路由 | `src/service.rs`、`src/app.rs` | [Runtime](docs/guides/runtime.md) |
-| Provider、模型、密钥、协议、压缩恢复 | `src/config.rs`、`src/agent.rs`、`src/provider/openai.rs` | [Provider](docs/guides/provider.md) |
-| 子 Agent、审批、取消、集群停滞 | `src/agent.rs`、`src/service.rs` | [Cluster](docs/guides/cluster.md) |
-| 工具、路径、SSRF、外部进程 | `src/tools/`、`src/security.rs` | [Tools](docs/guides/tools.md) |
-| 会话、分支、迁移、持久化 | `src/storage.rs`、`src/session.rs` | [Storage](docs/guides/storage.md) |
-| 配置上限、容量归一化、新增配置键 | `src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | Provider 专题（容量预算）；同步 `defaults_are_bounded` 类测试 |
-| 版本、GitHub PR、提交推送与本地同步 | `Cargo.toml`、`Cargo.lock`、`bindings/`、`conformance/` | [Release](docs/guides/release.md)、[Git 交付流程](docs/git-pr-local-sync.md)；可用项目 Skill [`git-pr-local-sync`](.agents/skills/git-pr-local-sync/SKILL.md) |
-
-指南与源码不一致时以源码为准，并在同一改动中更新该指南；一个事实只归属根文档或一个专题。根文档 ≤85 行；docs/guides/ 下的专题指南 ≤50 行且须含「适用范围/入口/不变量/诊断/验证」五节；被根文档路由的其他文档（如 docs/git-pr-local-sync.md、项目 Skill）各有行数预算，全部由 scripts/check-agent-docs.sh 强校验。
-
-## 消费端接入约束（摘要）
-
-消费端只允许 `AppService::start(CoreConfig)`、`AppHandle` 的 snapshot/messages/submit/request_sequence/execute_command/approve/cancel/activate_session/set_provider/subscribe/shutdown 接口，以及 `protocol.rs` DTO 与 `bridge.rs` 原子订阅（`subscribe_from`/`ResyncRequired`）。启动先取 snapshot，再 `subscribe_from(event_cursor)` 原子订阅并按 cursor 去重；`submit` 返回请求序号、`cancel` 携带之防陈旧取消；协议只做加法演进，未知事件静默忽略。完整契约见 UI Contract 专题，接口示例见 `examples/minimal.rs`。
-
-## 实施与验证
-
-| 改动 | 最小验证 |
-| --- | --- |
-| 文档 | `bash scripts/check-agent-docs.sh`、`git diff --check` |
-| 迭代中 | `cargo test --lib --all-features --locked <filter>` |
-| 局部 Rust 完成 | `cargo fmt --all -- --check`、`cargo test --lib --all-features --locked` |
-| 工具/存储/安全/进程或跨模块 | `cargo clippy --all-targets --all-features --locked -- -D warnings`、`cargo test --all-features --locked` |
-| 发布给消费端 | 完整验证后先提交并 push core；再由 TUI/WebUI 各自更新锁文件与适配 |
-
-保持改动聚焦，复用现有 helper，不清理无法证明无用的文件。事件/协议/持久化类型改动必须覆盖所有构造点、match、序列化与恢复测试。本仓库自 1H-Agent 提取（消费端项目各自持有前端源码）；未运行的检查必须在最终回复说明。
-
-构建产物只落在仓库默认 `target/`：不得用 `CARGO_TARGET_DIR` 为工具链或用途另开目录（同一目录内 rustc 版本与 SourceId 的产物各按指纹共存、互不驱逐，分开只会重复编译）；中间产物由 `$CARGO_HOME/config.toml` 的 `build.build-dir` 在仓库间共享，因此**不要运行 `cargo clean`**——它会清空共享缓存、让三个仓库一起冷启，需要回收空间时直接删除缓存目录，单包清理用 `cargo clean -p <包名>`。本仓库的 MSRV 档位（CI 的 `minimum-rust`）与 stable 产物同目录共存。
+Git 交付使用[共享工作流 Skill](../.agents/skills/git-pr-local-sync/SKILL.md)。
