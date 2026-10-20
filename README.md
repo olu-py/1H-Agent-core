@@ -108,7 +108,7 @@ handle.shutdown().await?;
 3. 消费滞后或游标被逐出时核心发送 `ResyncRequired`：重取快照与消息页，再从新游标重新订阅，不要猜缺失状态。
 4. `Approval` 到达必须立即展示；`ApprovalResolved` 到达则关闭匹配项，并从快照收敛全局下一个审批。
 
-完整契约、事件顺序（`ReasoningDelta* -> ReasoningCompleted -> TextDelta* -> ToolCallStreaming* -> Approval/ToolStarted`）与诊断表见 [`docs/guides/ui-contract.md`](docs/guides/ui-contract.md)。
+完整契约、事件顺序（`ReasoningDelta* -> ReasoningCompleted -> TextDelta* -> ToolCallStreaming* -> Approval/ToolStarted`）与诊断表见本地共享指南 `../.agents/guides/core/ui-contract.md`（需要另行取得工作区资料）。
 
 ## 协议产物
 
@@ -162,15 +162,11 @@ cargo --config \
 
 | 文档 | 内容 |
 | --- | --- |
-| [AGENTS.md](AGENTS.md) | AI/维护者入口：架构、源码路由、安全边界与分级验证 |
-| [UI Contract](docs/guides/ui-contract.md) | 通用 UI 契约、事件游标/回放/resync、协议演进规则 |
-| [Runtime](docs/guides/runtime.md) | 生命周期、后台容量、会话切换、取消与审批拒绝 |
-| [Provider](docs/guides/provider.md) | Provider 配置、密钥、请求协议、压缩与恢复 |
-| [Cluster](docs/guides/cluster.md) | AI 集群调度、审批 owner、预算与子会话 |
-| [Tools](docs/guides/tools.md) | 内置工具、权限分类、路径安全与 SSRF |
-| [Storage](docs/guides/storage.md) | schema/迁移、会话树、undo/redo 与快照 |
-| [Release](docs/guides/release.md) | 版本、Git 交付与消费端更新顺序 |
-| [GitHub 交付与本地同步](docs/git-pr-local-sync.md) | commit、push、PR 检查/合并、合并后本地对齐与异常处理 |
+| [AGENTS.md](AGENTS.md) | Core 模块维护入口 |
+| [本地共享 Core 专题指南](../.agents/guides/core/) | Runtime、Provider、Cluster、Tools、Storage、UI Contract 与 Release |
+| [本地共享 Git 工作流 Skill](../.agents/skills/git-pr-local-sync/SKILL.md) | commit、push、PR 检查/合并与本地同步 |
+
+共享指南保存在同级 `1HAgent/` 工作区，不随此仓库单独 clone 或 push。需要在独立 clone 中维护时，另行取得工作区资料。
 
 ## License
 

@@ -796,6 +796,13 @@ impl AgentRunner {
                     Ok(()) => {}
                     Err(StreamFailure::Provider(error)) => {
                         status = ChildSessionStatus::Failed;
+                        if !collector.assistant_text.is_empty() {
+                            append_text_bounded(
+                                &mut final_answer,
+                                &collector.assistant_text,
+                                child_max_output_bytes,
+                            );
+                        }
                         failure = Some(error.to_string());
                         break;
                     }
