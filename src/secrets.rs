@@ -4,6 +4,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use base64::Engine as _;
 use thiserror::Error;
 
 use crate::config::ProviderPreset;
@@ -158,6 +159,120 @@ pub fn redact(input: &str) -> String {
         .join(" ")
 }
 
+/// Redacts keys already present in the process cache without consulting the
+/// environment or keyring. This is for complete output fields, not streams.
+pub(crate) fn redact_cached(input: &str) -> String {
+    redact_values(input, &cached_keys())
+}
+
+pub(crate) fn cached_keys() -> Vec<String> {
+    key_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .filter_map(|value| value.as_ref().ok().filter(|key| !key.is_empty()).cloned())
+        .collect()
+}
+
+pub(crate) fn redact_values(input: &str, keys: &[String]) -> String {
+    let patterns = redaction_patterns(keys);
+    if patterns.is_empty() {
+        return input.to_owned();
+    }
+    let marker = redaction_marker(&patterns);
+    let mut remaining = input;
+    let mut result = String::with_capacity(input.len());
+    while let Some((position, length)) = patterns
+        .iter()
+        .filter_map(|pattern| {
+            remaining
+                .find(pattern)
+                .map(|position| (position, pattern.len()))
+        })
+        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+    {
+        result.push_str(&remaining[..position]);
+        result.push_str(&marker);
+        remaining = &remaining[position + length..];
+    }
+    result.push_str(remaining);
+    result
+}
+
+pub(crate) fn redact_json(value: &mut serde_json::Value, keys: &[String]) {
+    match value {
+        serde_json::Value::String(text) => *text = redact_values(text, keys),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json(item, keys);
+            }
+        }
+        serde_json::Value::Object(items) => {
+            for (key, mut value) in std::mem::take(items) {
+                redact_json(&mut value, keys);
+                items.insert(redact_values(&key, keys), value);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn redaction_patterns(keys: &[String]) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for key in keys.iter().filter(|key| !key.is_empty()) {
+        patterns.push(key.clone());
+        let json = serde_json::to_string(key).expect("string serialization cannot fail");
+        patterns.push(json[1..json.len() - 1].to_owned());
+        let encoded: String = url::form_urlencoded::byte_serialize(key.as_bytes()).collect();
+        // Percent escapes are case-insensitive; keep the original characters
+        // outside escapes unchanged.
+        let mut lower_hex = encoded.clone().into_bytes();
+        let mut index = 0;
+        while index + 2 < lower_hex.len() {
+            if lower_hex[index] == b'%' {
+                lower_hex[index + 1].make_ascii_lowercase();
+                lower_hex[index + 2].make_ascii_lowercase();
+                index += 3;
+            } else {
+                index += 1;
+            }
+        }
+        patterns.push(String::from_utf8(lower_hex).expect("URL encoding is UTF-8"));
+        patterns.push(encoded);
+        for engine in [
+            base64::engine::general_purpose::STANDARD,
+            base64::engine::general_purpose::STANDARD_NO_PAD,
+            base64::engine::general_purpose::URL_SAFE,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        ] {
+            patterns.push(engine.encode(key.as_bytes()));
+        }
+    }
+    patterns.sort_unstable();
+    patterns.dedup();
+    patterns
+}
+
+pub(crate) fn redaction_marker(patterns: &[String]) -> String {
+    const TEXT: &str = "[REDACTED]";
+    if patterns
+        .iter()
+        .all(|pattern| !pattern.contains('[') && !pattern.contains(']') && !TEXT.contains(pattern))
+    {
+        TEXT.to_owned()
+    } else {
+        let ch = (0xE000..=0x10FFFD)
+            .filter_map(char::from_u32)
+            .find(|ch| patterns.iter().all(|pattern| !pattern.contains(*ch)))
+            .unwrap_or('\u{FFFD}');
+        if patterns.iter().any(|pattern| TEXT.contains(pattern)) {
+            ch.to_string().repeat(3)
+        } else {
+            format!("{ch}{TEXT}{ch}")
+        }
+    }
+}
+
 /// Adopts a key the caller cached under the template's family id onto a
 /// freshly minted provider id. A new custom provider is created inside the core,
 /// so the client can only have stored its key before the id existed (under the
@@ -196,6 +311,52 @@ pub fn test_seed_key_for_id(id: &str, api_key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_redaction_handles_multiple_overlapping_and_json_escaped_keys() {
+        let keys = vec![
+            "synthetic/alpha".to_owned(),
+            "synthetic/alpha-long".to_owned(),
+            "quoted\"\\key".to_owned(),
+        ];
+        let encoded = serde_json::to_string(&keys[2]).unwrap();
+        let input = format!(
+            "a={} b={} c={} d={}",
+            keys[0],
+            keys[1],
+            keys[2],
+            &encoded[1..encoded.len() - 1]
+        );
+        let output = redact_values(&input, &keys);
+        for key in &keys {
+            assert!(!output.contains(key));
+        }
+        assert!(!output.contains(&encoded[1..encoded.len() - 1]));
+        assert_eq!(
+            output,
+            "a=[REDACTED] b=[REDACTED] c=[REDACTED] d=[REDACTED]"
+        );
+        assert_eq!(redact_values("ordinary\ntext", &keys), "ordinary\ntext");
+        for key in ["RED", "[REDACTED]", "A"] {
+            let output = redact_values(&format!("before {key} after"), &[key.to_owned()]);
+            assert!(!output.contains(key));
+        }
+    }
+
+    #[test]
+    fn redacts_url_and_base64_encodings() {
+        let key = "synthetic/key+密钥".to_owned();
+        let keys = vec![key.clone()];
+        let encoded: String = url::form_urlencoded::byte_serialize(key.as_bytes()).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key.as_bytes());
+        let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_bytes());
+        for value in [key, encoded, b64, url_safe] {
+            let output = redact_values(&format!("before {value} after"), &keys);
+            assert!(!output.contains(&value));
+            assert!(output.starts_with("before "));
+            assert!(output.ends_with(" after"));
+        }
+    }
 
     #[test]
     fn redacts_key_like_tokens() {

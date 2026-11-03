@@ -443,11 +443,12 @@ impl AgentRunner {
                 let result = self
                     .execute_child_tool_with_budget(call, active_budget)
                     .await?;
+                let result = crate::secrets::redact_cached(&result);
                 let _ = self.storage.finish_tool(&call.id, &result);
                 Some(result)
             }
             PolicyDecision::Deny(reason) => {
-                let result = format!("denied by policy: {reason}");
+                let result = crate::secrets::redact_cached(&format!("denied by policy: {reason}"));
                 let _ = self.storage.begin_tool(context.child_id, call, "denied");
                 let _ = self.storage.finish_tool(&call.id, &result);
                 Some(result)
@@ -517,6 +518,7 @@ impl AgentRunner {
                 } else {
                     "rejected by user".to_owned()
                 };
+                let result = crate::secrets::redact_cached(&result);
                 let _ = self.storage.finish_tool(&call.id, &result);
                 Some(result)
             }

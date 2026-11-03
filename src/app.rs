@@ -374,6 +374,7 @@ pub(crate) fn start_diff(app: &mut App) -> Result<()> {
             .execute(&call)
             .await
             .unwrap_or_else(|error| error.to_string());
+        let result = secrets::redact_cached(&result);
         let _ = events
             .send(AgentEvent::LocalCommandFinished {
                 command: "/diff".into(),

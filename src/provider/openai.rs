@@ -188,6 +188,7 @@ impl OpenAiClient {
                 )),
             };
         }
+        self.validate_endpoint()?;
         let response = self
             .client
             .get(format!("{}/models", self.base_url))
@@ -224,7 +225,12 @@ impl OpenAiClient {
                 "invalid models response: {error}"
             )))
         })?;
-        Ok(crate::model_meta::parse_provider_models(&value))
+        let mut models = crate::model_meta::parse_provider_models(&value);
+        let keys = self.redaction_keys();
+        for model in &mut models {
+            model.id = crate::secrets::redact_values(&model.id, &keys);
+        }
+        Ok(models)
     }
 
     /// Sends one request and streams its events. Returns `true` in the error
@@ -238,10 +244,13 @@ impl OpenAiClient {
         if self.scripted_steps.is_some() {
             return self.stream_scripted(events).await;
         }
-        let (path, body) = match request.kind {
+        self.validate_endpoint().map_err(|error| (false, error))?;
+        let (path, mut body) = match request.kind {
             ProviderKind::ChatCompletions => ("chat/completions", chat_body(&request)),
             ProviderKind::Responses => ("responses", responses_body(&request)),
         };
+        let keys = self.redaction_keys();
+        crate::secrets::redact_json(&mut body, &keys);
         let response = self
             .client
             .post(format!("{}/{path}", self.base_url))
@@ -251,12 +260,7 @@ impl OpenAiClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| {
-                (
-                    false,
-                    self.sanitize_provider_error(ProviderError::Http(error)),
-                )
-            })?;
+            .map_err(|error| (false, ProviderError::Http(error)))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -283,9 +287,24 @@ impl OpenAiClient {
 
         let mut decoder = SseDecoder::default();
         let mut responses_state = ResponsesStreamState::default();
+        let mut text_redactor = StreamRedactor::from_keys(&keys);
+        let mut reasoning_redactor = StreamRedactor::from_keys(&keys);
+        let slot_pattern_bytes = text_redactor
+            .patterns
+            .iter()
+            .map(String::len)
+            .sum::<usize>();
+        let max_pending_bytes = text_redactor
+            .patterns
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(0);
+        let mut arguments =
+            std::collections::BTreeMap::<String, (Option<String>, StreamRedactor)>::new();
         let mut stream = response.bytes_stream();
         let mut saw_done = false;
-        while let Some(chunk) = stream.next().await {
+        'stream: while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| (true, ProviderError::Http(error)))?;
             let decoded = decoder
                 .try_push(&chunk, self.max_sse_frame_bytes, self.max_sse_buffer_bytes)
@@ -293,7 +312,7 @@ impl OpenAiClient {
             for event in decoded {
                 if event.data.trim() == "[DONE]" {
                     saw_done = true;
-                    continue;
+                    break 'stream;
                 }
                 let value: Value = serde_json::from_str(&event.data)
                     .map_err(|error| (true, ProviderError::Protocol(error.to_string())))?;
@@ -306,15 +325,217 @@ impl OpenAiClient {
                     ),
                 }
                 .map_err(|error| (true, error))?;
-                for model_event in parsed {
+                for mut model_event in parsed {
+                    match &mut model_event {
+                        ModelEvent::TextDelta(text) => {
+                            let tail = reasoning_redactor.mask_pending();
+                            if !tail.is_empty() {
+                                events
+                                    .send(ModelEvent::ReasoningDelta(tail))
+                                    .await
+                                    .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                            }
+                            *text = text_redactor.push(text);
+                        }
+                        ModelEvent::ReasoningDelta(text) => *text = reasoning_redactor.push(text),
+                        ModelEvent::ToolCallDelta {
+                            slot,
+                            id,
+                            name,
+                            arguments_delta,
+                        } => {
+                            for pending in [
+                                ModelEvent::ReasoningDelta(reasoning_redactor.mask_pending()),
+                                ModelEvent::TextDelta(text_redactor.mask_pending()),
+                            ] {
+                                if !matches!(&pending, ModelEvent::TextDelta(text) | ModelEvent::ReasoningDelta(text) if text.is_empty())
+                                {
+                                    events
+                                        .send(pending)
+                                        .await
+                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                }
+                            }
+                            // Bound retained per-slot prefixes and identifiers independently
+                            // of the consumer's tool-call limit.
+                            let retained =
+                                arguments
+                                    .iter()
+                                    .fold(0usize, |total, (key, (id, redactor))| {
+                                        total
+                                            .saturating_add(key.len())
+                                            .saturating_add(id.as_ref().map_or(0, String::len))
+                                            .saturating_add(
+                                                redactor
+                                                    .patterns
+                                                    .iter()
+                                                    .map(String::len)
+                                                    .sum::<usize>(),
+                                            )
+                                            .saturating_add(redactor.pending.len())
+                                            .saturating_add(128)
+                                    });
+                            let incoming = if let Some((previous_id, _)) = arguments.get(slot) {
+                                id.as_ref().map_or(0, |value| {
+                                    value
+                                        .len()
+                                        .saturating_sub(previous_id.as_ref().map_or(0, String::len))
+                                })
+                            } else {
+                                slot.len()
+                                    .saturating_add(id.as_ref().map_or(0, String::len))
+                                    .saturating_add(slot_pattern_bytes)
+                                    .saturating_add(max_pending_bytes)
+                                    .saturating_add(128)
+                            };
+                            if retained.saturating_add(incoming) > self.max_sse_buffer_bytes {
+                                return Err((
+                                    true,
+                                    ProviderError::Protocol(
+                                        "tool-call redaction buffer limit exceeded".into(),
+                                    ),
+                                ));
+                            }
+                            let entry = arguments
+                                .entry(slot.clone())
+                                .or_insert_with(|| (None, StreamRedactor::from_keys(&keys)));
+                            if id.is_some() {
+                                entry.0.clone_from(id);
+                            }
+                            *arguments_delta = entry.1.push(arguments_delta);
+                            *slot = crate::secrets::redact_values(slot, &keys);
+                            if let Some(value) = id {
+                                *value = crate::secrets::redact_values(value, &keys);
+                            }
+                            if let Some(value) = name {
+                                *value = crate::secrets::redact_values(value, &keys);
+                            }
+                        }
+                        ModelEvent::ToolCallComplete(call) => {
+                            for pending in [
+                                ModelEvent::ReasoningDelta(reasoning_redactor.mask_pending()),
+                                ModelEvent::TextDelta(text_redactor.mask_pending()),
+                            ] {
+                                if !matches!(&pending, ModelEvent::TextDelta(text) | ModelEvent::ReasoningDelta(text) if text.is_empty())
+                                {
+                                    events
+                                        .send(pending)
+                                        .await
+                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                }
+                            }
+                            if let Some((slot, (_, redactor))) = arguments
+                                .iter_mut()
+                                .find(|(_, (id, _))| id.as_deref() == Some(call.id.as_str()))
+                            {
+                                let tail = redactor.finish();
+                                if !tail.is_empty() {
+                                    events
+                                        .send(ModelEvent::ToolCallDelta {
+                                            slot: crate::secrets::redact_values(slot, &keys),
+                                            id: None,
+                                            name: None,
+                                            arguments_delta: tail,
+                                        })
+                                        .await
+                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                }
+                            }
+                            call.id = crate::secrets::redact_values(&call.id, &keys);
+                            call.name = crate::secrets::redact_values(&call.name, &keys);
+                            crate::secrets::redact_json(&mut call.arguments, &keys);
+                        }
+                        ModelEvent::ProviderItem(value) => {
+                            crate::secrets::redact_json(value, &keys)
+                        }
+                        ModelEvent::ResponseId(value) => {
+                            *value = crate::secrets::redact_values(value, &keys)
+                        }
+                        ModelEvent::WebSearchStarted { query } => {
+                            *query = crate::secrets::redact_values(query, &keys)
+                        }
+                        ModelEvent::WebSearchResult {
+                            title,
+                            url,
+                            snippet,
+                        } => {
+                            *title = crate::secrets::redact_values(title, &keys);
+                            *url = crate::secrets::redact_values(url, &keys);
+                            *snippet = crate::secrets::redact_values(snippet, &keys);
+                        }
+                        ModelEvent::Done => {
+                            for pending in [
+                                ModelEvent::ReasoningDelta(reasoning_redactor.finish()),
+                                ModelEvent::TextDelta(text_redactor.finish()),
+                            ] {
+                                if !matches!(&pending, ModelEvent::TextDelta(text) | ModelEvent::ReasoningDelta(text) if text.is_empty())
+                                {
+                                    events
+                                        .send(pending)
+                                        .await
+                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                }
+                            }
+                            for (slot, (_, redactor)) in &mut arguments {
+                                let tail = redactor.finish();
+                                if !tail.is_empty() {
+                                    events
+                                        .send(ModelEvent::ToolCallDelta {
+                                            slot: crate::secrets::redact_values(slot, &keys),
+                                            id: None,
+                                            name: None,
+                                            arguments_delta: tail,
+                                        })
+                                        .await
+                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                     if matches!(model_event, ModelEvent::Done) {
                         saw_done = true;
+                    }
+                    if matches!(&model_event, ModelEvent::TextDelta(text) | ModelEvent::ReasoningDelta(text) if text.is_empty())
+                    {
+                        continue;
                     }
                     events
                         .send(model_event)
                         .await
                         .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                    if saw_done {
+                        break 'stream;
+                    }
                 }
+            }
+        }
+        // A failed stream drops any withheld prefix. Emitting it after an error
+        // could expose a credential when a consumer joins partial output.
+        for pending in [
+            ModelEvent::ReasoningDelta(reasoning_redactor.finish()),
+            ModelEvent::TextDelta(text_redactor.finish()),
+        ] {
+            if !matches!(&pending, ModelEvent::TextDelta(text) | ModelEvent::ReasoningDelta(text) if text.is_empty())
+            {
+                events
+                    .send(pending)
+                    .await
+                    .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+            }
+        }
+        for (slot, (_, redactor)) in &mut arguments {
+            let tail = redactor.finish();
+            if !tail.is_empty() {
+                events
+                    .send(ModelEvent::ToolCallDelta {
+                        slot: crate::secrets::redact_values(slot, &keys),
+                        id: None,
+                        name: None,
+                        arguments_delta: tail,
+                    })
+                    .await
+                    .map_err(|_| (true, ProviderError::ReceiverClosed))?;
             }
         }
         if !saw_done {
@@ -332,12 +553,24 @@ impl OpenAiClient {
     }
 
     fn redact_provider_message(&self, message: &str) -> String {
-        let message = if self.api_key.is_empty() {
-            message.to_owned()
-        } else {
-            message.replace(&self.api_key, "[REDACTED]")
-        };
-        crate::secrets::redact(&message)
+        crate::secrets::redact_values(&crate::secrets::redact(message), &self.redaction_keys())
+    }
+
+    fn validate_endpoint(&self) -> Result<(), ProviderError> {
+        let keys = self.redaction_keys();
+        if crate::secrets::redact_values(&self.base_url, &keys) != self.base_url {
+            return Err(ProviderError::Protocol(crate::secrets::redact_values(
+                "provider URL contains a configured credential; remove it from the URL",
+                &keys,
+            )));
+        }
+        Ok(())
+    }
+
+    fn redaction_keys(&self) -> Vec<String> {
+        let mut keys = crate::secrets::cached_keys();
+        keys.push(self.api_key.clone());
+        keys
     }
 
     fn sanitize_provider_error(&self, error: ProviderError) -> ProviderError {
@@ -403,6 +636,82 @@ impl OpenAiClient {
                 false,
                 ProviderError::Protocol("scripted step mismatch: expected stream".to_owned()),
             )),
+        }
+    }
+}
+
+/// Hold only a suffix that could start a known credential; all other text
+/// can be streamed immediately, including when UTF-8 characters span events.
+struct StreamRedactor {
+    patterns: Vec<String>,
+    marker: String,
+    pending: String,
+}
+
+impl StreamRedactor {
+    #[cfg(test)]
+    fn new(secret: &str) -> Self {
+        Self::from_keys(&[secret.to_owned()])
+    }
+
+    fn from_keys(keys: &[String]) -> Self {
+        let patterns = crate::secrets::redaction_patterns(keys);
+        // A marker must not form the secret itself, even across its edges.
+        // For unusual keys sharing marker characters, use a private-use
+        // character absent from every pattern instead.
+        let marker = crate::secrets::redaction_marker(&patterns);
+        Self {
+            patterns,
+            marker,
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str) -> String {
+        if self.patterns.is_empty() {
+            return text.to_owned();
+        }
+        self.pending.push_str(text);
+        let mut output = String::new();
+        while let Some((position, length)) = self
+            .patterns
+            .iter()
+            .filter_map(|pattern| {
+                self.pending
+                    .find(pattern)
+                    .map(|position| (position, pattern.len()))
+            })
+            .min_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+        {
+            output.push_str(&self.pending[..position]);
+            output.push_str(&self.marker);
+            self.pending.drain(..position + length);
+        }
+        let keep = self
+            .pending
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| {
+                self.patterns
+                    .iter()
+                    .any(|pattern| pattern.starts_with(&self.pending[i..]))
+            })
+            .unwrap_or(self.pending.len());
+        output.push_str(&self.pending[..keep]);
+        self.pending.drain(..keep);
+        output
+    }
+
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn mask_pending(&mut self) -> String {
+        if self.pending.is_empty() {
+            String::new()
+        } else {
+            self.pending.clear();
+            self.marker.clone()
         }
     }
 }
@@ -1237,6 +1546,220 @@ fn parse_sse_frame(frame: &[u8]) -> Option<SseEvent> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn streaming_redaction_handles_every_utf8_split_and_partial_prefix() {
+        for key in ["custom/密钥.with-punctuation", "sk-synthetic-123456789"] {
+            let input = format!("before {key} after {key} end");
+            for (split, _) in input
+                .char_indices()
+                .chain(std::iter::once((input.len(), '\0')))
+            {
+                let mut redactor = StreamRedactor::new(key);
+                let mut output = redactor.push(&input[..split]);
+                output.push_str(&redactor.push(&input[split..]));
+                output.push_str(&redactor.finish());
+                assert_eq!(output, "before [REDACTED] after [REDACTED] end");
+            }
+            let mut redactor = StreamRedactor::new(key);
+            assert_eq!(redactor.push("before "), "before ");
+            assert_eq!(redactor.push(&key[..2]), "");
+            assert_eq!(redactor.finish(), &key[..2]);
+        }
+    }
+
+    #[test]
+    fn streaming_redaction_handles_overlapping_cached_keys_at_every_split() {
+        let keys = vec![
+            "synthetic/alpha".to_owned(),
+            "synthetic/alpha-long".to_owned(),
+            "key-密钥".to_owned(),
+        ];
+        let input = "normal synthetic/alpha-long key-密钥 end";
+        for (split, _) in input
+            .char_indices()
+            .chain(std::iter::once((input.len(), '\0')))
+        {
+            let mut redactor = StreamRedactor::from_keys(&keys);
+            let mut output = redactor.push(&input[..split]);
+            output.push_str(&redactor.push(&input[split..]));
+            output.push_str(&redactor.finish());
+            for key in &keys {
+                assert!(!output.contains(key));
+            }
+            assert!(output.starts_with("normal "));
+            assert!(output.ends_with(" end"));
+        }
+    }
+
+    #[test]
+    fn streaming_redacts_encoded_credentials_across_every_split() {
+        use base64::Engine as _;
+        let key = "synthetic/key+密钥".to_owned();
+        let url: String = url::form_urlencoded::byte_serialize(key.as_bytes()).collect();
+        let base64 = base64::engine::general_purpose::STANDARD.encode(key.as_bytes());
+        for encoded in [url, base64] {
+            let input = format!("before {encoded} after");
+            for (split, _) in input
+                .char_indices()
+                .chain(std::iter::once((input.len(), '\0')))
+            {
+                let mut redactor = StreamRedactor::new(&key);
+                let mut result = redactor.push(&input[..split]);
+                result.push_str(&redactor.push(&input[split..]));
+                result.push_str(&redactor.finish());
+                assert!(!result.contains(&encoded));
+                assert!(result.starts_with("before "));
+                assert!(result.ends_with(" after"));
+            }
+        }
+    }
+
+    #[test]
+    fn redaction_marker_does_not_repeat_short_or_marker_like_keys() {
+        for key in ["RED", "[REDACTED]", "A", "[R"] {
+            let input = format!("before {key} after {key} end");
+            for (split, _) in input
+                .char_indices()
+                .chain(std::iter::once((input.len(), '\0')))
+            {
+                let mut redactor = StreamRedactor::new(key);
+                let output = format!(
+                    "{}{}{}",
+                    redactor.push(&input[..split]),
+                    redactor.push(&input[split..]),
+                    redactor.finish()
+                );
+                assert!(!output.contains(key));
+            }
+            assert!(
+                !OpenAiClient::new("http://127.0.0.1".into(), key.into())
+                    .unwrap()
+                    .redact_provider_message(&input)
+                    .contains(key)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_stream_redacts_split_text_and_reasoning() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let key = "synthetic/key.with.punctuation";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            let frames = [
+                json!({"type":"response.reasoning_summary_text.delta", "delta":"thinking synthetic/key."}),
+                json!({"type":"response.reasoning_summary_text.delta", "delta":"with.punctuation done s"}),
+                json!({"type":"response.output_text.delta", "delta":"answer synthetic/"}),
+                json!({"type":"response.output_text.delta", "delta":"key.with.punctuation done"}),
+                json!({"type":"response.completed"}),
+            ];
+            let body = frames
+                .iter()
+                .map(|v| format!("data: {v}\n\n"))
+                .collect::<String>();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let client = OpenAiClient::new(format!("http://{address}"), key.into()).unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        client
+            .stream(
+                empty_request(
+                    ProviderKind::Responses,
+                    ThinkingMode::OpenAiResponsesSummary,
+                ),
+                tx,
+            )
+            .await
+            .unwrap();
+        let (mut text, mut reasoning) = (String::new(), String::new());
+        let mut seen_text = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ModelEvent::TextDelta(delta) => {
+                    seen_text = true;
+                    text.push_str(&delta);
+                }
+                ModelEvent::ReasoningDelta(delta) => {
+                    assert!(!seen_text, "reasoning must precede text");
+                    reasoning.push_str(&delta);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(text, "answer [REDACTED] done");
+        assert_eq!(reasoning, "thinking [REDACTED] done [REDACTED]");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_stream_redacts_tool_arguments_and_provider_items() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let key = "synthetic\"\\key";
+        let encoded = serde_json::to_string(key).unwrap();
+        let argument = format!("{{\"value\":{encoded}}}");
+        let split = argument.find("synthetic").unwrap() + 5;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            let frames = [
+                json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"function_call", "call_id":"call-1", "name":"tool", "arguments":""}}),
+                json!({"type":"response.function_call_arguments.delta", "output_index":0, "delta":&argument[..split]}),
+                json!({"type":"response.function_call_arguments.delta", "output_index":0, "delta":&argument[split..]}),
+                json!({"type":"response.output_item.done", "output_index":0, "item":{"type":"function_call", "call_id":"call-1", "name":"tool", "arguments":argument}}),
+                json!({"type":"response.output_item.done", "item":{"type":"reasoning", "summary":[{"text":key}], "nested":{key:key}}}),
+                json!({"type":"response.completed"}),
+            ];
+            let body = frames
+                .iter()
+                .map(|v| format!("data: {v}\n\n"))
+                .collect::<String>();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let client = OpenAiClient::new(format!("http://{address}"), key.into()).unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        client
+            .stream(
+                empty_request(
+                    ProviderKind::Responses,
+                    ThinkingMode::OpenAiResponsesSummary,
+                ),
+                tx,
+            )
+            .await
+            .unwrap();
+        let mut arguments = String::new();
+        let mut saw_item = false;
+        while let Some(event) = rx.recv().await {
+            assert!(!format!("{event:?}").contains(key));
+            match event {
+                ModelEvent::ToolCallDelta {
+                    arguments_delta, ..
+                } => arguments.push_str(&arguments_delta),
+                ModelEvent::ToolCallComplete(call) => {
+                    assert_eq!(call.arguments["value"], "[REDACTED]")
+                }
+                ModelEvent::ProviderItem(item) => {
+                    assert!(item.to_string().contains("[REDACTED]"));
+                    saw_item = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap()["value"],
+            "[REDACTED]"
+        );
+        assert!(saw_item);
+        server.await.unwrap();
+    }
+
     fn scripted_steps(steps: Vec<ScriptedStep>) -> Result<OpenAiClient, ProviderError> {
         let mut client = OpenAiClient::new("http://127.0.0.1".into(), "test".into())?;
         client.scripted_steps = Some(std::sync::Arc::new(Mutex::new(steps.into())));
@@ -1256,6 +1779,153 @@ mod tests {
 
         assert!(!message.contains("custom/key.with.punctuation"));
         assert_eq!(message, "gateway echoed credential=[REDACTED]; retry later");
+
+        let key = "custom\"\\key";
+        let client = OpenAiClient::new("http://127.0.0.1".into(), key.into()).unwrap();
+        let encoded = serde_json::to_string(key).unwrap();
+        let message = client.redact_provider_message(&format!("{{\"message\":{encoded}}}"));
+        assert!(!message.contains(&encoded[1..encoded.len() - 1]));
+        assert!(message.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn provider_retry_and_late_error_redact_synthetic_keys() {
+        for key in ["custom/key.with.punctuation", "sk-synthetic-123456789"] {
+            let mut client = scripted_steps(vec![
+                ScriptedStep::Fail(ProviderError::Status {
+                    status: 429,
+                    message: format!("gateway echoed ({key})"),
+                    retry_after_ms: Some(1),
+                }),
+                ScriptedStep::EventsThenFail(
+                    vec![ModelEvent::TextDelta("partial answer".into())],
+                    ProviderError::Protocol(format!("provider echoed ({key})")),
+                ),
+            ])
+            .unwrap();
+            client.api_key = key.to_owned();
+            let (tx, mut rx) = mpsc::channel(16);
+            let error = client
+                .stream(
+                    empty_request(ProviderKind::Responses, ThinkingMode::Disabled),
+                    tx,
+                )
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains(key));
+            assert!(error.to_string().contains("[REDACTED]"));
+            let retry = rx.recv().await.unwrap();
+            match retry {
+                ModelEvent::Retrying { reason, .. } => {
+                    assert!(!reason.contains(key));
+                    assert!(reason.contains("[REDACTED]"));
+                }
+                _ => panic!("expected retry event"),
+            }
+            assert!(
+                matches!(rx.recv().await, Some(ModelEvent::TextDelta(text)) if text == "partial answer")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_failure_retries_before_sanitizing_the_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let key = "synthetic/connection-key";
+        let client =
+            OpenAiClient::new_with_retry(format!("http://{address}"), key.into(), 2, 1, 1).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let error = client
+            .stream(
+                empty_request(ProviderKind::Responses, ThinkingMode::Disabled),
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains(key));
+        match rx.recv().await {
+            Some(ModelEvent::Retrying { reason, .. }) => assert!(!reason.contains(key)),
+            event => panic!("expected one retry, got {event:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn endpoint_with_cached_credential_is_rejected_before_network() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = "synthetic/credential-in-url";
+        let client = OpenAiClient::new(format!("http://{address}/{key}"), key.into()).unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let error = client
+            .stream(
+                empty_request(ProviderKind::Responses, ThinkingMode::Disabled),
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains(key));
+        let error = client.list_models(1000).await.unwrap_err();
+        assert!(!error.to_string().contains(key));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_http_provider_redacts_errors_after_partial_and_in_models() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let key = "synthetic/key.with.punctuation";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 8192];
+                let _ = socket.read(&mut request).await.unwrap();
+                let (status, body) = if index == 0 {
+                    ("401 Unauthorized", format!("credential={key}"))
+                } else {
+                    (
+                        "200 OK",
+                        format!(
+                            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}}\n\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"synthetic/key.\"}}\n\ndata: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"message\":\"credential={key}\"}}}}}}\n\n"
+                        ),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client =
+            OpenAiClient::new_with_retry(format!("http://{address}"), key.into(), 1, 1, 1).unwrap();
+        let models_error = client.list_models(1000).await.unwrap_err().to_string();
+        assert!(!models_error.contains(key));
+        assert!(models_error.contains("[REDACTED]"));
+        let (tx, mut rx) = mpsc::channel(16);
+        let error = client
+            .stream(
+                empty_request(ProviderKind::Responses, ThinkingMode::Disabled),
+                tx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(key));
+        assert!(error.contains("[REDACTED]"));
+        assert!(matches!(rx.recv().await, Some(ModelEvent::TextDelta(text)) if text == "partial"));
+        assert!(
+            rx.recv().await.is_none(),
+            "failed stream must discard the withheld key prefix"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

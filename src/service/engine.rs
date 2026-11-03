@@ -126,7 +126,6 @@ pub(super) enum CoreCommand {
         session_id: String,
         reply: oneshot::Sender<Result<(), ApiError>>,
     },
-    Shutdown,
 }
 
 /// A pending approval: the consumer-facing id plus the deadline after which the
@@ -369,6 +368,7 @@ impl Engine {
                             .execute_shell(&command)
                             .await
                             .unwrap_or_else(|error| error.to_string());
+                        let result = secrets::redact_cached(&result);
                         let _ = events
                             .send(AgentEvent::LocalCommandFinished { command, result })
                             .await;
@@ -422,11 +422,19 @@ impl Engine {
 
 /// The state-machine event loop: consumes routed agent events and serialized
 /// commands, plus a periodic sweep for expired approvals.
-pub(super) async fn run_engine(mut engine: Engine, mut command_rx: mpsc::Receiver<CoreCommand>) {
+pub(super) async fn run_engine(
+    mut engine: Engine,
+    mut command_rx: mpsc::Receiver<CoreCommand>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
     let mut sweep = tokio::time::interval(Duration::from_secs(5));
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                break;
+            }
             routed = engine.app.router_rx.recv() => {
                 match routed {
                     Some(routed) => engine.handle_routed(routed),
@@ -435,22 +443,14 @@ pub(super) async fn run_engine(mut engine: Engine, mut command_rx: mpsc::Receive
             }
             command = command_rx.recv() => {
                 let Some(command) = command else {
-                    // All handles were dropped without an explicit shutdown:
-                    // clean up so no approvals or agents are left dangling.
-                    engine.shutdown().await;
                     break;
                 };
-                match command {
-                    CoreCommand::Shutdown => {
-                        engine.shutdown().await;
-                        break;
-                    }
-                    command => handle_command(&mut engine, command).await,
-                }
+                handle_command(&mut engine, command).await;
             }
             _ = sweep.tick() => engine.sweep_expired_approvals(),
         }
     }
+    engine.shutdown().await;
 }
 
 async fn handle_command(engine: &mut Engine, command: CoreCommand) {
@@ -459,11 +459,13 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             let _ = reply.send(state_snapshot(engine));
         }
         CoreCommand::GetRequestSequence { session_id, reply } => {
-            let result = engine
-                .app
-                .runtime(&session_id)
-                .map(|runtime| runtime.busy.then_some(runtime.request_seq))
-                .ok_or_else(|| ApiError::not_found("session runtime not found"));
+            let result = reject_cached_credentials([session_id.as_str()]).and_then(|()| {
+                engine
+                    .app
+                    .runtime(&session_id)
+                    .map(|runtime| runtime.busy.then_some(runtime.request_seq))
+                    .ok_or_else(|| ApiError::not_found("session runtime not found"))
+            });
             let _ = reply.send(result);
         }
         CoreCommand::GetMessages {
@@ -474,13 +476,10 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             reply,
         } => {
             if !reply.is_closed() {
-                let _ = reply.send(message_page(
-                    engine,
-                    &session_id,
-                    before,
-                    limit,
-                    cancellation.as_ref(),
-                ));
+                let result = reject_cached_credentials([session_id.as_str()]).and_then(|()| {
+                    message_page(engine, &session_id, before, limit, cancellation.as_ref())
+                });
+                let _ = reply.send(result);
             }
         }
         CoreCommand::GetMemories {
@@ -503,7 +502,8 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             candidate,
             reply,
         } => {
-            let result = save_memory(engine, &title, &content, candidate);
+            let result = reject_cached_credentials([title.as_str(), content.as_str()])
+                .and_then(|()| save_memory(engine, &title, &content, candidate));
             let _ = reply.send(result);
         }
         CoreCommand::ConfirmMemory { id, reply } => {
@@ -521,18 +521,21 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             content,
             reply,
         } => {
-            let result = mutate_memory(engine, |storage, workspace, config| {
-                storage
-                    .update_memory(
-                        workspace,
-                        id,
-                        &title,
-                        &content,
-                        config.memory.max_entry_bytes,
-                    )
-                    .map(|record| memory_dto(&record))
-                    .map_err(|error| memory_api_error(error, config))
-            });
+            let result =
+                reject_cached_credentials([title.as_str(), content.as_str()]).and_then(|()| {
+                    mutate_memory(engine, |storage, workspace, config| {
+                        storage
+                            .update_memory(
+                                workspace,
+                                id,
+                                &title,
+                                &content,
+                                config.memory.max_entry_bytes,
+                            )
+                            .map(|record| memory_dto(&record))
+                            .map_err(|error| memory_api_error(error, config))
+                    })
+                });
             let _ = reply.send(result);
         }
         CoreCommand::DeleteMemory { id, reply } => {
@@ -570,7 +573,8 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             allow_session,
             reply,
         } => {
-            let result = engine.resolve_approval(&approval_id, accept, allow_session);
+            let result = reject_cached_credentials([approval_id.as_str()])
+                .and_then(|()| engine.resolve_approval(&approval_id, accept, allow_session));
             let _ = reply.send(result);
         }
         CoreCommand::Cancel {
@@ -578,7 +582,10 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             request_seq,
             reply,
         } => {
-            let result = cancel_session(engine, &session_id, request_seq).await;
+            let result = match reject_cached_credentials([session_id.as_str()]) {
+                Ok(()) => cancel_session(engine, &session_id, request_seq).await,
+                Err(error) => Err(error),
+            };
             let _ = reply.send(result);
         }
         CoreCommand::SetProvider {
@@ -586,11 +593,22 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             model,
             reply,
         } => {
-            let result = set_provider(engine, &provider_id, &model);
+            let result = reject_cached_credentials([provider_id.as_str(), model.as_str()])
+                .and_then(|()| set_provider(engine, &provider_id, &model));
             let _ = reply.send(result);
         }
         CoreCommand::SetProviderConfig { provider, reply } => {
-            let result = set_provider_config(engine, provider);
+            let values = [
+                &provider.id,
+                &provider.name,
+                &provider.base_url,
+                &provider.model,
+            ]
+            .into_iter()
+            .map(String::as_str)
+            .chain(provider.enabled_models.iter().map(String::as_str));
+            let result = reject_cached_credentials(values)
+                .and_then(|()| set_provider_config(engine, provider));
             let _ = reply.send(result);
         }
         CoreCommand::SetProviderProfile {
@@ -604,17 +622,28 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             enabled_models,
             reply,
         } => {
-            let result = set_provider_profile(
-                engine,
-                &provider_id,
-                template,
-                name,
-                &model,
-                base_url,
-                kind,
-                context_window_tokens,
-                enabled_models,
-            );
+            let values = [
+                Some(provider_id.as_str()),
+                name.as_deref(),
+                Some(model.as_str()),
+                base_url.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .chain(enabled_models.iter().flatten().map(String::as_str));
+            let result = reject_cached_credentials(values).and_then(|()| {
+                set_provider_profile(
+                    engine,
+                    &provider_id,
+                    template,
+                    name,
+                    &model,
+                    base_url,
+                    kind,
+                    context_window_tokens,
+                    enabled_models,
+                )
+            });
             let _ = reply.send(result);
         }
         CoreCommand::GetProviderSettings { reply } => {
@@ -629,20 +658,39 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             model_metadata_refreshed(engine);
         }
         CoreCommand::RemoveProvider { provider_id, reply } => {
-            let result = remove_provider(engine, &provider_id);
+            let result = reject_cached_credentials([provider_id.as_str()])
+                .and_then(|()| remove_provider(engine, &provider_id));
             let _ = reply.send(result);
         }
         CoreCommand::ActivateSession { session_id, reply } => {
-            let result = activate_session(engine, &session_id);
+            let result = reject_cached_credentials([session_id.as_str()])
+                .and_then(|()| activate_session(engine, &session_id));
             let _ = reply.send(result);
         }
-        CoreCommand::Shutdown => unreachable!("Shutdown is handled by the engine loop"),
     }
+}
+
+fn reject_cached_credentials<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ApiError> {
+    let keys = secrets::cached_keys();
+    if values
+        .into_iter()
+        .any(|value| secrets::redact_values(value, &keys) != value)
+    {
+        return Err(ApiError::bad_request(secrets::redact_values(
+            "input contains a configured Provider credential; remove it before submitting",
+            &keys,
+        )));
+    }
+    Ok(())
 }
 
 /// Builds the v2 application snapshot.
 fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
     let app = &engine.app;
+    let keys = secrets::cached_keys();
+    let redact = |text: &str| secrets::redact_values(text, &keys);
     let sessions = app
         .sessions
         .iter()
@@ -650,13 +698,13 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
             let runtime = app.runtime(&session.id);
             SessionStateDto {
                 id: session.id.clone(),
-                title: session.title.clone(),
+                title: redact(&session.title),
                 parent_id: session.parent_id.clone(),
                 busy: runtime.map(|r| r.busy).unwrap_or(false),
                 phase: runtime
                     .map(|r| r.agent_phase.label().to_owned())
                     .unwrap_or_else(|| AgentPhase::Idle.label().to_owned()),
-                status: runtime.map(|r| r.status.clone()).unwrap_or_default(),
+                status: runtime.map(|r| redact(&r.status)).unwrap_or_default(),
                 child_status: app
                     .child_status
                     .get(&session.id)
@@ -678,7 +726,7 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
                 child_tool: app
                     .child_status
                     .get(&session.id)
-                    .and_then(|progress| progress.tool.clone()),
+                    .and_then(|progress| progress.tool.as_deref().map(redact)),
             }
         })
         .collect::<Vec<_>>();
@@ -689,20 +737,29 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
     };
     let approval = engine
         .oldest_pending()
-        .map(|(approval_id, session_id, approval)| ApprovalDto {
-            approval_id,
-            session_id,
-            call: approval.call.clone(),
-            reason: approval.reason.clone(),
-            source_session_id: approval.source_session_id.clone(),
-            source_title: approval.source_title.clone(),
-            created_at_ms: approval.created_at.elapsed().as_millis() as u64,
+        .map(|(approval_id, session_id, approval)| {
+            let mut call = approval.call.clone();
+            call.name = redact(&call.name);
+            secrets::redact_json(&mut call.arguments, &keys);
+            ApprovalDto {
+                approval_id,
+                session_id,
+                call,
+                reason: redact(&approval.reason),
+                source_session_id: approval.source_session_id.clone(),
+                source_title: approval.source_title.as_deref().map(redact),
+                created_at_ms: approval.created_at.elapsed().as_millis() as u64,
+            }
         });
     let todos = app
         .current
         .todos
         .iter()
-        .map(TodoDto::from)
+        .map(|task| {
+            let mut todo = TodoDto::from(task);
+            todo.title = redact(&todo.title);
+            todo
+        })
         .collect::<Vec<_>>();
     let context = active_session
         .as_deref()
@@ -712,7 +769,7 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
         .and_then(|session_id| engine.app.storage.load_partial(session_id).ok())
         .flatten()
         .map(|row| protocol::PartialDto {
-            content: row.content,
+            content: redact(&row.content),
             created_at: row.created_at,
         });
     Ok(AppSnapshotV2 {
@@ -720,9 +777,9 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
         event_cursor: engine.bridge.current_cursor(),
         active_session,
         sessions,
-        provider: app.config.provider.display_label().to_owned(),
+        provider: redact(app.config.provider.display_label()),
         provider_id: app.config.provider.id().to_owned(),
-        model: app.config.provider.model.clone(),
+        model: redact(&app.config.provider.model),
         mode: app.current.mode.as_str().to_owned(),
         approval,
         todos,
@@ -806,12 +863,15 @@ fn message_page(
     // Rows come back newest-first; restore display (oldest→newest) order. The
     // opaque `next_before` cursor is the id of the oldest message in the page
     // (the last row before the reversal), so the previous page is id < that.
+    let keys = secrets::cached_keys();
     let messages = rows
         .iter()
         .rev()
         .map(|row| {
             check()?;
-            Ok(stored_to_message_dto(row))
+            let mut dto = stored_to_message_dto(row);
+            redact_message_dto(&mut dto, &keys);
+            Ok(dto)
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     check()?;
@@ -821,6 +881,51 @@ fn message_page(
         next_before,
         has_more,
     })
+}
+
+fn redact_message_dto(message: &mut MessageDto, keys: &[String]) {
+    let text = |value: &mut String| *value = secrets::redact_values(value, keys);
+    let call = |call: &mut ToolCall| {
+        text(&mut call.id);
+        text(&mut call.name);
+        secrets::redact_json(&mut call.arguments, keys);
+    };
+    match message {
+        MessageDto::User { content, .. }
+        | MessageDto::Assistant { content, .. }
+        | MessageDto::System { content, .. }
+        | MessageDto::Thinking { content, .. }
+        | MessageDto::CompactionSummary { content, .. } => text(content),
+        MessageDto::Context { label, content, .. } => {
+            text(label);
+            text(content);
+        }
+        MessageDto::Tool {
+            call_id,
+            name,
+            arguments,
+            result,
+            ..
+        } => {
+            text(call_id);
+            text(name);
+            secrets::redact_json(arguments, keys);
+            if let Some(result) = result {
+                text(result);
+            }
+        }
+        MessageDto::ToolCalls { calls, .. } => {
+            for item in calls {
+                call(item);
+            }
+        }
+        MessageDto::ToolOutput {
+            call_id, output, ..
+        } => {
+            text(call_id);
+            text(output);
+        }
+    }
 }
 
 /// Maps a stored message row to its display-safe v2 DTO. Provider-private
@@ -1014,6 +1119,7 @@ fn submit_input(
     session_id: Option<&str>,
     text: &str,
 ) -> Result<u64, ApiError> {
+    reject_cached_credentials(std::iter::once(text).chain(session_id))?;
     let session_id = ensure_session(engine, session_id)?;
     // The target session is authoritative: when a caller submits to a session
     // that is not the engine's active one, route to it instead of mutating the
@@ -1126,6 +1232,7 @@ fn execute_command(
     session_id: Option<&str>,
     text: &str,
 ) -> Result<(), ApiError> {
+    reject_cached_credentials(std::iter::once(text).chain(session_id))?;
     let session_id = ensure_session(engine, session_id)?;
     let app = &mut engine.app;
     let Some(command) = commands::parse(text) else {
@@ -1509,14 +1616,20 @@ fn provider_settings(engine: &Engine) -> crate::protocol::ProviderSettingsDto {
 fn provider_profile_dto(
     provider: &crate::config::ProviderConfig,
 ) -> crate::protocol::ProviderProfileDto {
+    let keys = secrets::cached_keys();
+    let redact = |value: &str| secrets::redact_values(value, &keys);
     crate::protocol::ProviderProfileDto {
         id: provider.id().to_owned(),
         preset: provider.preset.key_id().to_owned(),
-        name: provider.name.clone(),
+        name: redact(&provider.name),
         kind: provider.kind.wire_tag().to_owned(),
-        model: provider.model.clone(),
-        base_url: provider.base_url.clone(),
-        enabled_models: provider.enabled_models.clone(),
+        model: redact(&provider.model),
+        base_url: redact(&provider.base_url),
+        enabled_models: provider
+            .enabled_models
+            .iter()
+            .map(|model| redact(model))
+            .collect(),
     }
 }
 
@@ -1551,6 +1664,7 @@ async fn provider_models(
     // up their models.dev row (the same exact-key semantics the active
     // model's L3 lookup uses), so pickers and fetch buttons see one merged
     // view instead of a list that hides known community windows.
+    let keys = secrets::cached_keys();
     let models = models
         .into_iter()
         .map(|mut model| {
@@ -1569,7 +1683,7 @@ async fn provider_models(
                 }
             }
             crate::protocol::ProviderModelDto {
-                id: model.id,
+                id: secrets::redact_values(&model.id, &keys),
                 context_window_tokens: model.context_window_tokens,
                 max_output_tokens: model.max_output_tokens,
             }
@@ -1785,17 +1899,19 @@ fn api_error(error: anyhow::Error) -> ApiError {
 }
 
 fn memory_dto(record: &MemoryRecord) -> MemoryDto {
+    let keys = secrets::cached_keys();
+    let redact = |text: &str| secrets::redact_values(text, &keys);
     MemoryDto {
         id: record.id,
         kind: record.kind.clone(),
-        title: record.title.clone(),
-        content: record.content.clone(),
-        topic: record.topic.clone(),
+        title: redact(&record.title),
+        content: redact(&record.content),
+        topic: record.topic.as_deref().map(redact),
         status: record.status.clone(),
         source_session_id: record.source_session_id.clone(),
         source_turn_id: record.source_turn_id.clone(),
         source_message_id: record.source_message_id,
-        evidence: record.evidence.clone(),
+        evidence: record.evidence.as_deref().map(redact),
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
         confirmed_at: record.confirmed_at.clone(),

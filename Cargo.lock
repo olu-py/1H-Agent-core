@@ -1657,6 +1657,7 @@ name = "protium-core"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "chrono",
  "criterion",
