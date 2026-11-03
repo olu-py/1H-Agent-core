@@ -188,6 +188,7 @@ impl OpenAiClient {
                 )),
             };
         }
+        self.validate_endpoint()?;
         let response = self
             .client
             .get(format!("{}/models", self.base_url))
@@ -243,6 +244,7 @@ impl OpenAiClient {
         if self.scripted_steps.is_some() {
             return self.stream_scripted(events).await;
         }
+        self.validate_endpoint().map_err(|error| (false, error))?;
         let (path, mut body) = match request.kind {
             ProviderKind::ChatCompletions => ("chat/completions", chat_body(&request)),
             ProviderKind::Responses => ("responses", responses_body(&request)),
@@ -552,6 +554,17 @@ impl OpenAiClient {
 
     fn redact_provider_message(&self, message: &str) -> String {
         crate::secrets::redact_values(&crate::secrets::redact(message), &self.redaction_keys())
+    }
+
+    fn validate_endpoint(&self) -> Result<(), ProviderError> {
+        let keys = self.redaction_keys();
+        if crate::secrets::redact_values(&self.base_url, &keys) != self.base_url {
+            return Err(ProviderError::Protocol(crate::secrets::redact_values(
+                "provider URL contains a configured credential; remove it from the URL",
+                &keys,
+            )));
+        }
+        Ok(())
     }
 
     fn redaction_keys(&self) -> Vec<String> {
@@ -1822,8 +1835,7 @@ mod tests {
         drop(listener);
         let key = "synthetic/connection-key";
         let client =
-            OpenAiClient::new_with_retry(format!("http://{address}/{key}"), key.into(), 2, 1, 1)
-                .unwrap();
+            OpenAiClient::new_with_retry(format!("http://{address}"), key.into(), 2, 1, 1).unwrap();
         let (tx, mut rx) = mpsc::channel(8);
         let error = client
             .stream(
@@ -1838,6 +1850,30 @@ mod tests {
             event => panic!("expected one retry, got {event:?}"),
         }
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn endpoint_with_cached_credential_is_rejected_before_network() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = "synthetic/credential-in-url";
+        let client = OpenAiClient::new(format!("http://{address}/{key}"), key.into()).unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let error = client
+            .stream(
+                empty_request(ProviderKind::Responses, ThinkingMode::Disabled),
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains(key));
+        let error = client.list_models(1000).await.unwrap_err();
+        assert!(!error.to_string().contains(key));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

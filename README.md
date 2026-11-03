@@ -75,7 +75,7 @@ handle.shutdown().await?;
 
 会话树与 fork/软删/undo（含文件快照回滚）；流式思考与工具调用；上下文压缩与溢出恢复；四种模式 `build`/`plan`/`explore`/`cluster`；权限审批、SSRF 校验与只读拦截；SQLite/WAL 持久化，消息、工具调用、Provider 状态与中断回答全部落盘；上下文窗口按「显式配置 > 运行时发现 > models.dev 快照 > 内置注册表」四层解析；OpenAI Responses/Chat 兼容、stdio MCP 子集、自定义斜杠命令与 Agent 模板。
 
-安全边界：文件工具限制在 `CoreConfig::workspace` 内，拒绝 `..`、绝对路径与符号链接逃逸；写入、删除、命令和浏览器交互按策略审批，`permissions.tools` 的 `deny` 优先于本会话放行。Provider API Key 从环境变量或系统钥匙串读取，配置不会主动保存密钥。模型流、工具和本地命令结果按已缓存 key 的原值、JSON 转义、常见 URL 编码和 Base64 形式过滤，匹配会改变输出、参数或标识符；提交文本、命令、记忆或 Provider 配置含已缓存 key 时会被拒绝。历史消息和上下文在读取、发送时过滤，数据库原文不改写；未加载的 key、其他编码和跨字段拼接未获全面保护，请勿把密钥放入会话或工具可访问的数据。
+安全边界：文件工具限制在 `CoreConfig::workspace` 内，拒绝 `..`、绝对路径与符号链接逃逸；写入、删除、命令和浏览器交互按策略审批，`permissions.tools` 的 `deny` 优先于本会话放行。Provider API Key 从环境变量或系统钥匙串读取，配置不会主动保存密钥。模型流、工具和本地命令结果按已缓存 key 的原值、JSON 转义、常见 URL 编码和 Base64 形式过滤，匹配会改变输出、参数或标识符；提交文本、命令、记忆或 Provider 配置含已缓存 key 时会被拒绝，Provider URL 含密钥时不发起请求。历史消息和上下文在读取、发送时过滤，数据库原文不改写；未加载的 key、其他编码和跨字段拼接未获全面保护，请勿把密钥放入会话或工具可访问的数据。
 
 ## 配置
 
