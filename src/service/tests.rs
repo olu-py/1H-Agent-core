@@ -2,6 +2,300 @@ use super::*;
 use crate::protocol::{ApiErrorKind, MessageDto, PROTOCOL_VERSION};
 use tempfile::TempDir;
 
+#[test]
+fn historical_messages_hide_cached_keys_without_rewriting_database() {
+    const CHILD: &str = "CORE_HISTORY_REDACTION_TEST_CHILD";
+    const KEY: &str = "synthetic/historical-key-563";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("--exact")
+            .arg("service::tests::historical_messages_hide_cached_keys_without_rewriting_database")
+            .arg("--nocapture")
+            .env(CHILD, "1");
+        for name in [
+            "OPENAI_API_KEY",
+            "AGENT_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "QWEN_API_KEY",
+            "ARK_API_KEY",
+            "VOLCANO_API_KEY",
+        ] {
+            child.env(name, KEY);
+        }
+        assert!(child.status().unwrap().success());
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let storage = Storage::open(&data.join("agent.db")).unwrap();
+        let session = storage.create_session(temp.path()).unwrap();
+        storage.append_message(&session, crate::provider::Role::User, &format!("older {KEY}")).unwrap();
+        storage.rename_session(&session, &format!("old title {KEY}")).unwrap();
+        storage.save_partial(&session, &format!("old partial {KEY}")).unwrap();
+        storage.create_memory(&temp.path().to_string_lossy(), "explicit", "old memory", &format!("remember {KEY}"), None, "active", None, None, None, None, 100, 100, 8192, 100000).unwrap();
+        drop(storage);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut buffer = [0u8; 8192];
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).map(|(_, value)| value.trim().parse().unwrap())).unwrap();
+                    if bytes.len() >= end + 4 + length { break; }
+                }
+            }
+            let body = "data: {\"type\":\"response.completed\"}\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        let mut config = Config::default();
+        config.data_dir = data.clone();
+        config.provider.base_url = format!("http://{address}");
+        config.provider.context_window_tokens = Some(128_000);
+        config.model_metadata.fetch = false;
+        let handle = AppService::start(CoreConfig { workspace: temp.path().to_owned(), config, data_dir: data.clone(), event_capacity: 128, event_max_bytes: crate::bridge::DEFAULT_MAX_BYTES, approval_timeout: Duration::from_secs(30), message_page_size: 100 }).await.unwrap();
+        let page = serde_json::to_string(&handle.messages(&session, None, None).await.unwrap()).unwrap();
+        assert!(!page.contains(KEY), "historical message exposed cached key");
+        assert!(page.contains("older"));
+        let state = serde_json::to_string(&handle.snapshot().await.unwrap()).unwrap();
+        assert!(!state.contains(KEY), "historical snapshot exposed cached key");
+        let memories = serde_json::to_string(&handle.memories(None, false).await.unwrap()).unwrap();
+        assert!(!memories.contains(KEY), "historical memory exposed cached key");
+        handle.submit(Some(session), "continue").await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(10), provider).await.unwrap().unwrap();
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        assert!(!body.contains(KEY), "historical context exposed cached key to provider");
+        assert!(body.contains("older"));
+        let db = rusqlite::Connection::open(data.join("agent.db")).unwrap();
+        let raw: String = db.query_row("SELECT content FROM messages WHERE role = 'user' ORDER BY id LIMIT 1", [], |row| row.get(0)).unwrap();
+        assert!(raw.contains(KEY), "read filtering must not rewrite historical data");
+        handle.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn tool_output_does_not_expose_cached_provider_keys() {
+    const CHILD: &str = "CORE_TOOL_REDACTION_TEST_CHILD";
+    const CURRENT: &str = "synthetic/current-provider-key-42";
+    const OTHER: &str = "synthetic/other-provider-key-82";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("--exact")
+            .arg("service::tests::tool_output_does_not_expose_cached_provider_keys")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("OPENAI_API_KEY", CURRENT);
+        for name in [
+            "AGENT_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "QWEN_API_KEY",
+            "ARK_API_KEY",
+            "VOLCANO_API_KEY",
+        ] {
+            child.env(name, OTHER);
+        }
+        assert!(child.status().unwrap().success());
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(async move {
+            let mut second_request = String::new();
+            for round in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0u8; 8192];
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let length: usize = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).map(|(_, value)| value.trim().parse().unwrap())).unwrap();
+                        if request.len() >= header_end + 4 + length { break; }
+                    }
+                }
+                if round == 1 { second_request = String::from_utf8(request).unwrap(); }
+                let events = if round == 0 {
+                    vec![serde_json::json!({"type":"response.output_item.done", "item":{"type":"function_call","call_id":"call-1","name":"file_read","arguments":"{\"path\":\"fixture.txt\"}"}}), serde_json::json!({"type":"response.completed"})]
+                } else {
+                    vec![serde_json::json!({"type":"response.output_text.delta","delta":"finished synthetic/other-provider-"}), serde_json::json!({"type":"response.output_text.delta","delta":"key-82"}), serde_json::json!({"type":"response.completed"})]
+                };
+                let body = events.iter().map(|value| format!("data: {value}\n\n")).collect::<String>();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            second_request
+        });
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("fixture.txt"), format!("normal\n{CURRENT}\n{OTHER}\n")).unwrap();
+        let mut config = Config::default();
+        config.data_dir = temp.path().join("data");
+        config.provider.base_url = format!("http://{address}");
+        config.provider.context_window_tokens = Some(128_000);
+        config.model_metadata.fetch = false;
+        let handle = AppService::start(CoreConfig { workspace: temp.path().to_owned(), config, data_dir: temp.path().join("data"), event_capacity: 128, event_max_bytes: crate::bridge::DEFAULT_MAX_BYTES, approval_timeout: Duration::from_secs(30), message_page_size: 100 }).await.unwrap();
+        let mut events = handle.subscribe();
+        for input in [format!("user input {CURRENT}"), format!("!echo {OTHER}"), format!("/unknown {OTHER}")] {
+            let error = handle.submit(None, &input).await.unwrap_err();
+            assert_eq!(error.kind, ApiErrorKind::BadRequest);
+            assert!(!error.message.contains(CURRENT));
+            assert!(!error.message.contains(OTHER));
+        }
+        let error = handle.execute_command(None, &format!("/unknown {OTHER}")).await.unwrap_err();
+        assert_eq!(error.kind, ApiErrorKind::BadRequest);
+        assert!(!error.message.contains(OTHER));
+        let error = handle.save_memory("note", &format!("secret {OTHER}"), false).await.unwrap_err();
+        assert_eq!(error.kind, ApiErrorKind::BadRequest);
+        assert!(!error.message.contains(OTHER));
+        let error = handle.set_provider("openai", OTHER).await.unwrap_err();
+        assert_eq!(error.kind, ApiErrorKind::BadRequest);
+        assert!(!error.message.contains(OTHER));
+        let error = handle.set_provider_profile("openai", crate::config::ProviderPreset::OpenAi, None, "model", Some(OTHER), None, None, None).await.unwrap_err();
+        assert_eq!(error.kind, ApiErrorKind::BadRequest);
+        let mut provider_config = crate::config::ProviderPreset::OpenAi.defaults();
+        provider_config.model = OTHER.into();
+        assert_eq!(handle.set_provider_config(provider_config).await.unwrap_err().kind, ApiErrorKind::BadRequest);
+        for error in [handle.approve(OTHER, true, false).await.unwrap_err(), handle.messages(OTHER, None, None).await.unwrap_err()] {
+            assert_eq!(error.kind, ApiErrorKind::BadRequest);
+            assert!(!error.message.contains(OTHER));
+        }
+        assert!(handle.snapshot().await.unwrap().active_session.is_none());
+        handle.submit(None, "read fixture").await.unwrap();
+        let mut serialized_events = String::new();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                serialized_events.push_str(&serde_json::to_string(&*event).unwrap());
+                if matches!(event.event, Event::Completed) { break; }
+                assert!(!matches!(event.event, Event::Failed { .. }), "unexpected failure: {event:?}");
+            }
+        }).await.unwrap();
+        let session = handle.snapshot().await.unwrap().active_session.unwrap();
+        let memory = handle.save_memory("normal title", "normal memory", false).await.unwrap();
+        assert_eq!(handle.update_memory(memory.id, "normal title", OTHER).await.unwrap_err().kind, ApiErrorKind::BadRequest);
+        assert!(handle.memories(None, false).await.unwrap().iter().any(|item| item.content == "normal memory"));
+        let messages = serde_json::to_string(&handle.messages(&session, None, None).await.unwrap()).unwrap();
+        let request = provider.await.unwrap();
+        // Exclude the Authorization header, which is the intended transport for CURRENT.
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let db = rusqlite::Connection::open(temp.path().join("data/agent.db")).unwrap();
+        let stored: String = db.query_row("SELECT result FROM tool_calls WHERE id = ?1", ["call-1"], |row| row.get(0)).unwrap();
+        for (boundary, output) in [("events", serialized_events.as_str()), ("messages", messages.as_str()), ("provider body", body), ("tool_calls.result", stored.as_str())] {
+            assert!(!output.contains(CURRENT), "current key exposed in {boundary}");
+            assert!(!output.contains(OTHER), "other provider key exposed in {boundary}");
+            assert!(output.contains("normal"), "fixture did not reach {boundary}");
+        }
+        let command = if cfg!(windows) { "!type fixture.txt" } else { "!cat fixture.txt" };
+        handle.submit(Some(session.clone()), command).await.unwrap();
+        let approval = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::Approval { approval_id, .. } = &events.recv().await.unwrap().event {
+                    break approval_id.clone();
+                }
+            }
+        }).await.unwrap();
+        handle.approve(&approval, true, false).await.unwrap();
+        let shell_result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::LocalCommandFinished { result, .. } = &events.recv().await.unwrap().event {
+                    break result.clone();
+                }
+            }
+        }).await.unwrap();
+        assert!(shell_result.contains("normal"));
+        assert!(!shell_result.contains(CURRENT), "current key exposed in shell event");
+        assert!(!shell_result.contains(OTHER), "other provider key exposed in shell event");
+        let messages = serde_json::to_string(&handle.messages(&session, None, None).await.unwrap()).unwrap();
+        assert!(!messages.contains(CURRENT));
+        assert!(!messages.contains(OTHER));
+        handle.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn provider_echo_is_redacted_in_public_events_and_messages() {
+    const CHILD: &str = "CORE_REDACTION_TEST_CHILD";
+    const KEY: &str = "synthetic/provider-key.with-punctuation";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("--exact")
+            .arg("service::tests::provider_echo_is_redacted_in_public_events_and_messages")
+            .arg("--nocapture")
+            .env(CHILD, "1");
+        for name in [
+            "OPENAI_API_KEY",
+            "AGENT_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "QWEN_API_KEY",
+            "ARK_API_KEY",
+            "VOLCANO_API_KEY",
+        ] {
+            child.env(name, KEY);
+        }
+        assert!(child.status().unwrap().success());
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 16384];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = [
+                serde_json::json!({"type":"response.output_text.delta","delta":"answer synthetic/provider-"}),
+                serde_json::json!({"type":"response.output_text.delta","delta":"key.with-punctuation done"}),
+                serde_json::json!({"type":"response.completed"}),
+            ].iter().map(|value| format!("data: {value}\n\n")).collect::<String>();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = temp.path().join("data");
+        config.provider.base_url = format!("http://{address}");
+        config.provider.context_window_tokens = Some(128_000);
+        config.model_metadata.fetch = false;
+        let handle = AppService::start(CoreConfig { workspace: temp.path().to_owned(), config, data_dir: temp.path().join("data"), event_capacity: 128, event_max_bytes: crate::bridge::DEFAULT_MAX_BYTES, approval_timeout: Duration::from_secs(30), message_page_size: 100 }).await.unwrap();
+        let mut events = handle.subscribe();
+        handle.submit(None, "hello").await.unwrap();
+        let mut serialized_events = String::new();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let envelope = events.recv().await.unwrap();
+                serialized_events.push_str(&serde_json::to_string(&*envelope).unwrap());
+                if matches!(envelope.event, Event::Completed) { break; }
+                assert!(!matches!(envelope.event, Event::Failed { .. }), "unexpected provider failure: {envelope:?}");
+            }
+        }).await.unwrap();
+        let session = handle.snapshot().await.unwrap().active_session.unwrap();
+        let messages = serde_json::to_string(&handle.messages(&session, None, None).await.unwrap()).unwrap();
+        for output in [&serialized_events, &messages] {
+            assert!(!output.contains(KEY));
+            assert!(output.contains("[REDACTED]"));
+        }
+        handle.shutdown().await.unwrap();
+        provider.await.unwrap();
+    });
+}
+
 #[tokio::test]
 async fn cancelled_message_read_is_acknowledged_and_does_not_poison_next_read() {
     let (_temp, handle) = test_handle().await;
@@ -738,10 +1032,85 @@ async fn workspace_lock_blocks_second_service() {
         second.is_err(),
         "second service must fail on the locked workspace"
     );
-    drop(first);
-    // After dropping the first, the same workspace is lockable again.
+    first.shutdown().await.unwrap();
+    // Shutdown releases the lock even while a handle remains alive.
     let third = AppService::start(core_config(&data_dir)).await;
     assert!(third.is_ok());
+    third.unwrap().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn full_queue_shutdown_keeps_lock_until_cleanup_finishes() {
+    for explicit in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let data = temp.path().join("data");
+        let lock = WorkspaceLock::acquire(&data, &workspace).unwrap();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (reply, _response) = oneshot::channel();
+        command_tx
+            .try_send(CoreCommand::GetState { reply })
+            .unwrap_or_else(|_| panic!("queue should have room"));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let lock = lock;
+            shutdown_rx.changed().await.unwrap();
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            drop(lock);
+            done_tx.send(()).unwrap();
+        });
+        let bridge = Arc::new(crate::bridge::EventBridge::new(
+            64,
+            crate::bridge::DEFAULT_MAX_BYTES,
+        ));
+        let handle = AppHandle::new(
+            command_tx,
+            bridge,
+            task,
+            shutdown_tx,
+            64,
+            crate::bridge::DEFAULT_MAX_BYTES,
+            100,
+        );
+        let retry_handle = explicit.then(|| handle.clone());
+        let mut shutdown = if explicit {
+            let h = handle.clone();
+            Some(tokio::spawn(async move { h.shutdown().await }))
+        } else {
+            None
+        };
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(WorkspaceLock::acquire(&data, &workspace).is_err());
+        if let Some(task) = &shutdown {
+            assert!(!task.is_finished());
+        }
+        if let Some(first) = shutdown.take() {
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            let h = retry_handle.unwrap();
+            let mut retry = tokio::spawn(async move { h.shutdown().await });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut retry)
+                    .await
+                    .is_err()
+            );
+            shutdown = Some(retry);
+        }
+        finish_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        if let Some(task) = shutdown {
+            task.await.unwrap().unwrap();
+        }
+        assert!(WorkspaceLock::acquire(&data, &workspace).is_ok());
+    }
 }
 
 #[test]

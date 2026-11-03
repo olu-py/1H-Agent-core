@@ -11,7 +11,7 @@
 //! state-machine task, so concurrent consumers cannot interleave mutations.
 //!
 //! On shutdown the engine rejects pending approvals, cancels the agent tree,
-//! closes subscriptions, and releases the database and the per-workspace
+//! ends the engine, and releases the database and the per-workspace
 //! exclusive lock. A second program opening the same canonical workspace fails
 //! immediately at [`AppService::start`].
 
@@ -24,7 +24,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 mod engine;
 #[cfg(test)]
@@ -83,9 +83,8 @@ pub struct CoreConfig {
 }
 
 /// The running application service. [`AppService::start`] builds the full state
-/// machine, starts the engine loop, and returns an [`AppHandle`] that owns the
-/// engine task and the per-workspace exclusive lock. Dropping the last handle
-/// shuts the engine down.
+/// machine, starts the engine loop, and returns an [`AppHandle`]. The engine
+/// holds the workspace lock through cleanup; dropping the last handle signals it.
 pub struct AppService;
 
 impl AppService {
@@ -140,7 +139,11 @@ impl AppService {
             approval_timeout: config.approval_timeout,
             command_tx: command_tx.clone(),
         };
-        let engine_task = tokio::spawn(run_engine(engine, command_rx));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let engine_task = tokio::spawn(async move {
+            let _workspace_lock = lock;
+            run_engine(engine, command_rx, shutdown_rx).await;
+        });
         let event_capacity = bridge.max_events();
         let event_max_bytes = bridge.max_bytes();
         let default_page_size = protocol::clamp_page_size(Some(config.message_page_size));
@@ -149,7 +152,7 @@ impl AppService {
             command_tx,
             bridge,
             engine_task,
-            lock,
+            shutdown_tx,
             event_capacity,
             event_max_bytes,
             default_page_size,

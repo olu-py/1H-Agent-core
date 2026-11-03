@@ -143,8 +143,9 @@ impl AgentRunner {
         items: &mut Vec<ConversationItem>,
         executed_tool_calls: &mut HashSet<String>,
     ) -> Result<(), String> {
+        let result = crate::secrets::redact_cached(result);
         self.storage
-            .finish_tool(&call.id, result)
+            .finish_tool(&call.id, &result)
             .map_err(|error| error.to_string())?;
         ui_events
             .send(AgentEvent::ToolFinished {
@@ -158,7 +159,7 @@ impl AgentRunner {
             output: result.to_owned(),
         });
         self.storage
-            .append_tool_output(&self.session_id, &call.id, result)
+            .append_tool_output(&self.session_id, &call.id, &result)
             .map_err(|error| error.to_string())?;
         executed_tool_calls.insert(tool_call_signature(call));
         Ok(())

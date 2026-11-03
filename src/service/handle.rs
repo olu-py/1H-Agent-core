@@ -1,21 +1,21 @@
 use std::sync::Arc;
 
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
 use crate::protocol::{self, ApiError, AppSnapshotV2, MemoryDto, MessagePage};
 
-use super::{CoreCommand, WorkspaceLock};
+use super::CoreCommand;
 
 /// Shared inner state of an [`AppHandle`]; reference-counted so handles can be
-/// cheaply cloned while the engine task and workspace lock live exactly once.
+/// cheaply cloned while the engine task lives exactly once.
 struct AppHandleInner {
     command_tx: mpsc::Sender<CoreCommand>,
     bridge: Arc<crate::bridge::EventBridge>,
     engine_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-    _lock: WorkspaceLock,
+    shutdown_tx: watch::Sender<bool>,
     event_capacity: usize,
     event_max_bytes: usize,
     default_page_size: usize,
@@ -23,10 +23,8 @@ struct AppHandleInner {
 
 impl Drop for AppHandleInner {
     fn drop(&mut self) {
-        // Signal a clean shutdown; the engine loop rejects approvals, cancels
-        // the agent tree, and closes subscriptions before it exits. The task is
-        // not aborted here: aborting could cut the cleanup short.
-        let _ = self.command_tx.try_send(CoreCommand::Shutdown);
+        // This signal is independent of the bounded command queue.
+        self.shutdown_tx.send_replace(true);
     }
 }
 
@@ -45,7 +43,7 @@ impl AppHandle {
         command_tx: mpsc::Sender<CoreCommand>,
         bridge: Arc<crate::bridge::EventBridge>,
         engine_task: JoinHandle<()>,
-        workspace_lock: WorkspaceLock,
+        shutdown_tx: watch::Sender<bool>,
         event_capacity: usize,
         event_max_bytes: usize,
         default_page_size: usize,
@@ -55,7 +53,7 @@ impl AppHandle {
                 command_tx,
                 bridge,
                 engine_task: tokio::sync::Mutex::new(Some(engine_task)),
-                _lock: workspace_lock,
+                shutdown_tx,
                 event_capacity,
                 event_max_bytes,
                 default_page_size,
@@ -471,12 +469,15 @@ impl AppHandle {
     }
 
     /// Gracefully shuts the engine down: pending approvals are rejected, the
-    /// agent tree is cancelled, subscriptions are closed, and the database and
+    /// agent tree is cancelled, and the database and
     /// workspace lock are released. Returns once the engine task has finished.
     pub async fn shutdown(&self) -> Result<(), ApiError> {
-        self.send(CoreCommand::Shutdown).await?;
-        if let Some(task) = self.inner.engine_task.lock().await.take() {
-            let _ = task.await;
+        let mut task = self.inner.engine_task.lock().await;
+        self.inner.shutdown_tx.send_replace(true);
+        if let Some(running) = task.as_mut() {
+            let result = running.await;
+            *task = None;
+            result.map_err(|_| ApiError::internal("engine shutdown failed"))?;
         }
         Ok(())
     }

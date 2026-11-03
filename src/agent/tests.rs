@@ -1477,7 +1477,9 @@ async fn child_agent_rejects_invalid_model_name() {
 #[tokio::test]
 async fn child_agent_executes_read_tools_across_turns() {
     let temp = TempDir::new().unwrap();
-    std::fs::write(temp.path().join("plan.txt"), "plan content").unwrap();
+    let key = "synthetic/child-provider-key-917";
+    crate::secrets::test_seed_key_for_id("synthetic-child-redaction-test", key);
+    std::fs::write(temp.path().join("plan.txt"), format!("plan content {key}")).unwrap();
     let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
     let session_id = storage.create_session(temp.path()).unwrap();
     storage
@@ -1522,11 +1524,25 @@ async fn child_agent_executes_read_tools_across_turns() {
     let sessions = storage.list_sessions(temp.path()).unwrap();
     let child = sessions.iter().find(|s| s.id != session_id).unwrap();
     let messages = storage.load_messages(&child.id).unwrap();
-    assert!(
-        messages
-            .iter()
-            .any(|item| matches!(item, ConversationItem::ToolOutput { .. }))
-    );
+    let output = messages
+        .iter()
+        .find_map(|item| match item {
+            ConversationItem::ToolOutput { output, .. } => Some(output),
+            _ => None,
+        })
+        .expect("child tool output must be stored");
+    assert!(output.contains("plan content"));
+    assert!(!output.contains(key));
+    let db = rusqlite::Connection::open(temp.path().join("agent.db")).unwrap();
+    let result: String = db
+        .query_row(
+            "SELECT result FROM tool_calls WHERE id = ?1",
+            ["c1"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(result.contains("plan content"));
+    assert!(!result.contains(key));
 }
 
 #[tokio::test]
