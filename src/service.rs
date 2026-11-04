@@ -178,6 +178,14 @@ impl WorkspaceLock {
     }
 }
 
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        // A duplicated or inherited handle can outlive this owner. Releasing
+        // explicitly avoids keeping the workspace locked until that handle closes.
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+
 /// A stable, dependency-free 64-bit FNV-1a hash used to name the per-workspace
 /// lock file (stable across Rust versions, unlike `DefaultHasher`).
 fn stable_hash(value: &Path) -> u64 {

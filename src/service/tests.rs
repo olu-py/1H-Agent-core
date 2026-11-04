@@ -1088,6 +1088,26 @@ async fn workspace_lock_blocks_second_service() {
     }
 }
 
+#[test]
+fn workspace_lock_releases_when_file_handle_is_duplicated() {
+    let temp = TempDir::new().unwrap();
+    let workspace = temp.path().join("workspace");
+    let data_dir = temp.path().join("data");
+    let lock = WorkspaceLock::acquire(&data_dir, &workspace).unwrap();
+    // An inherited or duplicated descriptor may outlive the owning task.
+    let inherited = lock._file.try_clone().unwrap();
+    assert!(WorkspaceLock::acquire(&data_dir, &workspace).is_err());
+    drop(lock);
+    let reacquired = WorkspaceLock::acquire(&data_dir, &workspace);
+    assert!(
+        reacquired.is_ok(),
+        "shutdown left a duplicated lock handle locked"
+    );
+    assert!(WorkspaceLock::acquire(&data_dir, &workspace).is_err());
+    drop(reacquired);
+    drop(inherited);
+}
+
 #[tokio::test]
 async fn full_queue_shutdown_keeps_lock_until_cleanup_finishes() {
     for explicit in [false, true] {
