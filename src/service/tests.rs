@@ -1080,9 +1080,10 @@ async fn workspace_lock_blocks_second_service() {
     );
     first.shutdown().await.unwrap();
     // Shutdown releases the lock even while a handle remains alive.
-    let third = AppService::start(core_config(&data_dir)).await;
-    assert!(third.is_ok());
-    third.unwrap().shutdown().await.unwrap();
+    let third = AppService::start(core_config(&data_dir))
+        .await
+        .unwrap_or_else(|error| panic!("restart after shutdown failed: {error:#}"));
+    third.shutdown().await.unwrap();
 }
 
 #[tokio::test]
