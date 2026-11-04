@@ -212,7 +212,10 @@ impl SessionRuntime {
                 self.status = format!("上下文已压缩，隐藏 {hidden} 条历史消息");
             }
             AgentEvent::CompactionFailed(error) => {
-                self.status = format!("上下文压缩失败，已使用安全裁剪：{error}");
+                self.status = format!(
+                    "上下文压缩失败，已使用安全裁剪：{}",
+                    secrets::redact_cached(&error)
+                );
                 self.push_entry(DisplayEntry {
                     kind: DisplayKind::Error,
                     content: DisplayContent::Markdown(self.status.clone()),
@@ -489,7 +492,9 @@ impl SessionRuntime {
                 self.mark_partial_if_streaming();
                 self.push_entry(DisplayEntry {
                     kind: DisplayKind::Error,
-                    content: DisplayContent::Markdown(secrets::redact(&error)),
+                    content: DisplayContent::Markdown(secrets::redact_cached(&secrets::redact(
+                        &error,
+                    ))),
                 });
                 self.busy = false;
                 self.active_task = None;
@@ -1098,6 +1103,30 @@ mod tests {
             workspace,
         };
         (temp, ctx, runtime)
+    }
+
+    #[test]
+    fn failure_entries_hide_cached_credentials() {
+        const CHILD: &str = "CORE_SESSION_ERROR_REDACTION_TEST_CHILD";
+        const KEY: &str = "synthetic/session-error-key-691";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("session::tests::failure_entries_hide_cached_credentials")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        crate::secrets::test_seed_key_for_id("synthetic-session-test", KEY);
+        let (_temp, ctx, mut runtime) = anchor_test_runtime();
+        runtime.handle_event(&ctx, AgentEvent::Failed(format!("failure {KEY}")));
+        runtime.handle_event(&ctx, AgentEvent::CompactionFailed(format!("failure {KEY}")));
+        let display = format!("{:?} {}", runtime.entries, runtime.status);
+        assert!(!display.contains(KEY));
+        assert!(display.contains("failure"));
     }
 
     #[test]

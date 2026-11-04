@@ -48,35 +48,35 @@ impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             kind: ApiErrorKind::BadRequest,
-            message: message.into(),
+            message: crate::secrets::redact_cached(&message.into()),
         }
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             kind: ApiErrorKind::NotFound,
-            message: message.into(),
+            message: crate::secrets::redact_cached(&message.into()),
         }
     }
 
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             kind: ApiErrorKind::Unauthorized,
-            message: message.into(),
+            message: crate::secrets::redact_cached(&message.into()),
         }
     }
 
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             kind: ApiErrorKind::Conflict,
-            message: message.into(),
+            message: crate::secrets::redact_cached(&message.into()),
         }
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             kind: ApiErrorKind::Internal,
-            message: message.into(),
+            message: crate::secrets::redact_cached(&message.into()),
         }
     }
 
