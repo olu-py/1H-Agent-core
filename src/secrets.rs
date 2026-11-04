@@ -174,6 +174,22 @@ pub(crate) fn cached_keys() -> Vec<String> {
         .collect()
 }
 
+/// Runs `publish` while key registration is locked, only if every currently
+/// cached key was included in the stream's redaction snapshot.
+pub(crate) fn publish_if_keys_covered<T>(
+    keys: &[String],
+    publish: impl FnOnce() -> T,
+) -> Option<T> {
+    let cache = key_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let covered = cache
+        .values()
+        .filter_map(|value| value.as_ref().ok().filter(|key| !key.is_empty()))
+        .all(|key| keys.contains(key));
+    if covered { Some(publish()) } else { None }
+}
+
 pub(crate) fn redact_values(input: &str, keys: &[String]) -> String {
     let patterns = redaction_patterns(keys);
     if patterns.is_empty() {

@@ -330,10 +330,8 @@ impl OpenAiClient {
                         ModelEvent::TextDelta(text) => {
                             let tail = reasoning_redactor.mask_pending();
                             if !tail.is_empty() {
-                                events
-                                    .send(ModelEvent::ReasoningDelta(tail))
-                                    .await
-                                    .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                send_stream_event(events, ModelEvent::ReasoningDelta(tail), &keys)
+                                    .await?;
                             }
                             *text = text_redactor.push(text);
                         }
@@ -350,10 +348,7 @@ impl OpenAiClient {
                             ] {
                                 if !matches!(&pending, ModelEvent::TextDelta(text) | ModelEvent::ReasoningDelta(text) if text.is_empty())
                                 {
-                                    events
-                                        .send(pending)
-                                        .await
-                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                    send_stream_event(events, pending, &keys).await?;
                                 }
                             }
                             // Bound retained per-slot prefixes and identifiers independently
@@ -418,10 +413,7 @@ impl OpenAiClient {
                             ] {
                                 if !matches!(&pending, ModelEvent::TextDelta(text) | ModelEvent::ReasoningDelta(text) if text.is_empty())
                                 {
-                                    events
-                                        .send(pending)
-                                        .await
-                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                    send_stream_event(events, pending, &keys).await?;
                                 }
                             }
                             if let Some((slot, (_, redactor))) = arguments
@@ -430,15 +422,17 @@ impl OpenAiClient {
                             {
                                 let tail = redactor.finish();
                                 if !tail.is_empty() {
-                                    events
-                                        .send(ModelEvent::ToolCallDelta {
+                                    send_stream_event(
+                                        events,
+                                        ModelEvent::ToolCallDelta {
                                             slot: crate::secrets::redact_values(slot, &keys),
                                             id: None,
                                             name: None,
                                             arguments_delta: tail,
-                                        })
-                                        .await
-                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                        },
+                                        &keys,
+                                    )
+                                    .await?;
                                 }
                             }
                             call.id = crate::secrets::redact_values(&call.id, &keys);
@@ -470,24 +464,23 @@ impl OpenAiClient {
                             ] {
                                 if !matches!(&pending, ModelEvent::TextDelta(text) | ModelEvent::ReasoningDelta(text) if text.is_empty())
                                 {
-                                    events
-                                        .send(pending)
-                                        .await
-                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                    send_stream_event(events, pending, &keys).await?;
                                 }
                             }
                             for (slot, (_, redactor)) in &mut arguments {
                                 let tail = redactor.finish();
                                 if !tail.is_empty() {
-                                    events
-                                        .send(ModelEvent::ToolCallDelta {
+                                    send_stream_event(
+                                        events,
+                                        ModelEvent::ToolCallDelta {
                                             slot: crate::secrets::redact_values(slot, &keys),
                                             id: None,
                                             name: None,
                                             arguments_delta: tail,
-                                        })
-                                        .await
-                                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                                        },
+                                        &keys,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -500,10 +493,7 @@ impl OpenAiClient {
                     {
                         continue;
                     }
-                    events
-                        .send(model_event)
-                        .await
-                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                    send_stream_event(events, model_event, &keys).await?;
                     if saw_done {
                         break 'stream;
                     }
@@ -518,36 +508,27 @@ impl OpenAiClient {
         ] {
             if !matches!(&pending, ModelEvent::TextDelta(text) | ModelEvent::ReasoningDelta(text) if text.is_empty())
             {
-                events
-                    .send(pending)
-                    .await
-                    .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                send_stream_event(events, pending, &keys).await?;
             }
         }
         for (slot, (_, redactor)) in &mut arguments {
             let tail = redactor.finish();
             if !tail.is_empty() {
-                events
-                    .send(ModelEvent::ToolCallDelta {
+                send_stream_event(
+                    events,
+                    ModelEvent::ToolCallDelta {
                         slot: crate::secrets::redact_values(slot, &keys),
                         id: None,
                         name: None,
                         arguments_delta: tail,
-                    })
-                    .await
-                    .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                    },
+                    &keys,
+                )
+                .await?;
             }
         }
-        if !saw_done {
-            events
-                .send(ModelEvent::Done)
-                .await
-                .map_err(|_| (true, ProviderError::ReceiverClosed))?;
-        } else if request.kind == ProviderKind::ChatCompletions {
-            events
-                .send(ModelEvent::Done)
-                .await
-                .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+        if !saw_done || request.kind == ProviderKind::ChatCompletions {
+            send_stream_event(events, ModelEvent::Done, &keys).await?;
         }
         Ok(())
     }
@@ -638,6 +619,28 @@ impl OpenAiClient {
             )),
         }
     }
+}
+
+/// Reserve without holding the cache lock; publish under that lock so a new
+/// credential cannot be registered between the coverage check and enqueue.
+async fn send_stream_event(
+    events: &mpsc::Sender<ModelEvent>,
+    event: ModelEvent,
+    keys: &[String],
+) -> Result<(), (bool, ProviderError)> {
+    let permit = events
+        .reserve()
+        .await
+        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+    crate::secrets::publish_if_keys_covered(keys, || permit.send(event)).ok_or_else(|| {
+        (
+            true,
+            ProviderError::Protocol(
+                "provider credentials changed during streaming; retry the request".into(),
+            ),
+        )
+    })?;
+    Ok(())
 }
 
 /// Hold only a suffix that could start a known credential; all other text
@@ -1612,6 +1615,74 @@ mod tests {
                 assert!(result.ends_with(" after"));
             }
         }
+    }
+
+    #[test]
+    fn stream_hides_keys_cached_after_request_starts() {
+        const CHILD: &str = "CORE_STREAM_NEW_KEY_TEST_CHILD";
+        const KEY: &str = "synthetic/newly-cached-key-713";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("provider::openai::tests::stream_hides_keys_cached_after_request_starts")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 8192];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let first = format!("data: {}\n\n", json!({"type":"response.output_text.delta", "delta":"ready:"}));
+                let second = format!("data: {}\n\ndata: {}\n\n", json!({"type":"response.output_text.delta", "delta":KEY}), json!({"type":"response.completed"}));
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}", first.len() + second.len()).as_bytes()).await.unwrap();
+                wait.await.unwrap();
+                socket.write_all(second.as_bytes()).await.unwrap();
+            });
+            let client = OpenAiClient::new(format!("http://{address}"), "synthetic-first-key".into()).unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            let stream = tokio::spawn(async move {
+                client.stream(empty_request(ProviderKind::Responses, ThinkingMode::OpenAiResponsesSummary), tx).await
+            });
+            let first = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            assert!(matches!(first, ModelEvent::TextDelta(ref text) if text == "ready:"));
+            crate::secrets::test_seed_key_for_id("newly-added-provider", KEY);
+            release.send(()).unwrap();
+            let mut output = String::new();
+            while let Some(event) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap() {
+                if let ModelEvent::TextDelta(text) = event { output.push_str(&text); }
+            }
+            let error = stream.await.unwrap().unwrap_err();
+            assert!(matches!(error, ProviderError::Protocol(ref message) if message.contains("credentials changed")));
+            server.await.unwrap();
+            assert!(!output.contains(KEY), "newly cached key was exposed after registration: {output}");
+
+            // A sender blocked on a full channel must re-check after capacity
+            // becomes available, not just before waiting for it.
+            let keys = crate::secrets::cached_keys();
+            crate::secrets::test_seed_key_for_id("alias-with-same-key", KEY);
+            let (same_tx, mut same_rx) = mpsc::channel(1);
+            send_stream_event(&same_tx, ModelEvent::Done, &keys).await.unwrap();
+            assert!(matches!(same_rx.recv().await, Some(ModelEvent::Done)));
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(ModelEvent::Done).await.unwrap();
+            let sender = tokio::spawn(async move {
+                send_stream_event(&tx, ModelEvent::TextDelta("synthetic/newer-key-998".into()), &keys).await
+            });
+            tokio::task::yield_now().await;
+            crate::secrets::test_seed_key_for_id("next-added-provider", "synthetic/newer-key-998");
+            assert!(matches!(rx.recv().await, Some(ModelEvent::Done)));
+            assert!(matches!(sender.await.unwrap(), Err((true, ProviderError::Protocol(_)))));
+            assert!(rx.recv().await.is_none());
+        });
     }
 
     #[test]

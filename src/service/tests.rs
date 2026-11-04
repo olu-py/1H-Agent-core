@@ -1069,20 +1069,43 @@ async fn workspace_lock_blocks_second_service() {
         approval_timeout: Duration::from_secs(300),
         message_page_size: 100,
     };
-    // First service acquires the per-workspace lock.
-    let first = AppService::start(core_config(&data_dir)).await.unwrap();
-    // A second service on the same canonical workspace must fail immediately
-    // (same data_dir → same lock file, still held by the first service).
-    let second = AppService::start(core_config(&data_dir)).await;
+    for attempt in 0..200 {
+        // First service acquires the per-workspace lock.
+        let first = AppService::start(core_config(&data_dir)).await.unwrap();
+        // A second service on the same canonical workspace must fail immediately
+        // (same data_dir → same lock file, still held by the first service).
+        let second = AppService::start(core_config(&data_dir)).await;
+        assert!(
+            second.is_err(),
+            "second service must fail on the locked workspace"
+        );
+        first.shutdown().await.unwrap();
+        // Shutdown releases the lock even while a handle remains alive.
+        let third = AppService::start(core_config(&data_dir))
+            .await
+            .unwrap_or_else(|error| panic!("restart {attempt} after shutdown failed: {error:#}"));
+        third.shutdown().await.unwrap();
+    }
+}
+
+#[test]
+fn workspace_lock_releases_when_file_handle_is_duplicated() {
+    let temp = TempDir::new().unwrap();
+    let workspace = temp.path().join("workspace");
+    let data_dir = temp.path().join("data");
+    let lock = WorkspaceLock::acquire(&data_dir, &workspace).unwrap();
+    // An inherited or duplicated descriptor may outlive the owning task.
+    let inherited = lock._file.try_clone().unwrap();
+    assert!(WorkspaceLock::acquire(&data_dir, &workspace).is_err());
+    drop(lock);
+    let reacquired = WorkspaceLock::acquire(&data_dir, &workspace);
     assert!(
-        second.is_err(),
-        "second service must fail on the locked workspace"
+        reacquired.is_ok(),
+        "shutdown left a duplicated lock handle locked"
     );
-    first.shutdown().await.unwrap();
-    // Shutdown releases the lock even while a handle remains alive.
-    let third = AppService::start(core_config(&data_dir)).await;
-    assert!(third.is_ok());
-    third.unwrap().shutdown().await.unwrap();
+    assert!(WorkspaceLock::acquire(&data_dir, &workspace).is_err());
+    drop(reacquired);
+    drop(inherited);
 }
 
 #[tokio::test]
