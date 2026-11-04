@@ -1079,7 +1079,7 @@ pub(crate) fn routed_to_event(event: &AgentEvent) -> Option<Event> {
         },
         AgentEvent::Completed { .. } => Event::Completed,
         AgentEvent::Failed(error) => Event::Failed {
-            error: error.clone(),
+            error: secrets::redact_cached(error),
         },
         AgentEvent::SessionsChanged => Event::SessionsChanged,
         AgentEvent::ChildSessionProgress {
@@ -1102,7 +1102,7 @@ pub(crate) fn routed_to_event(event: &AgentEvent) -> Option<Event> {
             Event::CompactionCompleted { hidden: *hidden }
         }
         AgentEvent::CompactionFailed(error) => Event::CompactionFailed {
-            error: error.clone(),
+            error: secrets::redact_cached(error),
         },
         AgentEvent::TodoUpdated { tasks } => Event::TodoUpdated {
             tasks: tasks.clone(),
@@ -1973,6 +1973,50 @@ fn save_memory(
 #[cfg(test)]
 mod approval_routing_tests {
     use super::*;
+
+    #[test]
+    fn internal_errors_do_not_expose_cached_provider_credentials() {
+        const CHILD: &str = "CORE_ERROR_REDACTION_TEST_CHILD";
+        const KEY: &str = "synthetic/error-boundary-key-846";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("service::engine::approval_routing_tests::internal_errors_do_not_expose_cached_provider_credentials")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        crate::secrets::test_seed_key_for_id("synthetic-error-test", KEY);
+        let message = format!("storage error includes {KEY}");
+        for event in [
+            AgentEvent::Failed(message.clone()),
+            AgentEvent::CompactionFailed(message.clone()),
+        ] {
+            let event = routed_to_event(&event).unwrap();
+            let serialized = serde_json::to_string(&event).unwrap();
+            assert!(
+                !serialized.contains(KEY),
+                "credential exposed in event: {serialized}"
+            );
+            assert!(serialized.contains("storage error"));
+        }
+        let error = api_error(anyhow::anyhow!("{message}"));
+        assert!(
+            !error.message.contains(KEY),
+            "credential exposed in API error"
+        );
+        assert!(error.message.contains("storage error"));
+        let error = storage_api_error(crate::storage::StorageError::MemoryLimit(message));
+        assert!(
+            !error.message.contains(KEY),
+            "credential exposed in storage error"
+        );
+        assert!(error.message.contains("storage error"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn accepted_agent_cancel_before_first_task_poll_is_not_ipc_precancel() {
         let temp = tempfile::TempDir::new().unwrap();

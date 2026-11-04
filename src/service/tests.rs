@@ -3,6 +3,52 @@ use crate::protocol::{ApiErrorKind, MessageDto, PROTOCOL_VERSION};
 use tempfile::TempDir;
 
 #[test]
+fn storage_failure_api_response_hides_cached_key() {
+    const CHILD: &str = "CORE_STORAGE_ERROR_REDACTION_TEST_CHILD";
+    const KEY: &str = "synthetic/storage-error-key-398";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("--exact")
+            .arg("service::tests::storage_failure_api_response_hides_cached_key")
+            .arg("--nocapture")
+            .env(CHILD, "1");
+        for name in [
+            "OPENAI_API_KEY",
+            "AGENT_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "QWEN_API_KEY",
+            "ARK_API_KEY",
+            "VOLCANO_API_KEY",
+        ] {
+            child.env(name, KEY);
+        }
+        assert!(child.status().unwrap().success());
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let mut config = Config::default();
+        config.data_dir = data.clone();
+        config.model_metadata.fetch = false;
+        let handle = AppService::start(CoreConfig {
+            workspace: temp.path().to_owned(), config, data_dir: data.clone(),
+            event_capacity: 128, event_max_bytes: crate::bridge::DEFAULT_MAX_BYTES,
+            approval_timeout: Duration::from_secs(30), message_page_size: 100,
+        }).await.unwrap();
+        let db = rusqlite::Connection::open(data.join("agent.db")).unwrap();
+        db.execute_batch(&format!("CREATE TRIGGER synthetic_failure BEFORE INSERT ON sessions BEGIN SELECT RAISE(FAIL, 'database failure {KEY}'); END;")).unwrap();
+        let error = handle.submit(None, "ordinary input").await.unwrap_err();
+        assert_eq!(error.kind, ApiErrorKind::Internal);
+        assert!(error.message.contains("database failure"));
+        assert!(!error.message.contains(KEY), "credential exposed in API error: {}", error.message);
+        handle.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn historical_messages_hide_cached_keys_without_rewriting_database() {
     const CHILD: &str = "CORE_HISTORY_REDACTION_TEST_CHILD";
     const KEY: &str = "synthetic/historical-key-563";
