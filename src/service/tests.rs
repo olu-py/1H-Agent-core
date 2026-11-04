@@ -1069,21 +1069,23 @@ async fn workspace_lock_blocks_second_service() {
         approval_timeout: Duration::from_secs(300),
         message_page_size: 100,
     };
-    // First service acquires the per-workspace lock.
-    let first = AppService::start(core_config(&data_dir)).await.unwrap();
-    // A second service on the same canonical workspace must fail immediately
-    // (same data_dir → same lock file, still held by the first service).
-    let second = AppService::start(core_config(&data_dir)).await;
-    assert!(
-        second.is_err(),
-        "second service must fail on the locked workspace"
-    );
-    first.shutdown().await.unwrap();
-    // Shutdown releases the lock even while a handle remains alive.
-    let third = AppService::start(core_config(&data_dir))
-        .await
-        .unwrap_or_else(|error| panic!("restart after shutdown failed: {error:#}"));
-    third.shutdown().await.unwrap();
+    for attempt in 0..20 {
+        // First service acquires the per-workspace lock.
+        let first = AppService::start(core_config(&data_dir)).await.unwrap();
+        // A second service on the same canonical workspace must fail immediately
+        // (same data_dir → same lock file, still held by the first service).
+        let second = AppService::start(core_config(&data_dir)).await;
+        assert!(
+            second.is_err(),
+            "second service must fail on the locked workspace"
+        );
+        first.shutdown().await.unwrap();
+        // Shutdown releases the lock even while a handle remains alive.
+        let third = AppService::start(core_config(&data_dir))
+            .await
+            .unwrap_or_else(|error| panic!("restart {attempt} after shutdown failed: {error:#}"));
+        third.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
